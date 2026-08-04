@@ -34,7 +34,7 @@ jobs:
             sudo apt-get update && sudo apt-get install -y jq
         fi
 
-        # Fail closed if an incomplete, legacy, or non-GBP config reaches Kraken.
+        # Fail closed if an incomplete, obsolete, or non-GBP config reaches Kraken.
         if ! printf '%s' "$DCA_TARGET_MAP" | jq -e --argjson state "$DCA_EXECUTION_STATE" '
           type == "object" and length > 0 and all(to_entries[];
             (.key | test("^[A-Z0-9]+_GBP$")) and

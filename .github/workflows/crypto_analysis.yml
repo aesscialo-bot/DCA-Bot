@@ -128,7 +128,7 @@ jobs:
                 if not isinstance(config, dict):
                     raise ValueError(f"{label}.{key} must be an object")
                 if "AMOUNT" in config:
-                    raise ValueError(f"{label}.{key} uses legacy AMOUNT instead of AMOUNT_GBP")
+                    raise ValueError(f"{label}.{key} uses obsolete AMOUNT instead of AMOUNT_GBP")
                 execution_fields = {"LAST_BUY_DATE", "PENDING_ORDER"}.intersection(config)
                 if execution_fields:
                     fields = ", ".join(sorted(execution_fields))
