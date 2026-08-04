@@ -109,8 +109,8 @@ jobs:
       if: steps.check.outputs.should_run == 'true'
       env:
         # Secrets
-        BITKUB_API_KEY: ${{ secrets.BITKUB_API_KEY }}
-        BITKUB_API_SECRET: ${{ secrets.BITKUB_API_SECRET }}
+        KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+        KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         GIST_ID: ${{ secrets.GIST_ID }}
         GIST_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }} # Using PAT for gist logging
@@ -123,6 +123,8 @@ jobs:
         
         # Timezone for logging/checks
         TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Bangkok' }}
+        TRADING_EXCHANGE: kraken
+        KRAKEN_QUOTE_CURRENCY: GBP
         
       run: python crypto_dca.py
 

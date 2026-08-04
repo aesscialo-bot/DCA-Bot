@@ -25,6 +25,7 @@ MINIMUM_DCA_AMOUNT_THB = 10.0
 DCA_TARGET_MAP_JSON = os.environ.get("DCA_TARGET_MAP", "{}")
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+TRADING_EXCHANGE = os.environ.get("TRADING_EXCHANGE", "bitkub").lower()
 
 
 def _gha_mask(value: str) -> None:
@@ -441,40 +442,60 @@ def execute_trade(
     print(f"🚀 Executing DCA Buy for {symbol} ({amount_thb} THB)...")
     
     try:
-        # 1. Place Bid
-        order_payload = {
-            "sym": symbol,
-            "amt": amount_thb, 
-            "rat": 0, 
-            "typ": "market"
-        }
-        
-        result = bitkub_request('POST', '/api/v3/market/place-bid', order_payload)
-        
-        if result.get('error') != 0:
-            raise Exception(f"API Error Code: {result.get('error')}")
+        if TRADING_EXCHANGE == "kraken":
+            from kraken_client import place_market_buy
 
-        order_id = result.get('result', {}).get('id')
+            order_data = place_market_buy(symbol, amount_thb)
+            order_id = order_data["order_id"]
+            spent_thb = order_data["spent_thb"]
+            received_amt = order_data["received"]
+            rate = spent_thb / received_amt
+            ts_exec = order_data["timestamp"]
+            exchange_pair = order_data["pair"]
+            quote_line = (
+                f"💷 **Spent ({order_data['quote_currency']}):** "
+                f"{order_data['spent_quote']:,.2f}\n"
+            )
+        elif TRADING_EXCHANGE == "bitkub":
+            order_payload = {
+                "sym": symbol,
+                "amt": amount_thb,
+                "rat": 0,
+                "typ": "market",
+            }
+            result = bitkub_request(
+                "POST", "/api/v3/market/place-bid", order_payload
+            )
+            if result.get("error") != 0:
+                raise Exception(f"API Error Code: {result.get('error')}")
+
+            order_id = result.get("result", {}).get("id")
+            print(f"   Placed Order ID: {order_id}. Waiting for match...")
+            time.sleep(5)
+            order_data = bitkub_request(
+                "GET",
+                "/api/v3/market/order-info",
+                params={"sym": symbol, "id": order_id, "sd": "buy"},
+            ).get("result", {})
+            spent_thb = float(order_data.get("filled", 0))
+            if spent_thb == 0:
+                spent_thb = float(order_data.get("total", 0))
+            history = order_data.get("history", [])
+            received_amt = sum(
+                float(t["amount"]) / float(t["rate"])
+                for t in history
+                if float(t.get("rate", 0)) > 0
+            )
+            rate = spent_thb / received_amt if received_amt > 0 else 0
+            ts_exec = int(order_data.get("ts", time.time()))
+            exchange_pair = symbol
+            quote_line = ""
+        else:
+            raise ValueError(
+                "TRADING_EXCHANGE must be either 'bitkub' or 'kraken'"
+            )
+
         _gha_mask(str(order_id))
-        print(f"   Placed Order ID: {order_id}. Waiting for match...")
-        
-        # 2. Wait
-        time.sleep(5) 
-
-        # 3. Fetch order details via shared client (params dict form)
-        order_data = bitkub_request(
-            'GET', '/api/v3/market/order-info',
-            params={"sym": symbol, "id": order_id, "sd": "buy"}
-        ).get('result', {})
-        
-        spent_thb = float(order_data.get('filled', 0))
-        if spent_thb == 0: spent_thb = float(order_data.get('total', 0))
-
-        history = order_data.get('history', [])
-        received_amt = sum(float(t['amount'])/float(t['rate']) for t in history if float(t.get('rate',0)) > 0)
-        
-        rate = (spent_thb / received_amt) if received_amt > 0 else 0
-        ts_exec = int(order_data.get('ts', time.time()))
         # Mask all sensitive trade values so they are redacted in GitHub Actions run logs
         _gha_mask(f"{spent_thb:.2f}")
         _gha_mask(f"{received_amt:.8f}")
@@ -518,7 +539,10 @@ def execute_trade(
                 }
                 
                 ghostfolio_saved = log_to_ghostfolio(
-                    ghostfolio_data, base_sym, account_id, exchange_pair=symbol
+                    ghostfolio_data,
+                    base_sym,
+                    account_id,
+                    exchange_pair=exchange_pair,
                 )
                 
                 if ghostfolio_saved:
@@ -544,8 +568,9 @@ def execute_trade(
         # 7. Notify Discord
         msg = (
             f"✅ **DCA Buy Executed!**\n"
-            f"🔹 **Pair:** {symbol}\n"
+            f"🔹 **Pair:** {exchange_pair}\n"
             f"💰 **Spent:** ฿{spent_thb:,.2f}\n"
+            f"{quote_line}"
             f"💵 **Spent (USD):** ${usd_spent:,.2f}\n"
             f"📥 **Received:** {received_amt:.8f} {base_sym}\n"
             f"🏷️ **Rate:** ฿{rate:,.2f}\n"
