@@ -18,26 +18,28 @@ Required environment variables:
     GEMINI_API_KEY      - Google AI Studio API key (for NL intent classification)
     GH_PAT              - GitHub Personal Access Token (repo scope)
     GITHUB_REPO         - GitHub repo in "owner/repo" format
+    GITHUB_WORKFLOW_REF - Exact branch/tag used for workflow dispatches
 
 Optional environment variables:
-    GITHUB_WORKFLOW_REF - Branch/tag used for workflow dispatches (default: main)
     DISCORD_CHANNEL_ID  - Restrict bot to one channel (responds to all messages there)
-    DISCORD_ALLOWED_USERS - Comma-separated Discord user IDs (security restriction)
+    DISCORD_ALLOWED_USERS - Comma-separated writer IDs; writes are blocked if omitted
     DCA_CRON_ENABLED    - "true" to enable built-in DCA scheduler (replaces cron-job.org)
     TIMEZONE            - Timezone for scheduler (default: Asia/Bangkok)
 """
 import asyncio
 import json
+import math
 import os
 import re
 import sys
 from datetime import datetime
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import tasks
 import requests
-import google.generativeai as genai
+from google import genai
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +50,7 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GH_PAT = os.environ.get("GH_PAT", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
-GITHUB_WORKFLOW_REF = os.environ.get("GITHUB_WORKFLOW_REF", "main")
+GITHUB_WORKFLOW_REF = os.environ.get("GITHUB_WORKFLOW_REF", "").strip()
 
 # Optional restrictions
 CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
@@ -57,65 +59,69 @@ ALLOWED_USERS = os.environ.get("DISCORD_ALLOWED_USERS", "")
 # DCA Scheduler — replaces external cron-job.org polling
 DCA_CRON_ENABLED = os.environ.get("DCA_CRON_ENABLED", "false").lower() == "true"
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
-DCA_AMOUNT_MIN_THB = 50
-DCA_AMOUNT_MAX_THB = 2000
+DCA_AMOUNT_MIN_GBP = 5
+DCA_AMOUNT_MAX_GBP = 1000
+CONFIG_WRITE_PREFIX = "!dca "
+ENABLE_CONFIRMATION_TTL_SECONDS = 300
+DISPATCH_RETRY_SECONDS = 30 * 60
+EXECUTION_STATE_VARIABLE = "DCA_EXECUTION_STATE"
+CONFIG_WRITE_ACTIONS = {"analyze", "update_dca"}
+
+# Enabling a target always requires a second, exact command from the same
+# allowlisted Discord user. Pending confirmations are intentionally in-memory:
+# a restart safely cancels them instead of enabling anything unexpectedly.
+_pending_enable_confirmations: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
 # Gemini setup — candidate models in order of preference (fast → fallback)
 # ---------------------------------------------------------------------------
 
-genai.configure(api_key=GEMINI_API_KEY)
 AI_MODEL_CANDIDATES = [
     "gemini-2.5-flash-lite",   # Optimized for speed/volume
-    "gemini-2.5-flash",        # Fast and capable (preferred)
-    "gemini-3-flash-preview",  # Frontier-class fallback
+    "gemini-2.5-flash",        # More capable Flash fallback
 ]
 
 CLASSIFY_PROMPT = """You are a command classifier for a cryptocurrency DCA automation system.
 Given a user message, classify the intent and extract parameters.
 
 IMPORTANT: Users refer to coins by name only — "BTC", "LINK", "SUI", "ETH", "bitcoin", "chainlink", etc.
-Never require or expect the user to include "/USDT", "_THB", or any trading pair notation.
+Never require a trading pair. All market analysis and trading use GBP.
 Always derive the coin symbol from the name and convert it to the correct internal format.
 
 Available actions:
 1. "analyze" - Run crypto market analysis
    - symbols: comma-separated coin names exactly as the user said — e.g. "BTC, LINK, SUI" (default: derive from current DCA config)
-     Accept plain names like "BTC", "bitcoin", "link", "chainlink" — do NOT convert to USDT pairs here.
+     Accept plain names like "BTC", "bitcoin", "link", "chainlink" — do not add a quote currency here.
    - short_report: true for AI summary only, false for full breakdown (default: true)
 
 2. "portfolio" - Check portfolio balance
    - short_report: true for balance/holdings only (no trade history) (default: true), false for full monthly report with 5th-to-5th trade history
 
 3. "update_dca" - Update DCA configuration for a symbol
-   - symbol: ALWAYS use the "COIN_THB" format — e.g. "BTC_THB", "LINK_THB", "SUI_THB".
+   - symbol: ALWAYS use the "COIN_GBP" format — e.g. "BTC_GBP", "LINK_GBP", "SUI_GBP".
      Convert any coin name or abbreviation the user mentions to this format:
-     "btc" → "BTC_THB", "bitcoin" → "BTC_THB", "link" → "LINK_THB", "chainlink" → "LINK_THB",
-     "doge" → "DOGE_THB", "dogecoin" → "DOGE_THB".
-     Never output COIN/USDT, COIN_USDT, or a bare coin name like "BTC" — always append "_THB".
-   - field: one of "TIME", "AMOUNT", "BUY_ENABLED"
-    - value: new value (HH:MM for TIME, number 50-2000 for AMOUNT, true/false for BUY_ENABLED)
+     "btc" → "BTC_GBP", "bitcoin" → "BTC_GBP", "link" → "LINK_GBP", "chainlink" → "LINK_GBP",
+     "doge" → "DOGE_GBP", "dogecoin" → "DOGE_GBP".
+     Never output a non-GBP pair or a bare coin name like "BTC" — always append "_GBP".
+   - field: one of "TIME", "AMOUNT_GBP", "BUY_ENABLED"
+    - value: new value (HH:MM for TIME, number 5-1000 for AMOUNT_GBP, true/false for BUY_ENABLED)
    Note: "disable X" or "turn off X" means BUY_ENABLED=false; "enable X" or "turn on X" means BUY_ENABLED=true.
 
 4. "status" - Show current DCA configuration
 
 5. "accounts" - Show Ghostfolio portfolio account mapping
 
-6. "buy_now" - Immediately buy a specific coin
-   - symbol: ALWAYS use "COIN_THB" format (same rules as update_dca)
-   Note: "buy LINK now", "buy BTC immediately", "purchase SUI" all map here.
+6. "help" - Show available commands
 
-7. "help" - Show available commands
-
-8. "unknown" - Message is not a recognized command
+7. "unknown" - Message is not a recognized command
 
 Respond with ONLY valid JSON, no markdown fences:
 {"action": "...", "params": {...}, "reply": "Brief description of what will be done"}"""
 
 
 # Valid actions the bot supports
-VALID_ACTIONS = {"analyze", "portfolio", "status", "update_dca", "buy_now", "accounts", "help", "unknown"}
+VALID_ACTIONS = {"analyze", "portfolio", "status", "update_dca", "accounts", "help", "unknown"}
 
 
 def _validate_intent(intent: dict) -> dict:
@@ -130,12 +136,6 @@ def _validate_intent(intent: dict) -> dict:
     params = intent.get("params", {})
     if not isinstance(params, dict):
         params = {}
-
-    # For buy_now, enforce symbol is present
-    if action == "buy_now":
-        symbol = params.get("symbol")
-        if not isinstance(symbol, str) or not symbol.strip():
-            return {"action": "unknown", "params": {}, "reply": "Could not determine symbol"}
 
     # For update_dca, enforce required param types from the AI
     if action == "update_dca":
@@ -152,6 +152,43 @@ def _validate_intent(intent: dict) -> dict:
     return {"action": action, "params": params, "reply": intent.get("reply", "")}
 
 
+def _allowed_user_ids() -> set[str]:
+    """Return the configured Discord writer allowlist."""
+    return {user_id.strip() for user_id in ALLOWED_USERS.split(",") if user_id.strip()}
+
+
+def _message_author_id(message: discord.Message) -> str:
+    author = getattr(message, "author", None)
+    author_id = getattr(author, "id", "")
+    return str(author_id).strip()
+
+
+def _is_authorized_config_writer(message: discord.Message) -> bool:
+    """Fail closed unless this message author is explicitly allowlisted."""
+    allowed_ids = _allowed_user_ids()
+    author_id = _message_author_id(message)
+    return bool(allowed_ids and author_id and author_id in allowed_ids)
+
+
+def _config_write_block_reason(
+    action: str, raw_text: str, message: discord.Message
+) -> str | None:
+    """Return why a config-writing command must be refused, if applicable."""
+    if action not in CONFIG_WRITE_ACTIONS:
+        return None
+    if not _is_authorized_config_writer(message):
+        return (
+            "Configuration changes require `DISCORD_ALLOWED_USERS` and an "
+            "explicitly allowlisted Discord user."
+        )
+    if not raw_text.startswith(CONFIG_WRITE_PREFIX):
+        return (
+            f"Configuration-changing commands must start exactly with "
+            f"`{CONFIG_WRITE_PREFIX}`."
+        )
+    return None
+
+
 async def classify_intent(text: str) -> dict:
     """Use Gemini to classify user intent from natural language."""
     last_error = None
@@ -159,10 +196,15 @@ async def classify_intent(text: str) -> dict:
 
     for model_name in AI_MODEL_CANDIDATES:
         try:
-            model = genai.GenerativeModel(model_name)
+            def generate():
+                with genai.Client(api_key=GEMINI_API_KEY) as ai_client:
+                    return ai_client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                    )
+
             response = await asyncio.to_thread(
-                model.generate_content,
-                prompt,
+                generate,
             )
             raw = response.text.strip()
             # Strip markdown code fences if Gemini wraps them
@@ -195,6 +237,9 @@ GH_API = "https://api.github.com"
 
 def trigger_workflow(workflow_file: str, inputs: dict | None = None) -> bool:
     """Trigger a GitHub Actions workflow via the dispatch API. Returns True on success."""
+    if not GITHUB_WORKFLOW_REF:
+        print("❌ GITHUB_WORKFLOW_REF is required; refusing workflow dispatch")
+        return False
     url = f"{GH_API}/repos/{GITHUB_REPO}/actions/workflows/{workflow_file}/dispatches"
     body = {"ref": GITHUB_WORKFLOW_REF}
     if inputs:
@@ -219,67 +264,156 @@ def get_repo_variable(name: str) -> str | None:
     return None
 
 
-def update_repo_variable(name: str, value: str) -> bool:
-    """Update a GitHub Actions repository variable. Returns True on success."""
-    url = f"{GH_API}/repos/{GITHUB_REPO}/actions/variables/{name}"
-    try:
-        r = requests.patch(url, json={"name": name, "value": value}, headers=GH_HEADERS, timeout=10)
-        return r.status_code == 204
-    except Exception as e:
-        print(f"❌ GitHub API error: {e}")
-        return False
-
-
 # ---------------------------------------------------------------------------
 # DCA Scheduler — smart cron replacement
 # ---------------------------------------------------------------------------
 
-# Maps "HH:MM" → {"symbols": {"BTC_THB": "2025-03-09", ...}} where value is LAST_BUY_DATE
+# Maps "HH:MM" to enabled GBP symbols and their LAST_BUY_DATE values.
 _dca_schedule: dict[str, dict] = {}
 
-# Total minutes in a day
-_DAY = 24 * 60
+# A workflow dispatch is suppressed briefly, then retried unless live execution
+# state confirms completion. HTTP 204 means accepted, not that the trade succeeded.
+_dca_dispatch_guard: dict[tuple[str, str], float] = {}
+_pending_recovery_symbols: set[str] = set()
 
+def refresh_dca_schedule(
+    raw_json: str | None, execution_state_json: str | None = None
+) -> None:
+    """Parse GBP rules plus trader-owned execution state for scheduling."""
+    def clear_schedule() -> None:
+        _dca_schedule.clear()
+        _pending_recovery_symbols.clear()
 
-def _wrap_diff(a_min: int, b_min: int) -> int:
-    """Shortest signed distance from b to a on a 24h clock (range -720 to +719)."""
-    return (a_min - b_min + _DAY // 2) % _DAY - _DAY // 2
-
-
-def refresh_dca_schedule(raw_json: str | None) -> None:
-    """Parse DCA_TARGET_MAP and update the scheduler's target times."""
     if not raw_json:
+        clear_schedule()
         return
     try:
         target_map = json.loads(raw_json)
     except (json.JSONDecodeError, ValueError):
+        clear_schedule()
         return
+    try:
+        execution_state = json.loads(execution_state_json or "{}")
+    except (json.JSONDecodeError, ValueError):
+        clear_schedule()
+        return
+
+    if not isinstance(target_map, dict) or not target_map:
+        clear_schedule()
+        return
+    if not isinstance(execution_state, dict):
+        clear_schedule()
+        return
+
+    def valid_date(value) -> bool:
+        if value == "":
+            return True
+        if not isinstance(value, str):
+            return False
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d") == value
+        except ValueError:
+            return False
+
+    for symbol, config in target_map.items():
+        if not isinstance(symbol, str) or not re.fullmatch(r"[A-Z0-9]+_GBP", symbol):
+            clear_schedule()
+            return
+        if not isinstance(config, dict):
+            clear_schedule()
+            return
+        if "AMOUNT" in config or "LAST_BUY_DATE" in config or "PENDING_ORDER" in config:
+            clear_schedule()
+            return
+        enabled = config.get("BUY_ENABLED")
+        amount = config.get("AMOUNT_GBP")
+        target_time = config.get("TIME")
+        if not isinstance(enabled, bool):
+            clear_schedule()
+            return
+        if (
+            isinstance(amount, bool)
+            or not isinstance(amount, (int, float))
+            or not math.isfinite(amount)
+            or amount < (DCA_AMOUNT_MIN_GBP if enabled else 0)
+            or amount > DCA_AMOUNT_MAX_GBP
+        ):
+            clear_schedule()
+            return
+        if not isinstance(target_time, str) or not re.fullmatch(
+            r"(?:[01]\d|2[0-3]):[0-5]\d", target_time
+        ):
+            clear_schedule()
+            return
+
+    for symbol, state_entry in execution_state.items():
+        if not isinstance(symbol, str) or not re.fullmatch(r"[A-Z0-9]+_GBP", symbol):
+            clear_schedule()
+            return
+        if not isinstance(state_entry, dict) or not valid_date(
+            state_entry.get("LAST_BUY_DATE", "")
+        ):
+            clear_schedule()
+            return
+        pending = state_entry.get("PENDING_ORDER")
+        if pending is None:
+            continue
+        if not isinstance(pending, dict):
+            clear_schedule()
+            return
+        pending_amount = pending.get("amount_gbp")
+        if (
+            not isinstance(pending.get("client_order_id"), str)
+            or not re.fullmatch(r"dca-[0-9a-f]{14}", pending["client_order_id"])
+            or not valid_date(pending.get("trade_date"))
+            or isinstance(pending_amount, bool)
+            or not isinstance(pending_amount, (int, float))
+            or not math.isfinite(pending_amount)
+            or not DCA_AMOUNT_MIN_GBP <= pending_amount <= DCA_AMOUNT_MAX_GBP
+        ):
+            clear_schedule()
+            return
 
     # Collect enabled symbols grouped by their TIME, preserving LAST_BUY_DATE
     time_slots: dict[str, dict[str, str]] = {}
     for symbol, config in target_map.items():
+        if not isinstance(symbol, str) or not re.fullmatch(r"[A-Z0-9]+_GBP", symbol):
+            continue
         if not isinstance(config, dict):
             continue
-        if not config.get("BUY_ENABLED", True):
+        if not config.get("BUY_ENABLED", False):
             continue
         time_val = config.get("TIME", "")
-        if not re.match(r"^\d{2}:\d{2}$", time_val):
+        if not isinstance(time_val, str) or not re.fullmatch(
+            r"(?:[01]\d|2[0-3]):[0-5]\d", time_val
+        ):
             continue
-        time_slots.setdefault(time_val, {})[symbol] = config.get("LAST_BUY_DATE", "")
+        state_entry = execution_state.get(symbol, {})
+        if not isinstance(state_entry, dict):
+            continue
+        time_slots.setdefault(time_val, {})[symbol] = state_entry.get(
+            "LAST_BUY_DATE", ""
+        )
 
     _dca_schedule.clear()
     _dca_schedule.update({
         time_val: {"symbols": symbols}
         for time_val, symbols in time_slots.items()
     })
+    _pending_recovery_symbols.clear()
+    _pending_recovery_symbols.update(
+        symbol
+        for symbol, state_entry in execution_state.items()
+        if isinstance(symbol, str)
+        and re.fullmatch(r"[A-Z0-9]+_GBP", symbol)
+        and isinstance(state_entry, dict)
+        and isinstance(state_entry.get("PENDING_ORDER"), dict)
+    )
 
 
 def _get_repo_variable_and_refresh(name: str) -> str | None:
-    """Fetch a repo variable; if it's DCA_TARGET_MAP, opportunistically refresh the schedule."""
-    value = get_repo_variable(name)
-    if name == "DCA_TARGET_MAP" and value and DCA_CRON_ENABLED:
-        refresh_dca_schedule(value)
-    return value
+    """Fetch one repository variable without mutating scheduler state."""
+    return get_repo_variable(name)
 
 
 def _format_cron_status() -> str:
@@ -301,12 +435,12 @@ def _format_cron_status() -> str:
         symbols_dict = info["symbols"]
         all_bought = all(lbd == today for lbd in symbols_dict.values())
 
-        # Compute all aligned dispatch times in the -30/+60 min window, sorted by offset from target
+        # Compute all aligned dispatch times in the -5/+60 min window, sorted by offset from target
         slots: list[tuple[int, int]] = []  # (diff, slot_min)
-        for quarter in range(0, 24 * 4):
-            slot_min = quarter * 15
-            diff = _wrap_diff(slot_min, target_min)
-            if -30 <= diff <= 60:
+        for tick in range(0, 24 * 12):
+            slot_min = tick * 5
+            diff = slot_min - target_min
+            if -5 <= diff <= 60:
                 slots.append((diff, slot_min))
         slots.sort()
 
@@ -314,7 +448,7 @@ def _format_cron_status() -> str:
         for diff, slot_min in slots:
             hh, mm = divmod(slot_min, 60)
             tag = f"{hh:02d}:{mm:02d}"
-            slot_passed = _wrap_diff(current_min, slot_min) >= 0
+            slot_passed = current_min >= slot_min
             if all_bought or slot_passed:
                 tag = f"~~{tag}~~"
             dispatch_times.append(tag)
@@ -333,73 +467,83 @@ def _format_cron_status() -> str:
 def _symbols_from_dca_map() -> str:
     """Derive analysis symbols from DCA_TARGET_MAP on GitHub.
 
-    Fetches the current DCA_TARGET_MAP repo variable and converts
-    THB trading pair keys to USDT pairs for CCXT analysis.
-    Returns comma-separated string like 'BTC/USDT, LINK/USDT, SUI/USDT'.
-    Falls back to 'BTC/USDT' if the map cannot be read.
+    Only canonical ``COIN_GBP`` keys are accepted. Invalid or old keys are
+    skipped so they can never be silently reinterpreted as pound budgets.
     """
     raw = _get_repo_variable_and_refresh("DCA_TARGET_MAP")
     if not raw:
-        return "BTC/USDT"
+        raise ValueError("DCA_TARGET_MAP could not be loaded")
     try:
         target_map = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
-        return "BTC/USDT"
+        raise ValueError("DCA_TARGET_MAP is not valid JSON")
+    if not isinstance(target_map, dict) or not target_map:
+        raise ValueError("DCA_TARGET_MAP must be a non-empty object")
 
     symbols = []
     for key in target_map:
-        if "_THB" in key:
-            base = key.replace("_THB", "")
-            symbols.append(f"{base}/USDT")
-        elif "/" in key:
-            symbols.append(key)
-        else:
-            symbols.append(key)
-    result = ", ".join(symbols) if symbols else "BTC/USDT"
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Z0-9]+_GBP", key):
+            raise ValueError("DCA_TARGET_MAP contains a non-GBP target key")
+        symbols.append(f"{key[:-4]}/GBP")
+    result = ", ".join(symbols)
     print(f"📋 Derived symbols from DCA_TARGET_MAP: {result}")
     return result
 
 
-def _to_usdt_pair(coin: str) -> str:
-    """Normalise any coin reference to a COIN/USDT pair for CCXT analysis.
-
-    Handles plain names ("BTC", "link"), COIN/USDT, COIN_USDT, COIN_THB, and
-    full names mapped via a small lookup table.
-    """
+def _normalise_gbp_key(coin: str) -> str:
+    """Return a canonical ``COIN_GBP`` key and reject non-GBP pairs."""
     FULL_NAMES: dict = {
         "bitcoin": "BTC", "ethereum": "ETH", "chainlink": "LINK",
         "solana": "SOL", "sui": "SUI", "cardano": "ADA", "ripple": "XRP",
         "dogecoin": "DOGE", "shiba": "SHIB", "polkadot": "DOT",
     }
     raw = coin.strip().lower()
-    # Resolve full English names first
     raw = FULL_NAMES.get(raw, raw).upper()
-    # Strip known suffixes: COIN/USDT, COIN_USDT, COIN_THB, COIN/THB, etc.
-    for sep in ("/USDT", "_USDT", "/BUSD", "_BUSD", "/THB", "_THB", "/USD"):
-        if raw.endswith(sep):
-            raw = raw[: -len(sep)]
-            break
-    # Keep only the base if a "/" remains (e.g. "BTC/BNB" edge case)
-    if "/" in raw:
-        raw = raw.split("/")[0]
-    return f"{raw}/USDT"
+    normalized = raw.replace("/", "_")
+    parts = normalized.split("_")
+    if len(parts) > 2 or (len(parts) == 2 and parts[1] != "GBP"):
+        raise ValueError("Only GBP trading pairs are supported")
+    base = parts[0]
+    if not re.fullmatch(r"[A-Z0-9]+", base):
+        raise ValueError("Invalid coin symbol")
+    return f"{base}_GBP"
+
+
+def _to_gbp_pair(coin: str) -> str:
+    """Return a canonical ``COIN/GBP`` analysis pair."""
+    key = _normalise_gbp_key(coin)
+    return f"{key[:-4]}/GBP"
 
 
 async def handle_analyze(params: dict, message: discord.Message):
     """Trigger the crypto analysis workflow."""
+    if not _is_authorized_config_writer(message):
+        await message.reply(
+            "⛔ Analysis can update DCA times and requires an explicitly "
+            "allowlisted Discord user."
+        )
+        return
+
     symbols_raw = params.get("symbols", "") or ""
     short = params.get("short_report", True)
 
     if symbols_raw.strip():
-        # Normalise plain coin names / any format to COIN/USDT for CCXT
-        symbols = ", ".join(
-            _to_usdt_pair(s)
-            for s in re.split(r"[,\s]+", symbols_raw.strip())
-            if s
-        )
+        try:
+            symbols = ", ".join(
+                _to_gbp_pair(s)
+                for s in re.split(r"[,\s]+", symbols_raw.strip())
+                if s
+            )
+        except ValueError as error:
+            await message.reply(f"❌ {error}")
+            return
     else:
         # Fall back to deriving from the live DCA_TARGET_MAP
-        symbols = _symbols_from_dca_map()
+        try:
+            symbols = _symbols_from_dca_map()
+        except ValueError as error:
+            await message.reply(f"❌ {error}")
+            return
 
     inputs = {
         "symbol": str(symbols),
@@ -430,30 +574,46 @@ async def handle_portfolio(params: dict, message: discord.Message):
 
 async def handle_status(params: dict, message: discord.Message):
     """Fetch and display the current DCA_TARGET_MAP configuration."""
-    raw = _get_repo_variable_and_refresh("DCA_TARGET_MAP")
+    raw, execution_state_raw = await asyncio.gather(
+        asyncio.to_thread(get_repo_variable, "DCA_TARGET_MAP"),
+        asyncio.to_thread(get_repo_variable, EXECUTION_STATE_VARIABLE),
+    )
     if not raw:
         await message.reply("❌ Could not fetch DCA_TARGET_MAP from GitHub")
         return
 
     try:
         target_map = json.loads(raw)
+        execution_state = json.loads(execution_state_raw or "{}")
+        if not isinstance(target_map, dict) or not isinstance(execution_state, dict):
+            raise ValueError("configuration variables must be JSON objects")
     except (json.JSONDecodeError, ValueError):
-        await message.reply(f"⚠️ DCA_TARGET_MAP is malformed:\n```{raw[:500]}```")
+        await message.reply("⚠️ DCA rules or execution state are malformed.")
         return
 
     lines = ["**📋 Current DCA Configuration**\n"]
     for symbol, config in target_map.items():
+        if not isinstance(symbol, str) or not re.fullmatch(r"[A-Z0-9]+_GBP", symbol):
+            lines.append(f"⚠️ **{symbol}** — unsupported config key; migrate it to `COIN_GBP`")
+            continue
         if isinstance(config, dict):
-            enabled = config.get("BUY_ENABLED", True)
+            enabled = config.get("BUY_ENABLED", False)
             status = "🟢" if enabled else "🔴"
+            state_entry = execution_state.get(symbol, {})
+            if not isinstance(state_entry, dict):
+                state_entry = {}
+            pending_label = " — ⚠️ reconciliation pending" if isinstance(
+                state_entry.get("PENDING_ORDER"), dict
+            ) else ""
             lines.append(
                 f"{status} **{symbol}** — "
                 f"Time: `{config.get('TIME', '?')}`, "
-                f"Amount: `{config.get('AMOUNT', '?')}` THB, "
-                f"Last Buy: `{config.get('LAST_BUY_DATE', 'never')}`"
+                f"Amount: `£{config.get('AMOUNT_GBP', '?')}`, "
+                f"Last Buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}`"
+                f"{pending_label}"
             )
         else:
-            lines.append(f"🟢 **{symbol}** — `{config}`")
+            lines.append(f"⚠️ **{symbol}** — unsupported non-object configuration")
 
     cron_status = _format_cron_status()
     if cron_status:
@@ -462,8 +622,23 @@ async def handle_status(params: dict, message: discord.Message):
     await message.reply("\n".join(lines))
 
 
-async def handle_update_dca(params: dict, message: discord.Message):
+async def handle_update_dca(
+    params: dict,
+    message: discord.Message,
+    *,
+    enable_confirmed: bool = False,
+    confirmed_snapshot: dict | None = None,
+):
     """Update a field in DCA_TARGET_MAP and save to GitHub."""
+    if not _is_authorized_config_writer(message):
+        await message.reply(
+            "⛔ Configuration changes require `DISCORD_ALLOWED_USERS` and an "
+            "explicitly allowlisted Discord user."
+        )
+        return
+    if not enable_confirmed:
+        _pending_enable_confirmations.pop(_message_author_id(message), None)
+
     symbol = str(params.get("symbol", "")).upper().strip()
     field = str(params.get("field", "")).upper()
     value = params.get("value")
@@ -472,17 +647,19 @@ async def handle_update_dca(params: dict, message: discord.Message):
         await message.reply("❌ Missing required params: `symbol`, `field`, `value`")
         return
 
-    # Normalise symbol to COIN_THB format regardless of what the AI returned
-    # e.g. "BTC", "BTC/USDT", "BTC_USDT", "BTC/THB" all → "BTC_THB"
-    for sep in ("/USDT", "_USDT", "/BUSD", "_BUSD", "/THB", "/USD"):
-        if symbol.endswith(sep):
-            symbol = symbol[: -len(sep)]
-            break
-    if not symbol.endswith("_THB"):
-        symbol = f"{symbol}_THB"
+    try:
+        symbol = _normalise_gbp_key(symbol)
+    except ValueError as error:
+        await message.reply(f"❌ {error}")
+        return
+
+    # "amount" is a convenient natural-language alias; the stored field is
+    # deliberately explicit so a number can never be mistaken for another currency.
+    if field == "AMOUNT":
+        field = "AMOUNT_GBP"
 
     # Validate field
-    allowed_fields = {"TIME", "AMOUNT", "BUY_ENABLED"}
+    allowed_fields = {"TIME", "AMOUNT_GBP", "BUY_ENABLED"}
     if field not in allowed_fields:
         await message.reply(f"❌ Can only update: {', '.join(sorted(allowed_fields))}")
         return
@@ -498,17 +675,17 @@ async def handle_update_dca(params: dict, message: discord.Message):
             await message.reply("❌ TIME must be between 00:00 and 23:59")
             return
 
-    elif field == "AMOUNT":
+    elif field == "AMOUNT_GBP":
         try:
             value = float(value)
-            if value < DCA_AMOUNT_MIN_THB or value > DCA_AMOUNT_MAX_THB:
+            if value < DCA_AMOUNT_MIN_GBP or value > DCA_AMOUNT_MAX_GBP:
                 raise ValueError("out of range")
             if value == int(value):
                 value = int(value)
         except (ValueError, TypeError):
             await message.reply(
-                f"❌ AMOUNT must be a number between {DCA_AMOUNT_MIN_THB} and "
-                f"{DCA_AMOUNT_MAX_THB}"
+                f"❌ AMOUNT_GBP must be between £{DCA_AMOUNT_MIN_GBP} and "
+                f"£{DCA_AMOUNT_MAX_GBP}"
             )
             return
 
@@ -543,114 +720,110 @@ async def handle_update_dca(params: dict, message: discord.Message):
         await message.reply(f"❌ Config for {symbol} is not in dict format, cannot update")
         return
 
-    # Apply update
+    if field == "BUY_ENABLED" and value is True:
+        try:
+            configured_amount = float(target_map[symbol].get("AMOUNT_GBP"))
+        except (TypeError, ValueError):
+            configured_amount = 0
+        if not DCA_AMOUNT_MIN_GBP <= configured_amount <= DCA_AMOUNT_MAX_GBP:
+            await message.reply(
+                f"⛔ Set AMOUNT_GBP between £{DCA_AMOUNT_MIN_GBP} and "
+                f"£{DCA_AMOUNT_MAX_GBP} before enabling {symbol}."
+            )
+            return
+
+        if not enable_confirmed:
+            author_id = _message_author_id(message)
+            confirmation_command = f"{CONFIG_WRITE_PREFIX}confirm enable {symbol}"
+            _pending_enable_confirmations[author_id] = {
+                "symbol": symbol,
+                "command": confirmation_command,
+                "amount_gbp": configured_amount,
+                "time": target_map[symbol].get("TIME"),
+                "expires_at": monotonic() + ENABLE_CONFIRMATION_TTL_SECONDS,
+            }
+            await message.reply(
+                f"⚠️ Enabling **{symbol}** permits real Kraken orders. "
+                f"To confirm, send exactly `{confirmation_command}` within "
+                f"{ENABLE_CONFIRMATION_TTL_SECONDS // 60} minutes."
+            )
+            return
+
+        if confirmed_snapshot is None or (
+            configured_amount != confirmed_snapshot.get("amount_gbp")
+            or target_map[symbol].get("TIME") != confirmed_snapshot.get("time")
+        ):
+            await message.reply(
+                "⛔ The amount or time changed after confirmation was requested. "
+                "Start the enable command again to review the current rules."
+            )
+            return
+
+    # Queue the one-field update through the same GitHub concurrency group as
+    # analysis and trading. Railway never PATCHes the shared rules map directly.
     old_value = target_map[symbol].get(field)
-    target_map[symbol][field] = value
-
-    # Save back to GitHub
-    new_json = json.dumps(target_map, separators=(",", ":"))
-    if update_repo_variable("DCA_TARGET_MAP", new_json):
-        # Refresh scheduler with the updated config
-        if DCA_CRON_ENABLED:
-            refresh_dca_schedule(new_json)
-        # Build recap of full updated config
-        lines = [f"✅ Updated **{symbol}** → **{field}**: `{old_value}` → `{value}`\n"]
-        lines.append("**📋 DCA Configuration**\n")
-        for sym, config in target_map.items():
-            if isinstance(config, dict):
-                enabled = config.get("BUY_ENABLED", True)
-                status = "🟢" if enabled else "🔴"
-                lines.append(
-                    f"{status} **{sym}** — "
-                    f"Time: `{config.get('TIME', '?')}`, "
-                    f"Amount: `{config.get('AMOUNT', '?')}` THB, "
-                    f"Last Buy: `{config.get('LAST_BUY_DATE', 'never')}`"
-                )
-            else:
-                lines.append(f"🟢 **{sym}** — `{config}`")
-        cron_status = _format_cron_status()
-        if cron_status:
-            lines.append(cron_status)
-        await message.reply("\n".join(lines))
+    inputs = {
+        "symbol": symbol,
+        "field": field,
+        "value_json": json.dumps(value, separators=(",", ":")),
+    }
+    if field == "BUY_ENABLED" and value is True:
+        inputs.update(
+            {
+                "expected_amount_gbp_json": json.dumps(
+                    confirmed_snapshot["amount_gbp"], separators=(",", ":")
+                ),
+                "expected_time": str(confirmed_snapshot["time"]),
+            }
+        )
+    if trigger_workflow("update_dca_config.yml", inputs):
+        old_display = f"£{old_value}" if field == "AMOUNT_GBP" else str(old_value)
+        new_display = f"£{value}" if field == "AMOUNT_GBP" else str(value)
+        await message.reply(
+            f"✅ Queued **{symbol}** → **{field}**: "
+            f"`{old_display}` → `{new_display}`. "
+            "GitHub will apply it against the latest rules in the serialized writer queue."
+        )
     else:
-        await message.reply("❌ Failed to save DCA_TARGET_MAP to GitHub")
+        await message.reply("❌ Failed to queue the DCA configuration update")
 
 
-async def handle_buy_now(params: dict, message: discord.Message):
-    """Set a symbol's TIME to now, enable it, and dispatch the workflow immediately."""
-    symbol = str(params.get("symbol", "")).upper().strip()
-    if not symbol:
-        await message.reply("❌ Please specify which coin to buy (e.g., 'buy LINK now')")
+async def _handle_enable_confirmation(
+    message: discord.Message, raw_text: str
+) -> None:
+    """Apply only an exact, unexpired confirmation from the initiating user."""
+    if not _is_authorized_config_writer(message):
+        await message.reply(
+            "⛔ Enable confirmations require an explicitly allowlisted Discord user."
+        )
         return
 
-    # Normalise to COIN_THB
-    for sep in ("/USDT", "_USDT", "/BUSD", "_BUSD", "/THB", "/USD"):
-        if symbol.endswith(sep):
-            symbol = symbol[: -len(sep)]
-            break
-    if not symbol.endswith("_THB"):
-        symbol = f"{symbol}_THB"
-
-    # Fetch current map
-    raw = _get_repo_variable_and_refresh("DCA_TARGET_MAP")
-    if not raw:
-        await message.reply("❌ Could not fetch DCA_TARGET_MAP from GitHub")
+    author_id = _message_author_id(message)
+    pending = _pending_enable_confirmations.get(author_id)
+    if not pending:
+        await message.reply("⛔ No enable confirmation is pending for your user.")
+        return
+    if monotonic() > pending["expires_at"]:
+        _pending_enable_confirmations.pop(author_id, None)
+        await message.reply("⛔ That enable confirmation expired; start again.")
+        return
+    if raw_text != pending["command"]:
+        await message.reply(
+            f"⛔ Confirmation did not match. Send exactly `{pending['command']}`."
+        )
         return
 
-    try:
-        target_map = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        await message.reply("❌ DCA_TARGET_MAP is malformed, cannot update safely")
-        return
-
-    if symbol not in target_map:
-        available = ", ".join(target_map.keys())
-        await message.reply(f"❌ Symbol **{symbol}** not found. Available: {available}")
-        return
-
-    if not isinstance(target_map[symbol], dict):
-        await message.reply(f"❌ Config for {symbol} is not in dict format")
-        return
-
-    # Use current time so the scheduler window (-30 to +60 min) triggers immediately
-    new_time = datetime.now(TIMEZONE).strftime("%H:%M")
-    old_time = target_map[symbol].get("TIME", "?")
-    was_enabled = target_map[symbol].get("BUY_ENABLED", True)
-
-    # Update TIME and ensure BUY_ENABLED=true (never touch LAST_BUY_DATE)
-    target_map[symbol]["TIME"] = new_time
-    target_map[symbol]["BUY_ENABLED"] = True
-
-    # Save to GitHub
-    new_json = json.dumps(target_map, separators=(",", ":"))
-    if not update_repo_variable("DCA_TARGET_MAP", new_json):
-        await message.reply("❌ Failed to save DCA_TARGET_MAP to GitHub")
-        return
-
-    # Refresh scheduler
-    if DCA_CRON_ENABLED:
-        refresh_dca_schedule(new_json)
-
-    # Dispatch workflow immediately
-    dispatched = await asyncio.to_thread(trigger_workflow, "daily_dca.yml")
-
-    # Build response
-    changes = [f"⏰ TIME: `{old_time}` → `{new_time}`"]
-    if not was_enabled:
-        changes.append("🟢 BUY_ENABLED: `false` → `true`")
-    dispatch_status = "✅ Workflow dispatched" if dispatched else "❌ Workflow dispatch failed"
-
-    last_buy = target_map[symbol].get("LAST_BUY_DATE", "")
-    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    warning = ""
-    if last_buy == today:
-        warning = f"\n⚠️ **Note:** LAST_BUY_DATE is already `{today}` — the workflow may skip this buy."
-
-    await message.reply(
-        f"🚀 **Buy Now: {symbol}**\n"
-        + "\n".join(changes)
-        + f"\n{dispatch_status}"
-        + warning
+    symbol = pending["symbol"]
+    confirmed_snapshot = {
+        "amount_gbp": pending["amount_gbp"],
+        "time": pending["time"],
+    }
+    _pending_enable_confirmations.pop(author_id, None)
+    await handle_update_dca(
+        {"symbol": symbol, "field": "BUY_ENABLED", "value": True},
+        message,
+        enable_confirmed=True,
+        confirmed_snapshot=confirmed_snapshot,
     )
 
 
@@ -678,8 +851,8 @@ async def handle_accounts(params: dict, message: discord.Message):
 HELP_TEXT = """**🤖 DCA Bot — Natural Language Commands**
 
 **Analysis:**
-• "Run analysis" / "Analyze BTC and LINK"
-• "Full analysis for BTC/USDT" (detailed report)
+• "!dca run analysis" / "!dca analyze BTC and LINK"
+• "!dca full analysis for BTC/GBP" (detailed report)
 
 **Portfolio:**
 • "Check portfolio" / "Show my balance"
@@ -688,13 +861,14 @@ HELP_TEXT = """**🤖 DCA Bot — Natural Language Commands**
 **DCA Config:**
 • "Show status" / "What's the current config?"
 • "Show accounts" / "Portfolio account map"
-• "Set BTC amount to 600" / "Change LINK amount to 200"
-• "Set BTC time to 22:00"
-• "Disable LINK" / "Enable BTC"
-• "Buy LINK now" / "Purchase SUI immediately"
-✅ AMOUNT range: 50–2000 THB per coin
+• "!dca set BTC amount to 25 pounds"
+• "!dca set BTC time to 22:00"
+• "!dca disable LINK" / "!dca enable BTC"
+✅ AMOUNT_GBP range: £5–£1000 per coin; Kraken's live market minimum is also checked
+⛔ Config-changing commands require the exact `!dca ` prefix and an allowlisted user
+⛔ Enabling a target requires the exact confirmation command returned by the bot
 
-All commands are interpreted via AI — just type naturally!
+Read-only commands remain conversational; config writes require the safety prefix.
 """
 
 
@@ -716,40 +890,70 @@ client = discord.Client(intents=intents)
 # Scheduled tasks (DCA cron replacement)
 # ---------------------------------------------------------------------------
 
-# Clock-aligned times: every 15 min at :00, :15, :30, :45 in the configured timezone
-_QUARTER_HOURS = [
+# Clock-aligned times every five minutes. This covers every valid HH:MM target,
+# including 23:51-23:59 without incorrectly wrapping it into the next day.
+_FIVE_MINUTE_TICKS = [
     datetime.strptime(f"{h:02d}:{m:02d}", "%H:%M").time().replace(tzinfo=TIMEZONE)
-    for h in range(24) for m in (0, 15, 30, 45)
+    for h in range(24) for m in range(0, 60, 5)
 ]
 
 
-@tasks.loop(time=_QUARTER_HOURS)
+def _due_symbols_for_dispatch(now: datetime) -> list[str]:
+    """Return due or unresolved symbols outside the temporary dispatch cooldown."""
+    today = now.strftime("%Y-%m-%d")
+    current_min = now.hour * 60 + now.minute
+    now_monotonic = monotonic()
+    for entry, dispatched_at in list(_dca_dispatch_guard.items()):
+        if entry[1] != today or now_monotonic - dispatched_at >= DISPATCH_RETRY_SECONDS:
+            _dca_dispatch_guard.pop(entry, None)
+
+    triggered_symbols: list[str] = [
+        symbol
+        for symbol in sorted(_pending_recovery_symbols)
+        if (symbol, today) not in _dca_dispatch_guard
+    ]
+    for time_str, info in _dca_schedule.items():
+        h, m = map(int, time_str.split(":"))
+        target_min = h * 60 + m
+        # Never wrap a late-night target into the next local day. The GitHub
+        # quick check uses the same same-day arithmetic.
+        diff = current_min - target_min
+
+        # Align with the GitHub quick check: do not mark an early dispatch as
+        # complete when the workflow would still decline to run the trader.
+        if not -5 <= diff <= 60:
+            continue
+
+        for symbol, last_buy_date in info["symbols"].items():
+            if last_buy_date == today:
+                continue
+            if symbol in triggered_symbols or (symbol, today) in _dca_dispatch_guard:
+                continue
+            triggered_symbols.append(symbol)
+
+    return triggered_symbols
+
+
+@tasks.loop(time=_FIVE_MINUTE_TICKS)
 async def dca_scheduler_tick():
-    """Check if any DCA target is within its -30/+60 min trigger window and dispatch the workflow."""
-    if not _dca_schedule:
+    """Dispatch due symbols, retrying until execution state confirms completion."""
+    if not _dca_schedule and not _pending_recovery_symbols:
         return
 
     now = datetime.now(TIMEZONE)
-    today = now.strftime("%Y-%m-%d")
-    current_min = now.hour * 60 + now.minute
-    should_dispatch = False
-    triggered_symbols: list[str] = []
+    triggered_symbols = _due_symbols_for_dispatch(now)
+    if not triggered_symbols:
+        return
 
-    for time_str, info in _dca_schedule.items():
-        # Check if current clock quarter is within -30 to +60 min of target
-        h, m = map(int, time_str.split(":"))
-        target_min = h * 60 + m
-        diff = _wrap_diff(current_min, target_min)
-
-        if -30 <= diff <= 60:
-            should_dispatch = True
-            triggered_symbols.extend(info["symbols"].keys())
-
-    if should_dispatch:
-        success = await asyncio.to_thread(trigger_workflow, "daily_dca.yml")
-        status = "✅" if success else "❌"
-        symbols_str = ", ".join(triggered_symbols)
-        print(f"{status} DCA cron dispatch for [{symbols_str}] at {now.strftime('%H:%M')}")
+    success = await asyncio.to_thread(trigger_workflow, "daily_dca.yml")
+    status = "✅" if success else "❌"
+    symbols_str = ", ".join(triggered_symbols)
+    print(f"{status} DCA cron dispatch for [{symbols_str}] at {now.strftime('%H:%M')}")
+    if success:
+        today = now.strftime("%Y-%m-%d")
+        dispatched_at = monotonic()
+        for symbol in triggered_symbols:
+            _dca_dispatch_guard[(symbol, today)] = dispatched_at
 
 
 
@@ -773,14 +977,17 @@ async def _notify(content: str) -> None:
 async def dca_schedule_refresh():
     """Periodically refresh the DCA schedule from GitHub."""
     try:
-        raw = await asyncio.to_thread(get_repo_variable, "DCA_TARGET_MAP")
+        raw, execution_state_raw = await asyncio.gather(
+            asyncio.to_thread(get_repo_variable, "DCA_TARGET_MAP"),
+            asyncio.to_thread(get_repo_variable, EXECUTION_STATE_VARIABLE),
+        )
         if not raw:
             msg = "⚠️ DCA schedule refresh failed: GitHub returned no data for DCA_TARGET_MAP — schedule unchanged"
             print(msg)
             await _notify(msg)
             return
         old_times = set(_dca_schedule.keys())
-        refresh_dca_schedule(raw)
+        refresh_dca_schedule(raw, execution_state_raw or "{}")
         new_times = set(_dca_schedule.keys())
         if new_times != old_times:
             added = new_times - old_times
@@ -812,7 +1019,6 @@ ACTION_HANDLERS = {
     "portfolio": handle_portfolio,
     "status": handle_status,
     "update_dca": handle_update_dca,
-    "buy_now": handle_buy_now,
     "accounts": handle_accounts,
     "help": handle_help,
 }
@@ -827,13 +1033,16 @@ async def on_ready():
     if ALLOWED_USERS:
         print(f"🔒 Allowed user IDs: {ALLOWED_USERS}")
     else:
-        print("⚠️ No DISCORD_ALLOWED_USERS set — any user in the channel can trigger actions")
+        print("⚠️ No DISCORD_ALLOWED_USERS set — all configuration writes are blocked")
 
     # Start DCA scheduler if enabled
     if DCA_CRON_ENABLED:
         # Initial schedule load
-        raw = await asyncio.to_thread(get_repo_variable, "DCA_TARGET_MAP")
-        refresh_dca_schedule(raw)
+        raw, execution_state_raw = await asyncio.gather(
+            asyncio.to_thread(get_repo_variable, "DCA_TARGET_MAP"),
+            asyncio.to_thread(get_repo_variable, EXECUTION_STATE_VARIABLE),
+        )
+        refresh_dca_schedule(raw, execution_state_raw or "{}")
         if _dca_schedule:
             times = ", ".join(sorted(_dca_schedule.keys()))
             print(f"⏰ DCA scheduler loaded: {times}")
@@ -843,7 +1052,7 @@ async def on_ready():
             dca_scheduler_tick.start()
         if not dca_schedule_refresh.is_running():
             dca_schedule_refresh.start()
-        print(f"⏰ DCA scheduler started (-30/+60 min window, 15 min ticks, TZ={TIMEZONE})")
+        print(f"⏰ DCA scheduler started (-5/+60 min window, 5 min ticks, TZ={TIMEZONE})")
 
 
 @client.event
@@ -879,9 +1088,22 @@ async def on_message(message: discord.Message):
         await message.reply(HELP_TEXT)
         return
 
+    # Exact enable confirmations bypass AI classification entirely.
+    if text.startswith(f"{CONFIG_WRITE_PREFIX}confirm"):
+        await _handle_enable_confirmation(message, text)
+        return
+
+    has_write_prefix = text.startswith(CONFIG_WRITE_PREFIX)
+    classification_text = (
+        text[len(CONFIG_WRITE_PREFIX) :].strip() if has_write_prefix else text
+    )
+    if has_write_prefix and not classification_text:
+        await message.reply("❌ Add a configuration command after the exact `!dca ` prefix.")
+        return
+
     # Classify intent via Gemini (show typing indicator while processing)
     async with message.channel.typing():
-        intent = await classify_intent(text)
+        intent = await classify_intent(classification_text)
 
     action = intent.get("action", "unknown")
     params = intent.get("params", {})
@@ -890,14 +1112,9 @@ async def on_message(message: discord.Message):
 
     handler = ACTION_HANDLERS.get(action)
     if handler:
-        # Block write actions when no user allowlist is configured (and this isn't a DM).
-        # Users with DISCORD_ALLOWED_USERS set are unaffected — this branch is never reached.
-        _WRITE_ACTIONS = {"analyze", "portfolio", "update_dca", "buy_now"}
-        if not ALLOWED_USERS and not is_dm and action in _WRITE_ACTIONS:
-            await message.reply(
-                "⚠️ Action commands require `DISCORD_ALLOWED_USERS` to be configured. "
-                "Contact the bot owner to set up access control."
-            )
+        block_reason = _config_write_block_reason(action, text, message)
+        if block_reason:
+            await message.reply(f"⛔ {block_reason}")
             return
         await handler(params, message)
     elif action == "unknown":
@@ -917,8 +1134,16 @@ async def on_message(message: discord.Message):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    missing = [v for v in ("DISCORD_BOT_TOKEN", "GEMINI_API_KEY", "GH_PAT", "GITHUB_REPO")
+    missing = [v for v in (
+        "DISCORD_BOT_TOKEN",
+        "GEMINI_API_KEY",
+        "GH_PAT",
+        "GITHUB_REPO",
+        "GITHUB_WORKFLOW_REF",
+    )
                if not os.environ.get(v)]
+    if not GITHUB_WORKFLOW_REF and "GITHUB_WORKFLOW_REF" not in missing:
+        missing.append("GITHUB_WORKFLOW_REF")
     if missing:
         print(f"❌ Missing required environment variables: {', '.join(missing)}")
         print("\nRequired:")
@@ -926,6 +1151,7 @@ if __name__ == "__main__":
         print("  GEMINI_API_KEY      - Google AI Studio API key")
         print("  GH_PAT             - GitHub PAT with repo scope")
         print("  GITHUB_REPO        - owner/repo format")
+        print("  GITHUB_WORKFLOW_REF - exact branch or tag for workflow dispatches")
         print("\nOptional:")
         print("  DISCORD_CHANNEL_ID  - Restrict to one channel")
         print("  DISCORD_ALLOWED_USERS - Comma-separated Discord user IDs")

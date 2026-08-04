@@ -1,117 +1,113 @@
-import os
-import json
-import math
-import time
-import requests
-from datetime import datetime, timedelta, timezone as dt_timezone
+"""Best-effort Ghostfolio logging for Kraken trades settled in GBP.
 
-# Ghostfolio Configuration
+Kraken remains the source of truth for the GBP trade. Ghostfolio's crypto
+profiles are USD-denominated, so this module alone converts the GBP unit price
+to USD immediately before importing an optional portfolio activity.
+"""
+
+import math
+import os
+import time
+from datetime import datetime, timezone as dt_timezone
+from zoneinfo import ZoneInfo
+
+import requests
+
+
 GHOSTFOLIO_URL = os.environ.get("GHOSTFOLIO_URL", "https://ghostfol.io")
 GHOSTFOLIO_TOKEN = os.environ.get("GHOSTFOLIO_TOKEN")
-PORTFOLIO_ACCOUNT_MAP_JSON = os.environ.get("PORTFOLIO_ACCOUNT_MAP", "{}")
 
-# Overrides for coins where Yahoo Finance's {symbol}USD ticker is wrong or maps to the
-# wrong asset. Keys are the base crypto symbol (e.g. "SUI"). Values are the exact
-# dataSource + symbol pair that Ghostfolio should use instead.
-# COINGECKO symbols are the CoinGecko coin ID (lowercase).
+# Some ticker strings identify the wrong asset through Yahoo. These mappings
+# deliberately use Ghostfolio's exact provider identifier.
 SYMBOL_DATASOURCE_OVERRIDES = {
     "HYPE": {"dataSource": "COINGECKO", "symbol": "hyperliquid"},
     "SUI": {"dataSource": "COINGECKO", "symbol": "sui"},
 }
-
-# These tickers are known to identify more than one asset. They must never use
-# the conventional Yahoo {ticker}USD fallback without an explicit mapping.
 AMBIGUOUS_SYMBOLS = {"HYPE"}
 
 IMPORT_RETRY_ATTEMPTS = 3
 IMPORT_RETRY_DELAY_SECONDS = 2
 RETRYABLE_IMPORT_STATUS_CODES = {408, 425, 429}
 ROI_LOOKUP_TIMEOUT_SECONDS = 10
+FX_LOOKUP_TIMEOUT_SECONDS = 5
 
-# Timezone Configuration
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "Asia/Bangkok")
-from zoneinfo import ZoneInfo
 SELECTED_TZ = ZoneInfo(TIMEZONE_NAME)
 
+
 def get_account_id(symbol, portfolio_map):
-    """
-    Get Ghostfolio account ID for a given crypto symbol.
-    Falls back to DEFAULT if symbol not found.
-    
-    Args:
-        symbol: Base crypto symbol (e.g., "BTC", "LINK")
-        portfolio_map: Dict mapping symbols to account IDs
-    
-    Returns:
-        Account UUID string or None if no mapping exists
-    """
+    """Return a symbol-specific Ghostfolio account, then DEFAULT if present."""
     if not portfolio_map:
-        print(f"⚠️ No PORTFOLIO_ACCOUNT_MAP configured.")
+        print("No PORTFOLIO_ACCOUNT_MAP configured.")
         return None
-    
-    # Try direct symbol match first
-    account_id = portfolio_map.get(symbol)
-    
+
+    account_id = portfolio_map.get(symbol.upper())
     if not account_id:
-        # Fall back to DEFAULT
         account_id = portfolio_map.get("DEFAULT")
         if account_id:
-            print(f"   Using DEFAULT account for {symbol}")
-    
+            print(f"   Using DEFAULT account for {symbol.upper()}")
     return account_id
 
+
 def authenticate_ghostfolio(base_url, access_token, timeout=30, retries=3, delay=2):
-    """
-    Authenticate to Ghostfolio and get Bearer JWT token.
-    Retries on transient network/SSL errors.
-    
-    Args:
-        base_url: Ghostfolio instance URL
-        access_token: User's access token
-        timeout: Request timeout in seconds (doubled from standard 15s)
-        retries: Number of attempts before giving up
-        delay: Seconds to wait between retries
-    
-    Returns:
-        Bearer token string or None on failure
-    """
+    """Exchange a Ghostfolio access token for a short-lived bearer token."""
     url = f"{base_url}/api/v1/auth/anonymous"
     payload = {"accessToken": access_token}
-    
+
     for attempt in range(1, retries + 1):
         try:
-            r = requests.post(url, json=payload, timeout=timeout)
-            
-            if r.status_code != 201:
-                print(f"❌ Ghostfolio auth failed ({r.status_code}): {r.text}")
+            response = requests.post(url, json=payload, timeout=timeout)
+            if response.status_code != 201:
+                print(
+                    "Ghostfolio auth failed "
+                    f"(HTTP {response.status_code}): "
+                    f"{_safe_response_body(response, [access_token])}"
+                )
                 return None
-            
-            token = r.json().get("authToken")
+
+            token = response.json().get("authToken")
             if not token:
-                print(f"❌ No authToken in Ghostfolio response")
+                print("Ghostfolio auth response did not include authToken.")
                 return None
-            
             return token
-            
         except requests.exceptions.Timeout:
-            print(f"❌ Ghostfolio auth timed out (attempt {attempt}/{retries})")
-        except (requests.exceptions.ConnectionError, requests.exceptions.SSLError) as e:
-            print(f"⚠️ Ghostfolio auth connection error (attempt {attempt}/{retries}): {e}")
-        except Exception as e:
-            print(f"❌ Ghostfolio authentication error: {e}")
+            print(f"Ghostfolio auth timed out (attempt {attempt}/{retries}).")
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.SSLError,
+        ) as error:
+            print(
+                "Ghostfolio auth connection error "
+                f"(attempt {attempt}/{retries}): {error}"
+            )
+        except Exception as error:
+            print(f"Ghostfolio authentication error: {error}")
             return None
-        
+
         if attempt < retries:
-            print(f"   Retrying in {delay}s...")
             time.sleep(delay)
-    
-    print(f"❌ Ghostfolio authentication failed after {retries} attempts")
+
+    print(f"Ghostfolio authentication failed after {retries} attempts.")
     return None
 
 
+def _validate_gbp_pair(symbol, exchange_pair):
+    """Reject a non-GBP exchange pair before portfolio data can be written."""
+    if not exchange_pair:
+        return
+
+    normalized_pair = exchange_pair.strip().upper().replace("_", "/")
+    expected_pair = f"{symbol.strip().upper()}/GBP"
+    if normalized_pair != expected_pair:
+        raise ValueError(
+            f"Expected Kraken GBP pair {expected_pair}, got {exchange_pair}"
+        )
+
+
 def resolve_ghostfolio_asset(symbol, exchange_pair=None):
-    """Resolve a base ticker to the exact identity expected by Ghostfolio."""
+    """Resolve a Kraken base ticker to Ghostfolio's USD provider profile."""
     base_symbol = symbol.strip().upper()
+    _validate_gbp_pair(base_symbol, exchange_pair)
     override = SYMBOL_DATASOURCE_OVERRIDES.get(base_symbol)
 
     if override:
@@ -126,11 +122,11 @@ def resolve_ghostfolio_asset(symbol, exchange_pair=None):
             f"Ambiguous Ghostfolio asset ticker {base_symbol} has no explicit mapping"
         )
     else:
-        yahoo_symbol = f"{base_symbol}USD"
+        provider_symbol = f"{base_symbol}USD"
         resolution = {
             "dataSource": "YAHOO",
-            "symbol": yahoo_symbol,
-            "providerIdentifier": yahoo_symbol,
+            "symbol": provider_symbol,
+            "providerIdentifier": provider_symbol,
             "usedExplicitMapping": False,
         }
 
@@ -139,20 +135,69 @@ def resolve_ghostfolio_asset(symbol, exchange_pair=None):
         f"pair={exchange_pair or 'unknown'}, base={base_symbol}, "
         f"requested_symbol={resolution['symbol']}, "
         f"data_source={resolution['dataSource']}, "
-        f"provider_identifier={resolution['providerIdentifier']}, "
         f"method={'explicit_mapping' if resolution['usedExplicitMapping'] else 'fallback'}"
     )
     return resolution
 
 
-def get_asset_roi_percent(symbol, account_id, exchange_pair=None, bearer_token=None):
-    """Return the Ghostfolio holdings-table ROI percent for an asset's mapped account."""
-    if not GHOSTFOLIO_TOKEN and not bearer_token:
-        print("⚠️ GHOSTFOLIO_TOKEN not set. Cannot fetch Ghostfolio asset ROI.")
-        return None
+def _positive_finite_number(value, field_name):
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{field_name} must be a positive finite number")
+    return number
 
+
+def get_gbp_usd_rate(trade_timestamp=None):
+    """Return an execution-date GBP-to-USD rate for Ghostfolio only."""
+    if trade_timestamp is not None:
+        trade_date = datetime.fromtimestamp(
+            float(trade_timestamp), tz=dt_timezone.utc
+        ).date()
+    else:
+        trade_date = datetime.now(dt_timezone.utc).date()
+
+    if trade_date < datetime.now(dt_timezone.utc).date():
+        sources = (
+            (
+                "Frankfurter historical",
+                f"https://api.frankfurter.app/{trade_date.isoformat()}?from=GBP&to=USD",
+            ),
+        )
+    else:
+        sources = (
+            ("Frankfurter", "https://api.frankfurter.app/latest?from=GBP&to=USD"),
+            ("ExchangeRate-API", "https://open.er-api.com/v6/latest/GBP"),
+        )
+
+    for source_name, url in sources:
+        try:
+            response = requests.get(url, timeout=FX_LOOKUP_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            rate = _positive_finite_number(
+                response.json()["rates"]["USD"], "GBP-to-USD rate"
+            )
+            return rate
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            requests.RequestException,
+        ) as error:
+            print(f"{source_name} GBP-to-USD lookup failed: {error}")
+        except Exception as error:
+            print(f"{source_name} GBP-to-USD lookup failed: {error}")
+
+    print("GBP-to-USD conversion unavailable; skipping optional Ghostfolio log.")
+    return None
+
+
+def get_asset_roi_percent(symbol, account_id, exchange_pair=None, bearer_token=None):
+    """Return Ghostfolio's account-scoped ROI percentage for one asset."""
+    if not GHOSTFOLIO_TOKEN and not bearer_token:
+        print("GHOSTFOLIO_TOKEN not set. Cannot fetch Ghostfolio asset ROI.")
+        return None
     if not account_id:
-        print("⚠️ No account ID provided. Cannot fetch Ghostfolio asset ROI.")
+        print("No account ID provided. Cannot fetch Ghostfolio asset ROI.")
         return None
 
     try:
@@ -178,10 +223,9 @@ def get_asset_roi_percent(symbol, account_id, exchange_pair=None, bearer_token=N
             },
             timeout=ROI_LOOKUP_TIMEOUT_SECONDS,
         )
-
         if response.status_code != 200:
             print(
-                "❌ Ghostfolio asset ROI lookup failed "
+                "Ghostfolio asset ROI lookup failed "
                 f"(HTTP {response.status_code}): "
                 f"{_safe_response_body(response, [f'Bearer {bearer_token}'])}"
             )
@@ -189,7 +233,7 @@ def get_asset_roi_percent(symbol, account_id, exchange_pair=None, bearer_token=N
 
         holdings = response.json().get("holdings")
         if not isinstance(holdings, list):
-            print("❌ Ghostfolio asset ROI lookup returned an invalid holdings list.")
+            print("Ghostfolio asset ROI response has no valid holdings list.")
             return None
 
         matching_holdings = [
@@ -200,27 +244,19 @@ def get_asset_roi_percent(symbol, account_id, exchange_pair=None, bearer_token=N
         ]
         if len(matching_holdings) != 1:
             print(
-                "⚠️ Ghostfolio asset ROI lookup returned "
-                f"{len(matching_holdings)} matching holdings for "
-                f"{resolution['dataSource']}/{resolution['symbol']}."
+                "Ghostfolio asset ROI lookup returned "
+                f"{len(matching_holdings)} matching holdings."
             )
             return None
 
         holding = matching_holdings[0]
-        net_performance = holding.get("netPerformanceWithCurrencyEffect")
-        investment = holding.get("investment")
-        if isinstance(net_performance, bool) or isinstance(investment, bool):
-            raise ValueError("ROI values must be numeric")
-
-        net_performance = float(net_performance)
-        investment = float(investment)
-        if not math.isfinite(net_performance) or not math.isfinite(investment):
-            raise ValueError("ROI values must be finite")
-        if investment <= 0:
-            raise ValueError("ROI investment must be greater than zero")
-
+        net_performance = _finite_number(
+            holding.get("netPerformanceWithCurrencyEffect"), "net performance"
+        )
+        investment = _positive_finite_number(
+            holding.get("investment"), "investment"
+        )
         roi_percent = (net_performance / investment) * 100
-
         print(
             "   Ghostfolio asset ROI: "
             f"asset={resolution['dataSource']}/{resolution['symbol']}, "
@@ -232,42 +268,76 @@ def get_asset_roi_percent(symbol, account_id, exchange_pair=None, bearer_token=N
         requests.exceptions.ConnectionError,
         requests.exceptions.SSLError,
     ) as error:
-        print(f"⚠️ Ghostfolio asset ROI lookup request failed: {error}")
+        print(f"Ghostfolio asset ROI request failed: {error}")
     except (TypeError, ValueError) as error:
-        print(f"⚠️ Ghostfolio asset ROI lookup returned invalid data: {error}")
+        print(f"Ghostfolio asset ROI returned invalid data: {error}")
     except Exception as error:
-        print(f"⚠️ Ghostfolio asset ROI lookup failed: {error}")
-
+        print(f"Ghostfolio asset ROI lookup failed: {error}")
     return None
 
 
-def build_ghostfolio_activity(trade_data, symbol, account_id, exchange_pair=None):
-    """Build an import activity after resolving its provider-specific asset."""
-    ts = trade_data["ts"]
-    dt = datetime.fromtimestamp(ts, tz=SELECTED_TZ)
-    date_str = dt.astimezone(dt_timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    quantity = float(f"{trade_data['amount_crypto']:.8f}")
+def _finite_number(value, field_name):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} must be finite")
+    return number
+
+
+def build_ghostfolio_activity(
+    trade_data,
+    symbol,
+    account_id,
+    exchange_pair=None,
+    gbp_usd_rate=None,
+):
+    """Build a USD-provider activity from an authoritative GBP Kraken trade."""
+    timestamp = _finite_number(trade_data["ts"], "trade timestamp")
+    quantity = _positive_finite_number(
+        trade_data["amount_crypto"], "crypto amount"
+    )
+    amount_gbp = _positive_finite_number(trade_data["amount_gbp"], "GBP spend")
+    cost_gbp = _positive_finite_number(trade_data["cost_gbp"], "GBP order cost")
+    fee_gbp = _finite_number(trade_data["fee_gbp"], "GBP fee")
+    gbp_fee_debit = _finite_number(
+        trade_data["gbp_fee_debit"], "GBP fee debit"
+    )
+    if fee_gbp < 0 or gbp_fee_debit < 0:
+        raise ValueError("GBP fee cannot be negative")
+    if abs(amount_gbp - (cost_gbp + gbp_fee_debit)) > 0.01:
+        raise ValueError("GBP spend must equal order cost plus GBP fee debit")
+    gbp_price = _positive_finite_number(
+        trade_data["gbp_price_per_unit"], "GBP unit price"
+    )
+    fx_rate = _positive_finite_number(gbp_usd_rate, "GBP-to-USD rate")
     resolution = resolve_ghostfolio_asset(symbol, exchange_pair=exchange_pair)
+
+    date = datetime.fromtimestamp(timestamp, tz=SELECTED_TZ)
+    date_text = date.astimezone(dt_timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    order_id = str(trade_data.get("order_id", "unknown")).replace("\n", " ")
 
     return {
         "accountId": account_id,
         "comment": (
-            f"฿{trade_data['amount_thb']:.2f} - ${trade_data['amount_usd']:.2f} - "
-            f"{trade_data['order_id']}"
+            f"GBP {amount_gbp:.2f} total on Kraken "
+            f"(cost {cost_gbp:.2f} + GBP debit fee {gbp_fee_debit:.2f}; "
+            f"fee equivalent {fee_gbp:.2f}) | order {order_id}"
         ),
         "currency": "USD",
         "dataSource": resolution["dataSource"],
-        "date": date_str,
-        "fee": 0,
-        "quantity": quantity,
+        "date": date_text,
+        # Ghostfolio's fee is an economic cost. For a base-asset fee, quantity
+        # is already net of that fee, so adding its GBP equivalent reconstructs
+        # the confirmed gross order cost without claiming an extra GBP cash debit.
+        "fee": round(fee_gbp * fx_rate, 4),
+        "quantity": float(f"{quantity:.8f}"),
         "symbol": resolution["symbol"],
         "type": "BUY",
-        "unitPrice": round(trade_data["usd_price_per_unit"], 4),
+        "unitPrice": round(gbp_price * fx_rate, 4),
     }
 
 
 def _safe_response_body(response, redacted_values=()):
-    """Return a bounded API response body without exposing the access token."""
+    """Return a bounded response body with credentials removed."""
     body = response.text[:1000]
     for value in (GHOSTFOLIO_TOKEN, *redacted_values):
         if value:
@@ -276,7 +346,6 @@ def _safe_response_body(response, redacted_values=()):
 
 
 def _response_messages(response):
-    """Extract Ghostfolio error messages when the response is JSON."""
     try:
         response_data = response.json()
     except ValueError:
@@ -291,14 +360,12 @@ def _response_messages(response):
 
 
 def _is_retryable_import_response(response):
-    """Identify transient Ghostfolio failures, including masked provider outages."""
     if response.status_code in RETRYABLE_IMPORT_STATUS_CODES:
         return True
     if response.status_code >= 500:
         return True
     if response.status_code != 400:
         return False
-
     return any(
         "is not valid for the specified data source" in message.lower()
         for message in _response_messages(response)
@@ -326,28 +393,26 @@ def _post_import(url, headers, payload, stage):
                 f"HTTP {response.status_code}: "
                 f"{_safe_response_body(response, [headers.get('Authorization')])}"
             )
-
             if not retryable:
-                print(f"❌ Ghostfolio {stage} failed ({failure})")
+                print(f"Ghostfolio {stage} failed ({failure}).")
                 return response
 
         print(
-            f"⚠️ Ghostfolio {stage} failed "
-            f"(attempt {attempt}/{IMPORT_RETRY_ATTEMPTS}; {failure})"
+            f"Ghostfolio {stage} failed "
+            f"(attempt {attempt}/{IMPORT_RETRY_ATTEMPTS}; {failure})."
         )
         if retryable and attempt < IMPORT_RETRY_ATTEMPTS:
-            print(f"   Retrying in {IMPORT_RETRY_DELAY_SECONDS}s...")
             time.sleep(IMPORT_RETRY_DELAY_SECONDS)
 
     print(
-        f"❌ Ghostfolio {stage} failed after "
-        f"{IMPORT_RETRY_ATTEMPTS} attempts: {failure}"
+        f"Ghostfolio {stage} failed after "
+        f"{IMPORT_RETRY_ATTEMPTS} attempts: {failure}."
     )
     return None
 
 
 def validate_ghostfolio_resolution(activity, dry_run_response):
-    """Ensure Ghostfolio resolved the exact provider identity we requested."""
+    """Ensure Ghostfolio resolved the exact provider identity requested."""
     activities = dry_run_response.get("activities", [])
     if len(activities) != 1:
         raise ValueError(
@@ -357,22 +422,13 @@ def validate_ghostfolio_resolution(activity, dry_run_response):
     result = activities[0]
     result_error = result.get("error")
     if result_error:
-        if (
-            isinstance(result_error, dict)
-            and result_error.get("code") == "IS_DUPLICATE"
-        ):
+        if isinstance(result_error, dict) and result_error.get("code") == "IS_DUPLICATE":
             return "duplicate"
         raise ValueError(f"Ghostfolio asset resolution failed: {result_error}")
 
     profile = result.get("SymbolProfile") or {}
     selected_data_source = profile.get("dataSource")
     selected_symbol = profile.get("symbol")
-    print(
-        "   Ghostfolio dry-run selection: "
-        f"data_source={selected_data_source}, "
-        f"provider_identifier={selected_symbol}, name={profile.get('name')}"
-    )
-
     if (
         selected_data_source != activity["dataSource"]
         or selected_symbol != activity["symbol"]
@@ -382,66 +438,54 @@ def validate_ghostfolio_resolution(activity, dry_run_response):
             f"requested {activity['dataSource']}/{activity['symbol']}, "
             f"selected {selected_data_source}/{selected_symbol}"
         )
-
     return "valid"
 
 
 def log_to_ghostfolio(
     trade_data, symbol, account_id, exchange_pair=None, bearer_token=None
 ):
-    """
-    Log a trade to Ghostfolio portfolio.
-    
-    Args:
-        trade_data: Dict with keys:
-            - ts: Unix timestamp
-            - amount_crypto: Crypto quantity received
-            - amount_thb: THB spent
-            - amount_usd: USD spent
-            - symbol: Base symbol (for logging)
-            - order_id: Trade order ID
-            - usd_price_per_unit: Price per 1 full coin in USD
-        symbol: Base crypto symbol (e.g., "BTC", "LINK")
-        account_id: Ghostfolio account UUID
-        exchange_pair: Input exchange pair for resolution logging (e.g., "HYPE_THB")
-        bearer_token: Existing Ghostfolio session token for a recovery job
-    
-    Returns:
-        True on success, False on failure
+    """Optionally mirror one completed Kraken GBP purchase into Ghostfolio.
+
+    Expected trade fields are ``ts``, ``amount_crypto``, ``cost_gbp``,
+    ``fee_gbp`` (economic GBP equivalent), ``gbp_fee_debit``, ``amount_gbp``
+    (total GBP cash debit), ``gbp_price_per_unit``, and ``order_id``. Every
+    failure returns ``False``;
+    portfolio logging never changes the outcome of the Kraken trade.
     """
     if not GHOSTFOLIO_TOKEN and not bearer_token:
-        print("⚠️ GHOSTFOLIO_TOKEN not set. Skipping Ghostfolio logging.")
+        print("GHOSTFOLIO_TOKEN not set. Skipping Ghostfolio logging.")
         return False
-    
     if not account_id:
-        print("⚠️ No account ID provided. Skipping Ghostfolio logging.")
+        print("No account ID provided. Skipping Ghostfolio logging.")
         return False
-    
+
     try:
-        # 1. Authenticate
         if not bearer_token:
             bearer_token = authenticate_ghostfolio(
                 GHOSTFOLIO_URL, GHOSTFOLIO_TOKEN, timeout=30
             )
             if not bearer_token:
                 return False
-        
-        # 2. Resolve the provider-specific asset and build the import payload.
+
+        fx_rate = get_gbp_usd_rate(trade_data["ts"])
+        if fx_rate is None:
+            return False
+
         activity = build_ghostfolio_activity(
-            trade_data, symbol, account_id, exchange_pair=exchange_pair
+            trade_data,
+            symbol,
+            account_id,
+            exchange_pair=exchange_pair,
+            gbp_usd_rate=fx_rate,
         )
         quantity = activity["quantity"]
-        
-        # 6. Import to Ghostfolio (with retry for transient errors)
         url = f"{GHOSTFOLIO_URL}/api/v1/import"
         headers = {
             "Authorization": f"Bearer {bearer_token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
         payload = {"activities": [activity]}
 
-        # Validate Ghostfolio's own provider resolution before creating anything.
-        # A mismatch fails closed instead of saving an activity under a wrong asset.
         dry_run = _post_import(
             f"{url}?dryRun=true", headers, payload, "asset-resolution dry run"
         )
@@ -450,66 +494,28 @@ def log_to_ghostfolio(
         dry_run_state = validate_ghostfolio_resolution(activity, dry_run.json())
         if dry_run_state == "duplicate":
             print(
-                f"✅ Ghostfolio activity already exists: "
-                f"{quantity:.8f} {symbol} @ ${activity['unitPrice']:.4f}"
+                "Ghostfolio activity already exists: "
+                f"{quantity:.8f} {symbol.upper()} at USD {activity['unitPrice']:.4f}."
             )
             return True
 
         response = _post_import(url, headers, payload, "import")
         if response is None or response.status_code != 201:
             return False
-
-        import_state = validate_ghostfolio_resolution(activity, response.json())
-        if import_state != "valid":
-            print(
-                "❌ Ghostfolio import returned a duplicate activity after a "
-                "valid dry run; reconcile it by exchange order ID"
-            )
+        if validate_ghostfolio_resolution(activity, response.json()) != "valid":
+            print("Ghostfolio import unexpectedly returned a duplicate activity.")
             return False
 
         print(
-            f"✅ Successfully logged to Ghostfolio: "
-            f"{quantity:.8f} {symbol} @ ${activity['unitPrice']:.4f}"
+            "Successfully logged to Ghostfolio: "
+            f"{quantity:.8f} {symbol.upper()} at USD {activity['unitPrice']:.4f} "
+            f"(source spend GBP {float(trade_data['amount_gbp']):.2f})."
         )
         return True
-    
-    except Exception as e:
-        print(f"❌ Ghostfolio logging error: {e}")
+    except Exception as error:
+        print(f"Ghostfolio logging error: {error}")
         return False
 
+
 if __name__ == "__main__":
-    # Test execution
-    print("Testing Portfolio Logger...")
-    
-    if not GHOSTFOLIO_TOKEN:
-        print("⚠️ Please set GHOSTFOLIO_TOKEN environment variable to test.")
-        print("Example: export GHOSTFOLIO_TOKEN='your-token' && python portfolio_logger.py")
-    else:
-        # Load account map
-        try:
-            portfolio_map = json.loads(PORTFOLIO_ACCOUNT_MAP_JSON)
-        except Exception:
-            print("⚠️ Failed to parse PORTFOLIO_ACCOUNT_MAP. Using empty map.")
-            portfolio_map = {}
-        
-        print(f"Portfolio Account Map: {portfolio_map}")
-        
-        # Test with dummy BTC trade
-        test_symbol = "BTC"
-        test_account_id = get_account_id(test_symbol, portfolio_map)
-        
-        if test_account_id:
-            dummy_data = {
-                "ts": datetime.now().timestamp(),
-                "amount_crypto": 0.00012345,
-                "amount_thb": 800.0,
-                "amount_usd": 25.10,
-                "symbol": test_symbol,
-                "order_id": "TEST_123",
-                "usd_price_per_unit": 95000.00
-            }
-            print(f"\nTest Payload: {dummy_data}")
-            result = log_to_ghostfolio(dummy_data, test_symbol, test_account_id)
-            print(f"Result: {'SUCCESS' if result else 'FAILED'}")
-        else:
-            print(f"❌ No account ID found for {test_symbol}")
+    print("This module is called by crypto_dca.py after a completed Kraken order.")

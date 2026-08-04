@@ -1,107 +1,172 @@
-import os
-import time
+"""Execute scheduled, GBP-denominated spot purchases on Kraken."""
+
 import json
 import math
-import requests
-from datetime import datetime, timedelta
-from gist_logger import update_gist_log
-from bitkub_client import bitkub_request, get_thb_usd_rate
-
-# --- Configuration ---
-# Timezone Configuration
-TIMEZONE_NAME = os.environ.get("TIMEZONE", "Asia/Bangkok")
+import os
+import re
+import time
+from datetime import datetime
 from zoneinfo import ZoneInfo
-SELECTED_TZ = ZoneInfo(TIMEZONE_NAME)
 
-# Default settings (fallback)
-DEFAULT_DCA_AMOUNT = 50.0
-DEFAULT_TARGET_TIME = os.environ.get("DCA_TARGET_TIME", "07:00")
+import requests
+
+from gist_logger import update_gist_log
+from kraken_client import (
+    KrakenOrderNoFill,
+    KrakenPreSubmissionError,
+    KrakenOrderStateUnknown,
+    build_client_order_id,
+    place_market_buy,
+    to_kraken_symbol,
+)
+
+
+TIMEZONE_NAME = os.environ.get("TIMEZONE", "Asia/Bangkok")
+SELECTED_TZ = ZoneInfo(TIMEZONE_NAME)
 DYNAMIC_DCA_DEFAULT_THRESHOLD_PERCENT = -2.0
 DYNAMIC_DCA_DEFAULT_REDUCED_MULTIPLIER = 0.5
-MINIMUM_DCA_AMOUNT_THB = 10.0
-
-# Target Map (JSON String)
-# Format: {"BTC_THB": {"TIME": "07:00", "AMOUNT": 800, "BUY_ENABLED": true, "LAST_BUY_DATE": ""}}
+MIN_DCA_GBP = 5.0
+MAX_DCA_GBP = 1000.0
 DCA_TARGET_MAP_JSON = os.environ.get("DCA_TARGET_MAP", "{}")
-
+DCA_EXECUTION_STATE_JSON = os.environ.get("DCA_EXECUTION_STATE", "{}")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-TRADING_EXCHANGE = os.environ.get("TRADING_EXCHANGE", "bitkub").lower()
+
+_CONFIG_KEY_PATTERN = re.compile(r"^[A-Z0-9]+_GBP$")
+_TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
 def _gha_mask(value: str) -> None:
-    """Emit a GitHub Actions masking command so the value is redacted in run logs."""
+    """Mask a value in GitHub Actions logs."""
     if os.environ.get("GITHUB_ACTIONS") == "true" and value:
         print(f"::add-mask::{value}", flush=True)
 
 
 def send_discord_alert(message, is_error=False):
     if not DISCORD_WEBHOOK_URL:
-        # print(f"[Discord Mock] {message}")
         return
 
-    color = 16711680 if is_error else 65280 # Red or Green
     payload = {
-        "embeds": [{
-            "title": "Crypto DCA Execution",
-            "description": message,
-            "color": color,
-            "timestamp": datetime.now(SELECTED_TZ).isoformat()
-        }]
+        "embeds": [
+            {
+                "title": "Kraken GBP DCA Execution",
+                "description": message,
+                "color": 16711680 if is_error else 65280,
+                "timestamp": datetime.now(SELECTED_TZ).isoformat(),
+            }
+        ]
     }
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
-    except Exception as e:
-        print(f"Failed to send Discord: {e}")
+        response = requests.post(
+            DISCORD_WEBHOOK_URL, json=payload, timeout=5
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        print(f"Failed to send Discord alert: {error}")
 
-def get_config_for_symbol(symbol_thb, target_map):
-    """
-    Resolves the configuration for a given symbol.
-    Returns a dict: {"TIME": "HH:MM", "AMOUNT": float, "BUY_ENABLED": bool}
-    """
-    config = {
-        "TIME": DEFAULT_TARGET_TIME, 
-        "AMOUNT": DEFAULT_DCA_AMOUNT, 
-        "BUY_ENABLED": True,
-        "LAST_BUY_DATE": None,
-        "DYNAMIC_DCA": None,
-        "KEY": symbol_thb # Store the key used in map for updates later
-    }
-    
-    # keys to check in order: "BTC_THB", "BTC/USDT"
-    keys_to_check = [symbol_thb]
+
+def _validate_config_key(symbol: str) -> str:
+    if not isinstance(symbol, str):
+        raise ValueError("DCA target keys must be strings such as BTC_GBP")
+    key = symbol.strip()
+    if not _CONFIG_KEY_PATTERN.fullmatch(key):
+        raise ValueError(
+            f"Unsupported DCA target {symbol!r}; use a Kraken GBP key such as BTC_GBP"
+        )
+    return key
+
+
+def _parse_amount_gbp(value, *, disabled=False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("AMOUNT_GBP must be a JSON number")
+    amount = float(value)
+    if not math.isfinite(amount) or amount < 0:
+        raise ValueError("AMOUNT_GBP must be a finite, non-negative value")
+    if disabled and amount <= MAX_DCA_GBP:
+        return amount
+    if amount < MIN_DCA_GBP or amount > MAX_DCA_GBP:
+        raise ValueError(
+            f"AMOUNT_GBP must be between GBP {MIN_DCA_GBP:.0f} and "
+            f"GBP {MAX_DCA_GBP:.0f}"
+        )
+    return amount
+
+
+def _parse_target_time(value, key: str) -> str:
+    if not isinstance(value, str) or not _TIME_PATTERN.fullmatch(value):
+        raise ValueError(f"{key}.TIME must use 24-hour HH:MM")
+    return value
+
+
+def _parse_last_buy_date(value, key: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{key}.LAST_BUY_DATE must be empty or YYYY-MM-DD")
+    if not value:
+        return value
     try:
-        base = symbol_thb.split('_')[0]
-        keys_to_check.append(f"{base}/USDT")
-    except Exception:
-        pass
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as error:
+        raise ValueError(
+            f"{key}.LAST_BUY_DATE must be empty or a valid YYYY-MM-DD date"
+        ) from error
+    if parsed.strftime("%Y-%m-%d") != value:
+        raise ValueError(f"{key}.LAST_BUY_DATE must use YYYY-MM-DD")
+    return value
 
-    found_entry = None
-    target_key = symbol_thb
-    
-    for key in keys_to_check:
-        if key in target_map:
-            found_entry = target_map[key]
-            target_key = key
-            break
-            
-    config["KEY"] = target_key
-            
-    if found_entry:
-        if isinstance(found_entry, dict):
-            # New Format
-            config["TIME"] = found_entry.get("TIME", DEFAULT_TARGET_TIME)
-            config["AMOUNT"] = float(found_entry.get("AMOUNT", DEFAULT_DCA_AMOUNT))
-            config["BUY_ENABLED"] = found_entry.get("BUY_ENABLED", True)
-            config["LAST_BUY_DATE"] = found_entry.get("LAST_BUY_DATE", None)
-            config["DYNAMIC_DCA"] = found_entry.get("DYNAMIC_DCA")
-        else:
-            # Old Format (String Time)
-            config["TIME"] = str(found_entry)
-            
-    else:
-        print(f"⚠️ No config found for {symbol_thb}. Using defaults.")
 
-    return config
+def _execution_state_for_symbol(symbol_key, execution_state):
+    if execution_state is None:
+        return {}
+    if not isinstance(execution_state, dict):
+        raise ValueError("DCA_EXECUTION_STATE must be a JSON object")
+    entry = execution_state.get(symbol_key, {})
+    if not isinstance(entry, dict):
+        raise ValueError(f"DCA_EXECUTION_STATE.{symbol_key} must be an object")
+    return entry
+
+
+def get_config_for_symbol(symbol_gbp, target_map, execution_state=None):
+    """Return one validated GBP-native target configuration."""
+    key = _validate_config_key(symbol_gbp)
+    if not isinstance(target_map, dict) or key not in target_map:
+        raise ValueError(f"No DCA configuration exists for {key}")
+
+    entry = target_map[key]
+    if not isinstance(entry, dict):
+        raise ValueError(f"{key} must use the object configuration format")
+    if "AMOUNT" in entry:
+        raise ValueError(f"{key} uses unsupported AMOUNT; rename it to AMOUNT_GBP")
+    execution_only_fields = {"LAST_BUY_DATE", PENDING_ORDER_FIELD}.intersection(entry)
+    if execution_only_fields:
+        fields = ", ".join(sorted(execution_only_fields))
+        raise ValueError(
+            f"{key} contains execution-only field(s) {fields}; move them to "
+            f"{EXECUTION_STATE_VARIABLE}"
+        )
+    if "AMOUNT_GBP" not in entry:
+        raise ValueError(f"{key} must define AMOUNT_GBP")
+    for required_field in ("TIME", "BUY_ENABLED"):
+        if required_field not in entry:
+            raise ValueError(f"{key} must define {required_field}")
+
+    buy_enabled = entry["BUY_ENABLED"]
+    if not isinstance(buy_enabled, bool):
+        raise ValueError(f"{key}.BUY_ENABLED must be true or false")
+
+    amount_gbp = _parse_amount_gbp(entry["AMOUNT_GBP"], disabled=not buy_enabled)
+    target_time = _parse_target_time(entry["TIME"], key)
+    state_entry = _execution_state_for_symbol(key, execution_state)
+    last_buy_date = _parse_last_buy_date(
+        state_entry.get("LAST_BUY_DATE", ""), key
+    )
+
+    return {
+        "TIME": target_time,
+        "AMOUNT_GBP": amount_gbp,
+        "BUY_ENABLED": buy_enabled,
+        "LAST_BUY_DATE": last_buy_date,
+        "DYNAMIC_DCA": entry.get("DYNAMIC_DCA"),
+        "KEY": key,
+    }
 
 
 def get_dynamic_dca_settings(dynamic_dca):
@@ -115,7 +180,6 @@ def get_dynamic_dca_settings(dynamic_dca):
 
     if dynamic_dca is None:
         return settings
-
     if not isinstance(dynamic_dca, dict):
         settings["error"] = "DYNAMIC_DCA must be an object."
         return settings
@@ -127,7 +191,9 @@ def get_dynamic_dca_settings(dynamic_dca):
 
     try:
         threshold_percent = float(
-            dynamic_dca.get("THRESHOLD_PERCENT", DYNAMIC_DCA_DEFAULT_THRESHOLD_PERCENT)
+            dynamic_dca.get(
+                "THRESHOLD_PERCENT", DYNAMIC_DCA_DEFAULT_THRESHOLD_PERCENT
+            )
         )
         reduced_multiplier = float(
             dynamic_dca.get(
@@ -141,9 +207,10 @@ def get_dynamic_dca_settings(dynamic_dca):
     if not math.isfinite(threshold_percent) or not math.isfinite(reduced_multiplier):
         settings["error"] = "DYNAMIC_DCA threshold and multiplier must be finite."
         return settings
-
     if not 0 < reduced_multiplier <= 1:
-        settings["error"] = "DYNAMIC_DCA.REDUCED_MULTIPLIER must be above 0 and at most 1."
+        settings["error"] = (
+            "DYNAMIC_DCA.REDUCED_MULTIPLIER must be above 0 and at most 1."
+        )
         return settings
 
     settings.update(
@@ -166,48 +233,47 @@ def get_ghostfolio_account_id(symbol):
             raise ValueError("PORTFOLIO_ACCOUNT_MAP must be a JSON object")
         return get_account_id(symbol, portfolio_map)
     except (json.JSONDecodeError, ValueError, TypeError) as error:
-        print(f"⚠️ Could not read PORTFOLIO_ACCOUNT_MAP: {error}")
+        print(f"Could not read PORTFOLIO_ACCOUNT_MAP: {error}")
     except Exception as error:
-        print(f"⚠️ Could not resolve Ghostfolio account for {symbol}: {error}")
-
+        print(f"Could not resolve Ghostfolio account for {symbol}: {error}")
     return None
 
 
-def _build_dca_decision(amount_thb, multiplier, roi_percent, reason):
+def _build_dca_decision(amount_gbp, multiplier, roi_percent, reason):
     return {
-        "amount_thb": amount_thb,
+        "amount_gbp": amount_gbp,
         "multiplier": multiplier,
         "roi_percent": roi_percent,
         "reason": reason,
     }
 
 
-def determine_dynamic_dca_decision(symbol, configured_amount, dynamic_dca):
-    """Choose a full or reduced DCA amount from the asset's Ghostfolio ROI."""
-    configured_amount = float(configured_amount)
+def determine_dynamic_dca_decision(symbol, configured_amount_gbp, dynamic_dca):
+    """Choose a full or reduced GBP amount using the asset's Ghostfolio ROI."""
+    configured_amount_gbp = _parse_amount_gbp(configured_amount_gbp)
     settings = get_dynamic_dca_settings(dynamic_dca)
 
     if settings["error"]:
         return _build_dca_decision(
-            configured_amount,
+            configured_amount_gbp,
             1.0,
             None,
             f"Full buy (x1): {settings['error']}",
         )
-
     if not settings["enabled"]:
         return _build_dca_decision(
-            configured_amount,
+            configured_amount_gbp,
             1.0,
             None,
             "Full buy (x1): Dynamic DCA is disabled.",
         )
 
-    base_symbol = symbol.split("_")[0]
+    exchange_pair = to_kraken_symbol(symbol)
+    base_symbol = exchange_pair.split("/", maxsplit=1)[0]
     account_id = get_ghostfolio_account_id(base_symbol)
     if not account_id:
         return _build_dca_decision(
-            configured_amount,
+            configured_amount_gbp,
             1.0,
             None,
             "Full buy (x1): Ghostfolio ROI is unavailable; using the configured amount.",
@@ -217,15 +283,15 @@ def determine_dynamic_dca_decision(symbol, configured_amount, dynamic_dca):
         from portfolio_logger import get_asset_roi_percent
 
         roi_percent = get_asset_roi_percent(
-            base_symbol, account_id, exchange_pair=symbol
+            base_symbol, account_id, exchange_pair=exchange_pair
         )
     except Exception as error:
-        print(f"⚠️ Ghostfolio asset ROI lookup failed for {symbol}: {error}")
+        print(f"Ghostfolio asset ROI lookup failed for {symbol}: {error}")
         roi_percent = None
 
     if roi_percent is None:
         return _build_dca_decision(
-            configured_amount,
+            configured_amount_gbp,
             1.0,
             None,
             "Full buy (x1): Ghostfolio ROI is unavailable; using the configured amount.",
@@ -233,32 +299,37 @@ def determine_dynamic_dca_decision(symbol, configured_amount, dynamic_dca):
 
     if roi_percent >= settings["threshold_percent"]:
         reduced_amount = round(
-            configured_amount * settings["reduced_multiplier"], 2
+            configured_amount_gbp * settings["reduced_multiplier"], 2
         )
-        if reduced_amount >= MINIMUM_DCA_AMOUNT_THB:
+        if reduced_amount >= MIN_DCA_GBP:
+            label = (
+                "Half buy"
+                if settings["reduced_multiplier"] == 0.5
+                else "Reduced buy"
+            )
             return _build_dca_decision(
                 reduced_amount,
                 settings["reduced_multiplier"],
                 roi_percent,
                 (
-                    f"Half buy (x{settings['reduced_multiplier']:g}): asset ROI "
+                    f"{label} (x{settings['reduced_multiplier']:g}): asset ROI "
                     f"{roi_percent:+.2f}% is at or above "
                     f"{settings['threshold_percent']:.2f}%."
                 ),
             )
 
         return _build_dca_decision(
-            configured_amount,
+            configured_amount_gbp,
             1.0,
             roi_percent,
             (
                 "Full buy (x1): the reduced amount would be below the "
-                f"{MINIMUM_DCA_AMOUNT_THB:.0f} THB minimum."
+                f"GBP {MIN_DCA_GBP:.0f} execution guardrail."
             ),
         )
 
     return _build_dca_decision(
-        configured_amount,
+        configured_amount_gbp,
         1.0,
         roi_percent,
         (
@@ -269,402 +340,534 @@ def determine_dynamic_dca_decision(symbol, configured_amount, dynamic_dca):
 
 
 def format_asset_roi(roi_percent):
-    """Format an asset ROI for a Discord trade notification."""
     if roi_percent is None:
         return "Unavailable"
     return f"{roi_percent:+.2f}%"
 
+
 def is_time_to_trade(target_time_str):
-    """
-    Checks if current BKK time matches the target time (HH:MM) within a small window.
-    Assumes script runs frequently (e.g. every 15-30 mins).
-    We check if current time is within [target, target + 15m).
-    """
+    """Return true once today's target time has arrived, with catch-up support."""
     now = datetime.now(SELECTED_TZ)
-    
-    # Parse target
     try:
-        t_hour, t_minute = map(int, target_time_str.split(':'))
-        target_dt = now.replace(hour=t_hour, minute=t_minute, second=0, microsecond=0)
-    except (ValueError, AttributeError) as e:
-        print(f"❌ Invalid target time format: {target_time_str} ({e})")
+        target_hour, target_minute = map(int, target_time_str.split(":"))
+        target_dt = now.replace(
+            hour=target_hour,
+            minute=target_minute,
+            second=0,
+            microsecond=0,
+        )
+    except (ValueError, AttributeError) as error:
+        print(f"Invalid target time format: {target_time_str} ({error})")
         return False
-    
-    # If target is tomorrow (e.g. now=23:50, target=00:10), this naive compare fails.
-    # But usually we run daily cycle. If target is 00:10 and now is 23:50, diff is huge.
-    # If target is 23:50 and now is 00:05 (next day), diff is negative.
-    # Simple fix: we only care if NOW is "just after" TARGET.
-    
-    diff = (now - target_dt).total_seconds()
-    
-    # Handle day wrap for "just after midnight" if target was late night?
-    # No, typically cron runs same day. 
-    # If target=23:55 and now=00:05, diff is negative huge?
-    # Wait: now(00:05) - target(23:55 today) -> target is in future? No.
-    # If now is 00:05, target 23:55 of TODAY is in future. Diff is large negative.
-    # So we missed yesterday's window.
-    
-    # Rules:
-    # 1. If within +/- 5 mins of target time -> BUY
-    # 2. If target time is in the past (today) -> BUY (Catch-up mechanism)
-    #    (The catch-up relies on the "Not bought today" check in main loop)
-    
-    abs_diff = abs(diff)
-    
-    # Rule 1: Window check (+/- 5 mins = 300s)
-    if abs_diff <= 300:
-        print(f"✅ Within window (+/- 5m). Diff={diff:.0f}s")
+
+    difference_seconds = (now - target_dt).total_seconds()
+    if abs(difference_seconds) <= 300:
+        print(f"Within target window. Diff={difference_seconds:.0f}s")
         return True
-        
-    # Rule 2: Late check (Target passed today)
-    # If diff is positive (Now > Target)
-    if diff > 0:
-        print(f"✅ Target time passed today. Diff={diff:.0f}s. Catch-up mode.")
+    if difference_seconds > 0:
+        print(f"Target time passed today. Diff={difference_seconds:.0f}s; catch-up mode.")
         return True
-        
     return False
 
-def save_last_buy_date(target_map, symbol_key, date_str):
-    """
-    Saves LAST_BUY_DATE to GitHub repository variable with retry logic.
-    CRITICAL: This is the primary safeguard against double-buys.
-    If this fails, we raise an exception to fail the workflow loudly.
-    """
-    print(f"💾 Saving LAST_BUY_DATE for {symbol_key} as {date_str}...")
-    
-    # Update local object
-    if symbol_key not in target_map:
-        target_map[symbol_key] = {}
-        
-    if not isinstance(target_map[symbol_key], dict):
-        # Convert simple "07:00" to dict object to support LAST_BUY_DATE
-        target_map[symbol_key] = {
-            "TIME": str(target_map[symbol_key]),
-            "AMOUNT": DEFAULT_DCA_AMOUNT,
-            "BUY_ENABLED": True
-        }
-        
-    target_map[symbol_key]["LAST_BUY_DATE"] = date_str
-    
-    # Serialize
-    new_json = json.dumps(target_map)
-    
-    # Push to GitHub with retry logic
-    token = os.environ.get("GIST_TOKEN") 
-    if not token:
-        err_msg = "🚨 CRITICAL: No GIST_TOKEN found. Cannot update LAST_BUY_DATE. DOUBLE-BUY RISK!"
-        print(err_msg)
-        send_discord_alert(err_msg, is_error=True)
-        raise RuntimeError(err_msg)
 
-    repo = os.environ.get("GITHUB_REPOSITORY")
-    if not repo:
-        err_msg = "🚨 CRITICAL: GITHUB_REPOSITORY env var missing. Cannot update LAST_BUY_DATE. DOUBLE-BUY RISK!"
-        print(err_msg)
-        send_discord_alert(err_msg, is_error=True)
-        raise RuntimeError(err_msg)
-    
-    url = f"https://api.github.com/repos/{repo}/actions/variables/DCA_TARGET_MAP"
+EXECUTION_STATE_VARIABLE = "DCA_EXECUTION_STATE"
+PENDING_ORDER_FIELD = "PENDING_ORDER"
+_CLIENT_ORDER_ID_PATTERN = re.compile(r"^dca-[0-9a-f]{14}$")
+
+
+def _github_variable_context(variable_name):
+    token = os.environ.get("GIST_TOKEN")
+    if not token:
+        raise RuntimeError("GIST_TOKEN is required to read live DCA configuration")
+
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    if not repository:
+        raise RuntimeError(
+            "GITHUB_REPOSITORY is required to read live DCA configuration"
+        )
+
+    collection_url = f"https://api.github.com/repos/{repository}/actions/variables"
+    url = f"{collection_url}/{variable_name}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     }
-    data = {"name": "DCA_TARGET_MAP", "value": new_json}
-    
-    # Retry configuration
-    max_retries = 3
-    retry_delays = [1, 3, 5]  # Exponential-ish backoff: 1s, 3s, 5s
-    last_error = None
-    
-    for attempt in range(max_retries):
-        try:
-            print(f"   Attempt {attempt + 1}/{max_retries}...")
-            r = requests.patch(url, headers=headers, json=data, timeout=15)
-            
-            if r.status_code == 204:
-                print("✅ Successfully updated DCA_TARGET_MAP on GitHub.")
-                return  # Success!
-            elif r.status_code == 404:
-                # Variable doesn't exist, try to create it
-                print(f"   Variable not found (404). Attempting to create...")
-                create_url = f"https://api.github.com/repos/{repo}/actions/variables"
-                r_create = requests.post(create_url, headers=headers, json=data, timeout=15)
-                if r_create.status_code == 201:
-                    print("✅ Successfully created DCA_TARGET_MAP on GitHub.")
-                    return  # Success!
-                else:
-                    last_error = f"Create failed: {r_create.status_code} {r_create.text}"
-            else:
-                last_error = f"HTTP {r.status_code}: {r.text}"
-                
-        except requests.exceptions.Timeout:
-            last_error = "Request timed out"
-        except requests.exceptions.RequestException as e:
-            last_error = str(e)
-        
-        # If not the last attempt, wait and retry
-        if attempt < max_retries - 1:
-            delay = retry_delays[attempt]
-            print(f"   ⚠️ Failed: {last_error}. Retrying in {delay}s...")
-            time.sleep(delay)
-    
-    # All retries exhausted - CRITICAL FAILURE
-    err_msg = (
-        f"🚨 **CRITICAL: LAST_BUY_DATE UPDATE FAILED** 🚨\n"
-        f"Symbol: {symbol_key}\n"
-        f"Date: {date_str}\n"
-        f"Error: {last_error}\n\n"
-        f"⚠️ **DOUBLE-BUY RISK**: The trade was executed but the safeguard was not updated!\n"
-        f"**ACTION REQUIRED**: Manually set `LAST_BUY_DATE` to `{date_str}` for `{symbol_key}` in GitHub Variables."
+    return url, collection_url, headers
+
+
+def _fetch_repo_json_variable(variable_name, *, required):
+    url, _collection_url, headers = _github_variable_context(variable_name)
+    response = requests.get(url, headers=headers, timeout=15)
+    if response.status_code == 404 and not required:
+        return {}, False
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Live {variable_name} read failed with HTTP {response.status_code}"
+        )
+    try:
+        value = json.loads(response.json()["value"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Live {variable_name} is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Live {variable_name} must be a JSON object")
+    return value, True
+
+
+def _write_repo_json_variable(variable_name, value, *, exists):
+    url, collection_url, headers = _github_variable_context(variable_name)
+    data = {
+        "name": variable_name,
+        "value": json.dumps(value, separators=(",", ":")),
+    }
+    if exists:
+        response = requests.patch(url, headers=headers, json=data, timeout=15)
+        expected_status = 204
+    else:
+        response = requests.post(
+            collection_url, headers=headers, json=data, timeout=15
+        )
+        expected_status = 201
+    if response.status_code != expected_status:
+        operation = "update" if exists else "create"
+        raise RuntimeError(
+            f"{variable_name} {operation} failed with HTTP {response.status_code}"
+        )
+
+
+def fetch_live_target_map():
+    """Fetch the current repository-wide map; never trade from a stale snapshot."""
+    target_map, _exists = _fetch_repo_json_variable(
+        "DCA_TARGET_MAP", required=True
     )
-    print(err_msg)
-    send_discord_alert(err_msg, is_error=True)
-    
-    # Raise exception to fail the workflow loudly
-    raise RuntimeError(f"Failed to update LAST_BUY_DATE after {max_retries} attempts: {last_error}")
+    return target_map
+
+
+def _validate_execution_state(execution_state):
+    if not isinstance(execution_state, dict):
+        raise ValueError("DCA_EXECUTION_STATE must be a JSON object")
+    for raw_key, entry in execution_state.items():
+        key = _validate_config_key(raw_key)
+        if not isinstance(entry, dict):
+            raise ValueError(f"DCA_EXECUTION_STATE.{key} must be an object")
+        _parse_last_buy_date(entry.get("LAST_BUY_DATE", ""), key)
+        pending = entry.get(PENDING_ORDER_FIELD)
+        if pending is None:
+            continue
+        if not isinstance(pending, dict):
+            raise ValueError(f"{key}.{PENDING_ORDER_FIELD} must be an object")
+        client_order_id = pending.get("client_order_id")
+        if not isinstance(client_order_id, str) or not _CLIENT_ORDER_ID_PATTERN.fullmatch(
+            client_order_id
+        ):
+            raise ValueError(f"{key} has an invalid pending client order ID")
+        _parse_last_buy_date(pending.get("trade_date"), key)
+        _parse_amount_gbp(pending.get("amount_gbp"))
+    return execution_state
+
+
+def fetch_live_execution_state():
+    state, _exists = _fetch_repo_json_variable(
+        EXECUTION_STATE_VARIABLE, required=False
+    )
+    return _validate_execution_state(state)
+
+
+def _pending_order_for_symbol(execution_state, symbol_key):
+    entry = _execution_state_for_symbol(symbol_key, execution_state)
+    return entry.get(PENDING_ORDER_FIELD)
+
+
+def prepare_order_intent(symbol_key, client_order_id, trade_date, amount_gbp):
+    """Persist an order intent before Kraken can receive a create request."""
+    key = _validate_config_key(symbol_key)
+    _parse_last_buy_date(trade_date, key)
+    amount_gbp = _parse_amount_gbp(amount_gbp)
+    if not _CLIENT_ORDER_ID_PATTERN.fullmatch(client_order_id):
+        raise ValueError("Invalid deterministic client order ID")
+
+    state, exists = _fetch_repo_json_variable(
+        EXECUTION_STATE_VARIABLE, required=False
+    )
+    _validate_execution_state(state)
+    entry = state.setdefault(key, {"LAST_BUY_DATE": ""})
+    pending = entry.get(PENDING_ORDER_FIELD)
+    if pending is not None:
+        return pending, True
+
+    pending = {
+        "client_order_id": client_order_id,
+        "trade_date": trade_date,
+        "amount_gbp": amount_gbp,
+    }
+    entry[PENDING_ORDER_FIELD] = pending
+    _write_repo_json_variable(EXECUTION_STATE_VARIABLE, state, exists=exists)
+    print(f"Persisted durable Kraken order intent for {key} ({client_order_id}).")
+    return pending, False
+
+
+def clear_order_intent(symbol_key, client_order_id):
+    """Clear a known-safe intent after a pre-submit or terminal no-fill failure."""
+    key = _validate_config_key(symbol_key)
+    state, exists = _fetch_repo_json_variable(
+        EXECUTION_STATE_VARIABLE, required=True
+    )
+    _validate_execution_state(state)
+    pending = _pending_order_for_symbol(state, key)
+    if pending is None:
+        return
+    if pending["client_order_id"] != client_order_id:
+        raise RuntimeError(f"Refusing to clear a different pending order for {key}")
+    state[key].pop(PENDING_ORDER_FIELD, None)
+    _write_repo_json_variable(EXECUTION_STATE_VARIABLE, state, exists=exists)
+    print(f"Cleared safe no-fill order intent for {key}.")
+
+
+def complete_order_intent(symbol_key, client_order_id, completed_date):
+    """Atomically record the daily completion and remove its durable intent."""
+    key = _validate_config_key(symbol_key)
+    _parse_last_buy_date(completed_date, key)
+    state, exists = _fetch_repo_json_variable(
+        EXECUTION_STATE_VARIABLE, required=True
+    )
+    _validate_execution_state(state)
+    pending = _pending_order_for_symbol(state, key)
+    if pending is None or pending["client_order_id"] != client_order_id:
+        raise RuntimeError(f"Durable order intent changed or disappeared for {key}")
+    state[key]["LAST_BUY_DATE"] = completed_date
+    state[key].pop(PENDING_ORDER_FIELD, None)
+    _write_repo_json_variable(EXECUTION_STATE_VARIABLE, state, exists=exists)
+    print(f"Completed order intent for {key}; LAST_BUY_DATE={completed_date}.")
+
+
+def _trade_rule_snapshot(config):
+    """Return the fields that must not change between decision and submission."""
+    return (
+        config["TIME"],
+        config["AMOUNT_GBP"],
+        config["BUY_ENABLED"],
+        config["LAST_BUY_DATE"],
+        config["DYNAMIC_DCA"],
+    )
+
+
+def _revalidate_trade_intent(symbol, expected_config, today):
+    """Fail closed if the repository-wide rules changed before order submission."""
+    live_map = fetch_live_target_map()
+    live_state = fetch_live_execution_state()
+    live_config = get_config_for_symbol(symbol, live_map, live_state)
+    if not live_config["BUY_ENABLED"]:
+        raise RuntimeError(f"{symbol} was disabled before order submission")
+    if live_config["LAST_BUY_DATE"] == today:
+        raise RuntimeError(f"{symbol} is already marked as bought on {today}")
+    if not is_time_to_trade(live_config["TIME"]):
+        raise RuntimeError(f"{symbol} is no longer due for execution")
+    if _trade_rule_snapshot(live_config) != _trade_rule_snapshot(expected_config):
+        raise RuntimeError(
+            f"{symbol} configuration changed during this run; retry with fresh rules"
+        )
+    return live_map, live_state
+
 
 def execute_trade(
-    symbol, amount_thb, map_key=None, target_map=None, dca_decision=None
+    symbol,
+    amount_gbp,
+    map_key=None,
+    target_map=None,
+    dca_decision=None,
+    expected_config=None,
 ):
+    """Execute one GBP Kraken order and record a confirmed fill."""
+    amount_gbp = _parse_amount_gbp(amount_gbp)
     if dca_decision is None:
         dca_decision = _build_dca_decision(
-            amount_thb,
+            amount_gbp,
             1.0,
             None,
             "Full buy (x1): Dynamic DCA decision was not available.",
         )
 
-    # Mask the configured DCA amount so subsequent log lines are redacted in GitHub Actions
-    _gha_mask(str(amount_thb))
-    if float(amount_thb) == int(float(amount_thb)):
-        _gha_mask(str(int(float(amount_thb))))
-    print(f"🚀 Executing DCA Buy for {symbol} ({amount_thb} THB)...")
-    
+    key = _validate_config_key(map_key or symbol)
+    today = datetime.now(SELECTED_TZ).strftime("%Y-%m-%d")
+    intent = None
+    intent_was_existing = False
     try:
-        if TRADING_EXCHANGE == "kraken":
-            from kraken_client import place_market_buy
-
-            order_data = place_market_buy(symbol, amount_thb)
-            order_id = order_data["order_id"]
-            spent_thb = order_data["spent_thb"]
-            received_amt = order_data["received"]
-            rate = spent_thb / received_amt
-            ts_exec = order_data["timestamp"]
-            exchange_pair = order_data["pair"]
-            quote_line = (
-                f"💷 **Spent ({order_data['quote_currency']}):** "
-                f"{order_data['spent_quote']:,.2f}\n"
+        live_state = fetch_live_execution_state()
+        intent = _pending_order_for_symbol(live_state, key)
+        if intent is not None:
+            intent_was_existing = True
+            amount_gbp = _parse_amount_gbp(intent["amount_gbp"])
+            print(
+                f"Reconciling durable Kraken order intent for {key} "
+                f"({intent['client_order_id']})."
             )
-        elif TRADING_EXCHANGE == "bitkub":
-            order_payload = {
-                "sym": symbol,
-                "amt": amount_thb,
-                "rat": 0,
-                "typ": "market",
-            }
-            result = bitkub_request(
-                "POST", "/api/v3/market/place-bid", order_payload
-            )
-            if result.get("error") != 0:
-                raise Exception(f"API Error Code: {result.get('error')}")
-
-            order_id = result.get("result", {}).get("id")
-            print(f"   Placed Order ID: {order_id}. Waiting for match...")
-            time.sleep(5)
-            order_data = bitkub_request(
-                "GET",
-                "/api/v3/market/order-info",
-                params={"sym": symbol, "id": order_id, "sd": "buy"},
-            ).get("result", {})
-            spent_thb = float(order_data.get("filled", 0))
-            if spent_thb == 0:
-                spent_thb = float(order_data.get("total", 0))
-            history = order_data.get("history", [])
-            received_amt = sum(
-                float(t["amount"]) / float(t["rate"])
-                for t in history
-                if float(t.get("rate", 0)) > 0
-            )
-            rate = spent_thb / received_amt if received_amt > 0 else 0
-            ts_exec = int(order_data.get("ts", time.time()))
-            exchange_pair = symbol
-            quote_line = ""
         else:
-            raise ValueError(
-                "TRADING_EXCHANGE must be either 'bitkub' or 'kraken'"
+            if expected_config is None:
+                raise RuntimeError(
+                    f"No expected live configuration was supplied for new order {key}"
+                )
+            _revalidate_trade_intent(symbol, expected_config, today)
+            client_order_id = build_client_order_id(symbol, today)
+            intent, intent_was_existing = prepare_order_intent(
+                key, client_order_id, today, amount_gbp
             )
+            if not intent_was_existing:
+                try:
+                    # The durable intent now exists. Re-check rules again so an
+                    # intervening disable or amount edit clears safely before Kraken.
+                    _revalidate_trade_intent(symbol, expected_config, today)
+                except Exception as validation_error:
+                    raise KrakenPreSubmissionError(
+                        "Live rules changed after the durable intent was saved: "
+                        f"{validation_error}"
+                    ) from validation_error
 
-        _gha_mask(str(order_id))
-        # Mask all sensitive trade values so they are redacted in GitHub Actions run logs
-        _gha_mask(f"{spent_thb:.2f}")
-        _gha_mask(f"{received_amt:.8f}")
-        _gha_mask(f"{rate:.2f}")
-        dt_str = datetime.fromtimestamp(ts_exec, tz=SELECTED_TZ).strftime('%Y-%m-%d %H:%M:%S')
+        client_order_id = intent["client_order_id"]
+        amount_gbp = _parse_amount_gbp(intent["amount_gbp"])
+        _gha_mask(str(amount_gbp))
+        if amount_gbp.is_integer():
+            _gha_mask(str(int(amount_gbp)))
+        print(f"Executing Kraken DCA buy for {symbol} ({amount_gbp:.2f} GBP).")
 
-        # 4. Calculate USD value
-        base_sym = symbol.split('_')[0]
-        fx_rate = get_thb_usd_rate()
-        
-        if fx_rate == 0:
-            # FX rate fetch failed - send error notification
-            fx_error_msg = (
-                f"⚠️ **FX Rate Fetch Failed**\n"
-                f"Trade executed successfully but USD conversion unavailable.\n"
-                f"All currency exchange API sources failed."
+        def final_rule_check():
+            if intent_was_existing:
+                return
+            _revalidate_trade_intent(symbol, expected_config, today)
+
+        order_data = place_market_buy(
+            symbol,
+            amount_gbp,
+            client_order_id=client_order_id,
+            reconcile_only=intent_was_existing,
+            pre_submit_check=final_rule_check,
+        )
+    except KrakenOrderStateUnknown as error:
+        message = (
+            f"CRITICAL: Kraken order state is unknown for {key}; the durable "
+            f"intent remains locked for reconciliation. {error}"
+        )
+        print(message)
+        send_discord_alert(message, is_error=True)
+        return False
+    except (KrakenOrderNoFill, KrakenPreSubmissionError) as error:
+        if intent is not None:
+            try:
+                clear_order_intent(key, intent["client_order_id"])
+            except Exception as clear_error:
+                error = RuntimeError(
+                    f"{error}; durable intent cleanup also failed: {clear_error}"
+                )
+        message = f"DCA failed ({symbol}): {error}"
+        print(message)
+        send_discord_alert(message, is_error=True)
+        return False
+    except Exception as error:
+        if intent is not None:
+            message = (
+                f"CRITICAL: Unexpected Kraken failure for {key}; the durable "
+                f"intent remains locked for reconciliation. {error}"
             )
-            send_discord_alert(fx_error_msg, is_error=True)
-        
-        usd_spent = spent_thb * fx_rate if fx_rate > 0 else 0
-        usd_price_per_unit = (usd_spent / received_amt) if received_amt > 0 else 0
-        _gha_mask(f"{usd_spent:.2f}")
-        _gha_mask(f"{usd_price_per_unit:.4f}")
+        else:
+            message = f"DCA failed before an order intent was saved ({symbol}): {error}"
+        print(message)
+        send_discord_alert(message, is_error=True)
+        return False
 
-        # 5. Log to Ghostfolio
-        ghostfolio_saved = False
-        try:
-            from portfolio_logger import log_to_ghostfolio
-            
-            account_id = get_ghostfolio_account_id(base_sym)
-            
-            if account_id:
-                ghostfolio_data = {
-                    "ts": ts_exec,
-                    "amount_crypto": received_amt,
-                    "amount_thb": spent_thb,
-                    "amount_usd": usd_spent,
-                    "symbol": base_sym,
-                    "order_id": order_id,
-                    "usd_price_per_unit": usd_price_per_unit
-                }
-                
-                ghostfolio_saved = log_to_ghostfolio(
-                    ghostfolio_data,
-                    base_sym,
+    order_id = order_data["order_id"]
+    exchange_pair = order_data["pair"]
+    cost_gbp = float(order_data["cost_gbp"])
+    fee_gbp = float(order_data["fee_gbp"])
+    gbp_fee_debit = float(order_data["gbp_fee_debit"])
+    fee_details = order_data["fee_details"]
+    spent_gbp = float(order_data["spent_gbp"])
+    received_amount = float(order_data["received"])
+    gbp_price_per_unit = float(order_data["market_gbp_price_per_unit"])
+    effective_gbp_price_per_unit = float(
+        order_data["effective_gbp_price_per_unit"]
+    )
+    execution_timestamp = int(order_data["timestamp"])
+    base_symbol = exchange_pair.split("/", maxsplit=1)[0]
+
+    _gha_mask(str(order_id))
+    _gha_mask(f"{cost_gbp:.2f}")
+    _gha_mask(f"{fee_gbp:.2f}")
+    _gha_mask(f"{gbp_fee_debit:.2f}")
+    _gha_mask(f"{spent_gbp:.2f}")
+    _gha_mask(f"{received_amount:.8f}")
+    _gha_mask(f"{gbp_price_per_unit:.2f}")
+
+    # Completion and pending-intent removal are one write in the trader-only
+    # execution-state variable. If it fails, the durable intent remains locked.
+    try:
+        complete_order_intent(key, client_order_id, intent["trade_date"])
+    except Exception as error:
+        message = (
+            f"CRITICAL: Kraken filled {order_id}, but execution state could not be "
+            f"completed for {key}. The durable intent remains locked: {error}"
+        )
+        print(message)
+        send_discord_alert(message, is_error=True)
+        return False
+
+    trade_data = {
+        "ts": execution_timestamp,
+        "amount_crypto": received_amount,
+        "amount_gbp": spent_gbp,
+        "cost_gbp": cost_gbp,
+        "fee_gbp": fee_gbp,
+        "gbp_fee_debit": gbp_fee_debit,
+        "fee_details": fee_details,
+        "order_id": order_id,
+        "gbp_price_per_unit": gbp_price_per_unit,
+        "effective_gbp_price_per_unit": effective_gbp_price_per_unit,
+        "exchange_pair": exchange_pair,
+    }
+
+    ghostfolio_saved = False
+    try:
+        from portfolio_logger import log_to_ghostfolio
+
+        account_id = get_ghostfolio_account_id(base_symbol)
+        if account_id:
+            ghostfolio_saved = bool(
+                log_to_ghostfolio(
+                    trade_data,
+                    base_symbol,
                     account_id,
                     exchange_pair=exchange_pair,
                 )
-                
-                if ghostfolio_saved:
-                    print(f"✅ Logged to Ghostfolio account {account_id}")
-                else:
-                    print(f"⚠️ Failed to log to Ghostfolio")
-            else:
-                print(f"⚠️ No Ghostfolio account configured for {base_sym}")
-                
-        except Exception as e:
-            print(f"⚠️ Ghostfolio logging error: {e}")
+            )
+        else:
+            print(f"No Ghostfolio account configured for {base_symbol}.")
+    except Exception as error:
+        print(f"Ghostfolio logging error: {error}")
 
-        # 6. Log to Gist
-        update_gist_log({
-            "ts": ts_exec,
-            "amount_thb": spent_thb,
-            "price": rate,
-            "amount_btc": received_amt, # Generic field name, but holds crypto amount
-            "usd_rate": 0, 
-            "order_id": order_id
-        }, symbol=base_sym, saved_to_ghostfolio=ghostfolio_saved)
-
-        # 7. Notify Discord
-        msg = (
-            f"✅ **DCA Buy Executed!**\n"
-            f"🔹 **Pair:** {exchange_pair}\n"
-            f"💰 **Spent:** ฿{spent_thb:,.2f}\n"
-            f"{quote_line}"
-            f"💵 **Spent (USD):** ${usd_spent:,.2f}\n"
-            f"📥 **Received:** {received_amt:.8f} {base_sym}\n"
-            f"🏷️ **Rate:** ฿{rate:,.2f}\n"
-            f"🏷️ **Rate (USD):** ${usd_price_per_unit:,.4f}\n"
-            f"📊 **Asset ROI:** {format_asset_roi(dca_decision.get('roi_percent'))}\n"
-            f"⚖️ **DCA Decision:** {dca_decision.get('reason')}\n"
-            f"💾 **Portfolio:** {'✅ Saved' if ghostfolio_saved else '❌ Not saved'}\n"
-            f"🕒 **Time:** {dt_str}\n"
-            f"🆔 **Order ID:** {order_id}"
+    try:
+        update_gist_log(
+            trade_data,
+            symbol=base_symbol,
+            saved_to_ghostfolio=ghostfolio_saved,
         )
-        send_discord_alert(msg, is_error=False)
+    except Exception as error:
+        print(f"Gist logging error: {error}")
 
-    except Exception as e:
-        err = f"❌ **DCA Failed ({symbol})**: {str(e)}"
-        print(err)
-        send_discord_alert(err, is_error=True)
-        # Fall through — LAST_BUY_DATE is still saved below to prevent
-        # the bot from hammering a broken API/insufficient funds every 15 min.
+    execution_time = datetime.fromtimestamp(
+        execution_timestamp, tz=SELECTED_TZ
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    message = (
+        "DCA buy executed and confirmed.\n"
+        f"**Pair:** {exchange_pair}\n"
+        f"**Order cost:** £{cost_gbp:,.2f}\n"
+        f"**Kraken fee (GBP equivalent):** £{fee_gbp:,.2f}\n"
+        f"**Fee charged from GBP:** £{gbp_fee_debit:,.2f}\n"
+        f"**Total GBP debit:** £{spent_gbp:,.2f}\n"
+        f"**Received:** {received_amount:.8f} {base_symbol}\n"
+        f"**Market rate:** £{gbp_price_per_unit:,.2f}\n"
+        f"**Effective rate:** £{effective_gbp_price_per_unit:,.2f}\n"
+        f"**Asset ROI:** {format_asset_roi(dca_decision.get('roi_percent'))}\n"
+        f"**DCA Decision:** {dca_decision.get('reason')}\n"
+        f"**Portfolio:** {'Saved' if ghostfolio_saved else 'Not saved'}\n"
+        f"**Time:** {execution_time}\n"
+        f"**Order ID:** {order_id}"
+    )
+    send_discord_alert(message, is_error=False)
+    return True
 
-    # 8. Update LAST_BUY_DATE in DCA_TARGET_MAP (always — success or failure)
-    # CRITICAL: Outside try/except so RuntimeError from save_last_buy_date propagates
-    # and the workflow fails loudly instead of silently swallowing the double-buy risk.
-    if map_key and target_map:
-        today_str = datetime.now(SELECTED_TZ).strftime("%Y-%m-%d")
-        print(f"🔄 Updating LAST_BUY_DATE for {map_key} to {today_str}...")
-        save_last_buy_date(target_map, map_key, today_str)
 
 def main():
-    print(f"--- Starting DCA Logic ---")
-    
-    # Parse Target Map
+    print("--- Starting Kraken GBP DCA logic ---")
     try:
         target_map = json.loads(DCA_TARGET_MAP_JSON)
-    except Exception:
-        print("⚠️ Failed to parse DCA_TARGET_MAP JSON. Using empty map.")
-        target_map = {}
+        if not isinstance(target_map, dict) or not target_map:
+            raise ValueError("DCA_TARGET_MAP must be a non-empty JSON object")
+        execution_state = json.loads(DCA_EXECUTION_STATE_JSON or "{}")
+        _validate_execution_state(execution_state)
+    except (json.JSONDecodeError, ValueError) as error:
+        message = f"Invalid DCA configuration or execution state: {error}"
+        print(message)
+        send_discord_alert(message, is_error=True)
+        return False
 
-    print(f"Target Map Keys: {list(target_map.keys())}")
-
-    # Determine symbols to process
-    symbols_to_process = []
-    for k in target_map.keys():
-        if isinstance(target_map[k], dict):
-             # Check if explicitly disabled, if enabled or missing key -> include
-             if target_map[k].get("BUY_ENABLED", True):
-                 symbols_to_process.append(k)
-             else:
-                 print(f"🚫 {k} is DISABLED in config. Skipping.")
-        else:
-             # Legacy string format -> Assume enabled
-            symbols_to_process.append(k)
-    
-    # Clean list
-    symbols_to_process = [s.strip() for s in symbols_to_process if s.strip()]
-
-    print(f"Symbols to Process (Enabled): {symbols_to_process}")
-
+    print(f"Target map keys: {list(target_map.keys())}")
+    all_succeeded = True
+    pending_keys = [
+        key
+        for key, entry in execution_state.items()
+        if isinstance(entry, dict) and entry.get(PENDING_ORDER_FIELD) is not None
+    ]
+    symbols_to_process = list(dict.fromkeys([*target_map, *pending_keys]))
     for symbol in symbols_to_process:
-        print(f"\nPROCESSING {symbol}...")
-        
-        config = get_config_for_symbol(symbol, target_map)
-        
-        # BUY_ENABLED check is redundant if we filtered above, but good for safety
-        if not config["BUY_ENABLED"]:
-            print(f"⛔ Trade Disabled for {symbol}. Skipping.")
-            continue
-            
-        target_time = config["TIME"]
-        configured_amount = config["AMOUNT"]
-        
-        if is_time_to_trade(target_time):
-            # Check LAST_BUY_DATE
-            today_str = datetime.now(SELECTED_TZ).strftime("%Y-%m-%d")
-            last_buy = config.get("LAST_BUY_DATE")
-            
-            if last_buy == today_str:
-                print(f"🛑 Already bought {symbol} today ({today_str}). Skipping.")
-            else:
-                dca_decision = determine_dynamic_dca_decision(
-                    symbol, configured_amount, config["DYNAMIC_DCA"]
-                )
-                print(
-                    "✅ Time match & Not bought today! "
-                    f"{dca_decision['reason']}"
-                )
-                execute_trade(
+        pending = _pending_order_for_symbol(execution_state, symbol)
+        if pending is not None:
+            recovery_decision = _build_dca_decision(
+                float(pending["amount_gbp"]),
+                1.0,
+                None,
+                "Recovery: reconcile the durable Kraken order intent only.",
+            )
+            try:
+                succeeded = execute_trade(
                     symbol,
-                    dca_decision["amount_thb"],
-                    map_key=config["KEY"],
+                    pending["amount_gbp"],
+                    map_key=symbol,
                     target_map=target_map,
-                    dca_decision=dca_decision,
+                    dca_decision=recovery_decision,
+                    expected_config=None,
                 )
-        else:
-            print(f"⏳ Not time yet (Target: {target_time}). Skipping.")
+            except Exception as error:
+                message = f"DCA recovery failed ({symbol}): {error}"
+                print(message)
+                send_discord_alert(message, is_error=True)
+                succeeded = False
+            if not succeeded:
+                all_succeeded = False
+            continue
+
+        try:
+            config = get_config_for_symbol(symbol, target_map, execution_state)
+        except ValueError as error:
+            message = f"Rejected DCA configuration: {error}"
+            print(message)
+            send_discord_alert(message, is_error=True)
+            all_succeeded = False
+            continue
+
+        if not config["BUY_ENABLED"]:
+            print(f"{symbol} is disabled; skipping.")
+            continue
+        if not is_time_to_trade(config["TIME"]):
+            print(f"Not time yet for {symbol} (target: {config['TIME']}).")
+            continue
+
+        today = datetime.now(SELECTED_TZ).strftime("%Y-%m-%d")
+        if config["LAST_BUY_DATE"] == today:
+            print(f"Already bought {symbol} today ({today}); skipping.")
+            continue
+
+        decision = determine_dynamic_dca_decision(
+            symbol, config["AMOUNT_GBP"], config["DYNAMIC_DCA"]
+        )
+        print(decision["reason"])
+        try:
+            succeeded = execute_trade(
+                symbol,
+                decision["amount_gbp"],
+                map_key=config["KEY"],
+                target_map=target_map,
+                dca_decision=decision,
+                expected_config=config,
+            )
+        except Exception as error:
+            message = f"DCA post-fill handling failed ({symbol}): {error}"
+            print(message)
+            send_discord_alert(message, is_error=True)
+            succeeded = False
+        if not succeeded:
+            all_succeeded = False
+
+    return all_succeeded
+
 
 if __name__ == "__main__":
-    main()
+    if not main():
+        raise SystemExit(1)

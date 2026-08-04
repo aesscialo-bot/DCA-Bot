@@ -5,11 +5,11 @@ import os
 import re
 import json
 import time
-import google.generativeai as genai
+from google import genai
 from datetime import datetime, timedelta, timezone
 
 # --- Config ---
-EXCHANGE_ID = os.environ.get("EXCHANGE_ID", "binance")
+EXCHANGE_ID = os.environ.get("EXCHANGE_ID", "kraken")
 # Support comma-separated list OR JSON array
 SYMBOLS_ENV = os.environ.get("SYMBOL", "")
 
@@ -18,8 +18,10 @@ def _parse_symbols(symbols_env: str, dca_map_env: str) -> list:
 
     Priority:
       1. Explicit SYMBOL env var (comma-separated or JSON array).
-      2. Derive from DCA_TARGET_MAP keys (BTC_THB -> BTC/USDT).
-      3. Fallback to ["BTC/USDT"].
+      2. Derive from canonical DCA_TARGET_MAP keys (BTC_GBP -> BTC/GBP).
+
+    When neither source is valid, fail closed instead of analyzing an asset that
+    was never configured.
     """
     # 1. Explicit SYMBOL env var
     if symbols_env.strip():
@@ -31,40 +33,47 @@ def _parse_symbols(symbols_env: str, dca_map_env: str) -> list:
                 result = [str(parsed)]
         except (json.JSONDecodeError, ValueError):
             result = [s.strip() for s in symbols_env.split(",") if s.strip()]
+        normalized = []
+        for symbol in result:
+            candidate = symbol.upper().replace("_", "/")
+            if "/" not in candidate:
+                candidate = f"{candidate}/GBP"
+            if not re.fullmatch(r"[A-Z0-9]+/GBP", candidate):
+                raise ValueError(f"Only GBP analysis pairs are supported: {symbol}")
+            normalized.append(candidate)
+        result = normalized
         print(f"📋 Symbols from SYMBOL env var: {result}")
         return result
 
     # 2. Derive from DCA_TARGET_MAP
     try:
         dca_map = json.loads(dca_map_env) if dca_map_env else {}
-    except (json.JSONDecodeError, ValueError):
-        dca_map = {}
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ValueError("DCA_TARGET_MAP is not valid JSON") from error
+
+    if not isinstance(dca_map, dict):
+        raise ValueError("DCA_TARGET_MAP must be a JSON object")
 
     if dca_map:
         symbols = []
         for key in dca_map:
-            # Convert THB keys to USDT pairs (BTC_THB -> BTC/USDT)
-            if "_THB" in key:
-                base = key.replace("_THB", "")
-                symbols.append(f"{base}/USDT")
-            elif "/" in key:
-                symbols.append(key)
-            else:
-                symbols.append(key)
+            if isinstance(key, str) and re.fullmatch(r"[A-Z0-9]+_GBP", key):
+                symbols.append(f"{key[:-4]}/GBP")
         if symbols:
             print(f"📋 Symbols derived from DCA_TARGET_MAP: {symbols}")
             return symbols
+        raise ValueError("DCA_TARGET_MAP contains no canonical COIN_GBP keys")
 
-    # 3. Fallback
-    print("⚠️ No SYMBOL env var or DCA_TARGET_MAP found. Falling back to ['BTC/USDT']")
-    return ["BTC/USDT"]
+    raise ValueError(
+        "No Kraken GBP analysis symbols were provided and DCA_TARGET_MAP is empty"
+    )
 
-
-SYMBOLS = _parse_symbols(SYMBOLS_ENV, os.environ.get("DCA_TARGET_MAP", "{}"))
 
 TIMEFRAME = "15m"
 LOCAL_TZ = os.environ.get("TIMEZONE", "Asia/Bangkok")
-PERIODS = [14, 30, 45, 60]  # Focused on short-term market evolution
+# Kraken Spot REST returns at most 720 candles. At 15 minutes that is 7.5 days,
+# so these periods deliberately stay within the exchange's documented window.
+PERIODS = [3, 5, 7]
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DCA_TARGET_MAP_ENV = os.environ.get("DCA_TARGET_MAP", "{}")
@@ -80,6 +89,13 @@ except Exception:
 def _harmonic_mean(series):
     """Harmonic mean of a numeric series — used for DCA price averaging."""
     return len(series) / (1 / series).sum()
+
+
+def get_analysis_exchange(exchange_id=EXCHANGE_ID):
+    """Return the one supported public market-data client."""
+    if str(exchange_id).strip().lower() != "kraken":
+        raise ValueError("Crypto analysis supports Kraken GBP markets only")
+    return ccxt.kraken({"enableRateLimit": True})
 
 
 # --- Fetch helper ---
@@ -171,8 +187,6 @@ def get_ai_summary(full_report, current_symbol):
         return "No GEMINI_API_KEY found. Skipping AI analysis.", None, None
 
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-
         prompt = f"""
         You are a crypto DCA timing analyst. Your job is to choose ONE daily buy time (HH:MM) for {current_symbol} from the report below.
 
@@ -190,21 +204,20 @@ def get_ai_summary(full_report, current_symbol):
         2) Give a short reason (max 3 sentences) mentioning which timeframe(s) drove the decision.
 
         DECISION RULES (follow in order):
-        A) Recency Shift Check (14-day override)
-        - Identify the best 14-day candidate by PRIMARY objective (lowest median_miss).
-        - Only override longer timeframes with the 14-day candidate if BOTH are true:
-        1) The 14-day candidate win_rate is >= 10 percentage points higher than the best 30-day candidate win_rate, AND
-        2) The 14-day candidate median_miss is not worse than the best 30-day candidate by more than 0.20 percentage points.
-        - If these conditions are NOT met, ignore the 14-day winner (treat as noise).
+        A) Recency Shift Check (3-day override)
+        - Identify the best 3-day candidate by PRIMARY objective (lowest median_miss).
+        - Only override longer timeframes with the 3-day candidate if BOTH are true:
+        1) Its win_rate is at least 10 percentage points higher than the best 7-day candidate, AND
+        2) Its median_miss is no more than 0.20 percentage points worse than the best 7-day candidate.
 
-        B) Base Selection (30/60-day weighted, median_miss-first)
-        - Compute the base choice by comparing the 30-day and 60-day best candidates (lowest median_miss in each timeframe).
-        - Prefer the 60-day best candidate unless the 30-day best median_miss is better by >= 0.15 percentage points (recent improvement).
+        B) Base Selection (5/7-day weighted, median_miss-first)
+        - Compare the best 5-day and 7-day candidates.
+        - Prefer the 7-day candidate unless the 5-day median_miss is better by at least 0.15 percentage points.
 
         C) Consistency Bonus (only as tie-break)
         - If multiple candidates are within 0.10 percentage points median_miss of the current choice in the chosen base timeframe:
-        - Pick the one that appears in the Top 5 across the most timeframes (30/45/60).
-        - If still tied, pick the higher win_rate in the 60-day table.
+        - Pick the one that appears in the Top 5 across the most timeframes (3/5/7).
+        - If still tied, pick the higher win_rate in the 7-day table.
         - If still tied, pick the earlier time (HH:MM).
 
         OUTPUT FORMAT (exactly, no extra text):
@@ -215,14 +228,11 @@ def get_ai_summary(full_report, current_symbol):
         {full_report}
         """
         
-        # Try a list of models in order of preference (Good -> Fallback)
-        # This task needs structured extraction, not deep reasoning.
-        # Avoid reasoning-first models (e.g. gemini-3-*) as they add ~60s+ per call.
+        # Use only the Flash family selected for this deployment. This task needs
+        # structured extraction, not a higher-cost reasoning-first model.
         candidates = [
-            'gemini-2.5-pro',          # High-capability 
-            'gemini-2.5-flash',        # Fast and capable (preferred)
             'gemini-2.5-flash-lite',   # Optimized for speed/volume
-            'gemini-3-flash-preview',  # Frontier-class fallback
+            'gemini-2.5-flash',        # More capable Flash fallback
         ]
 
         result_text = None
@@ -231,8 +241,11 @@ def get_ai_summary(full_report, current_symbol):
         for model_name in candidates:
             try:
                 print(f"Trying AI model: {model_name}...")
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(prompt)
+                with genai.Client(api_key=GEMINI_API_KEY) as ai_client:
+                    response = ai_client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                    )
                 result_text = response.text.strip()
                 break # Stop after the first successful model
             except Exception as e:
@@ -278,18 +291,19 @@ def send_to_discord(report_content, color=3447003):
             }]
         }
         try:
-            r = requests.post(DISCORD_WEBHOOK_URL, json=payload)
+            r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
             r.raise_for_status()
             print(f"Sent chunk {i+1}/{len(chunks)} to Discord")
         except Exception as e:
             print(f"Failed to send to Discord: {e}")
 
 def main():
-    exchange = getattr(ccxt, EXCHANGE_ID)({"enableRateLimit": True})
+    symbols = _parse_symbols(SYMBOLS_ENV, DCA_TARGET_MAP_ENV)
+    exchange = get_analysis_exchange()
 
     map_was_updated = False  # Track whether any TIME value was actually changed
 
-    for symbol in SYMBOLS:
+    for symbol in symbols:
         print(f"\nExample: PROCESSING {symbol}...")
         report_lines = []
         summary_lines = []  # For short report
@@ -339,10 +353,10 @@ def main():
                 try:
                     top_common, top_avg, top_dca, start, end = analyze_period(df, days, LOCAL_TZ)
                     
-                    # Capture the best time from the 30-day period
-                    if days == 30 and not top_dca.empty:
+                    # Use the longest Kraken-supported period as the final candidate.
+                    if days == max(PERIODS) and not top_dca.empty:
                         best_overall_time = top_dca.iloc[0]['time']
-                        log(f"🏆 CHAMPION TIME (30 Days): {best_overall_time}")
+                        log(f"🏆 CHAMPION TIME ({days} Days): {best_overall_time}")
                     
                     log(f"Range: {start} -> {end}")
                     
@@ -360,7 +374,7 @@ def main():
 
             # After loop, prepare for AI analysis (always use full detailed report)
             final_time = best_overall_time
-            source_method = "Quantitative (30d Median Miss)"
+            source_method = "Quantitative (7d Kraken GBP Median Miss)"
 
             if GEMINI_API_KEY:
                 log("\n" + "="*40, summary_only=True)
@@ -395,19 +409,11 @@ def main():
             # Update EXISTING_MAP with the final time BEFORE building the Discord report
             # so the appended DCA_TARGET_MAP snapshot reflects the new recommended times.
             if final_time:
-                # Normalize to THB key if possible (e.g., BTC/USDT -> BTC_THB)
+                # Normalize to the canonical Kraken GBP configuration key.
                 base = symbol.split('/')[0]
-                thb_key = f"{base}_THB"
+                gbp_key = f"{base}_GBP"
 
-                # Determine which key to update
-                target_key = symbol  # Default
-                if thb_key in EXISTING_MAP:
-                    target_key = thb_key
-                elif symbol in EXISTING_MAP:
-                    target_key = symbol
-                else:
-                    # New Entry: Prefer THB key for standard
-                    target_key = thb_key
+                target_key = gbp_key
 
                 # Update Logic
                 if target_key in EXISTING_MAP and isinstance(EXISTING_MAP[target_key], dict):
@@ -415,14 +421,15 @@ def main():
                     EXISTING_MAP[target_key]["TIME"] = final_time
                     if final_time != old_time:
                         map_was_updated = True
-                    log(f"✅ Updated existing config for '{target_key}' -> TIME: {final_time}")
+                    log(
+                        f"✅ Recommended TIME for existing target '{target_key}': "
+                        f"{final_time}. The workflow will merge it if live rules are unchanged."
+                    )
                 elif target_key in EXISTING_MAP:
-                    # It's a string (legacy format)
-                    old_time = EXISTING_MAP[target_key]
-                    EXISTING_MAP[target_key] = final_time
-                    if final_time != old_time:
-                        map_was_updated = True
-                    log(f"✅ Updated legacy string for '{target_key}' -> {final_time}")
+                    log(
+                        f"⚠️ '{target_key}' is not an object and was not updated.",
+                        summary_only=True,
+                    )
                 else:
                     # Symbol not in DCA_TARGET_MAP (new manual-dispatch analysis).
                     # Analysis is complete and Discord report has been sent below,
@@ -447,17 +454,20 @@ def main():
 
     # Send final DCA_TARGET_MAP snapshot (reflects all TIME updates from this run)
     if EXISTING_MAP:
-        label = "DCA_TARGET_MAP (updated)" if map_was_updated else "DCA_TARGET_MAP"
+        label = (
+            "DCA_TARGET_MAP (recommended TIME snapshot)"
+            if map_was_updated
+            else "DCA_TARGET_MAP"
+        )
         lines = [f"**📋 {label}**\n"]
         for symbol, config in EXISTING_MAP.items():
             if isinstance(config, dict):
-                enabled = config.get("BUY_ENABLED", True)
+                enabled = config.get("BUY_ENABLED", False)
                 status = "🟢" if enabled else "🔴"
                 lines.append(
                     f"{status} **{symbol}** — "
                     f"Time: `{config.get('TIME', '?')}`, "
-                    f"Amount: `{config.get('AMOUNT', '?')}` THB, "
-                    f"Last Buy: `{config.get('LAST_BUY_DATE', 'never')}`"
+                    f"Amount: `£{config.get('AMOUNT_GBP', '?')}`"
                 )
             else:
                 lines.append(f"🟢 **{symbol}** — `{config}`")
