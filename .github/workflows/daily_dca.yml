@@ -54,7 +54,7 @@ jobs:
           if (.value | type) == "string" then
             "\(.key)|\(.value)||\(true)"
           else
-            "\(.key)|\(.value.TIME // "07:00")|\(.value.LAST_BUY_DATE // "")|\(.value.BUY_ENABLED // true)"
+            "\(.key)|\(.value.TIME // "07:00")|\(.value.LAST_BUY_DATE // "")|\(if .value.BUY_ENABLED == null then true else .value.BUY_ENABLED end)"
           end
         ' | while IFS='|' read -r SYMBOL TARGET_TIME LAST_BUY ENABLED; do
         
@@ -88,7 +88,7 @@ jobs:
         SHOULD_RUN=$(cat .should_run_flag)
         rm .should_run_flag
         
-        echo "should_run=$SHOULD_RUN" >> $GITHUB_OUTPUT
+        echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
 
     - name: Checkout repository
       if: steps.check.outputs.should_run == 'true'
