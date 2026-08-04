@@ -33,14 +33,13 @@ jobs:
         cache: 'pip'
 
     - name: Install dependencies
-      run: pip install --upgrade pip && pip install requests
-      # Only install 'requests' - portfolio_balance.py doesn't need pandas/other heavy deps
+      run: pip install --upgrade pip && pip install -r requirements.txt
 
     - name: Check Portfolio Balance
       env:
         # API credentials
-        BITKUB_API_KEY: ${{ secrets.BITKUB_API_KEY }}
-        BITKUB_API_SECRET: ${{ secrets.BITKUB_API_SECRET }}
+        KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+        KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         
         # Discord notification
         DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}

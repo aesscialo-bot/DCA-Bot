@@ -1,4 +1,4 @@
-ccxt>=4.3.0,<4.4.54
+ccxt==4.5.71
 pandas
 requests
-google-generativeai
+google-genai==1.75.0

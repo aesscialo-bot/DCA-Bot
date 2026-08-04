@@ -1,117 +1,131 @@
-import os
-import requests
-from datetime import datetime, timedelta
-from bitkub_client import get_thb_usd_rate
+"""Best-effort logging of Kraken GBP purchases to a GitHub Gist."""
 
-# Gist Logging Configuration
+import os
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import requests
+
+
 GIST_ID = os.environ.get("GIST_ID")
 GIST_TOKEN = os.environ.get("GIST_TOKEN")
+GIST_FILENAME = "kraken_gbp_trade_log.md"
+GIST_REQUEST_TIMEOUT_SECONDS = 10
 
-# Timezone Configuration
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "Asia/Bangkok")
-from zoneinfo import ZoneInfo
-SELECTED_TZ = ZoneInfo(TIMEZONE_NAME) 
+SELECTED_TZ = ZoneInfo(TIMEZONE_NAME)
+
+TABLE_HEADER = (
+    "# Kraken GBP Trade Log\n\n"
+    "| Date | Order cost | Kraken fee | Total GBP debit | Price (GBP) | Crypto received | Kraken order | Ghostfolio |\n"
+    "| --- | ---: | ---: | ---: | ---: | ---: | --- | :---: |\n"
+)
+
+
+def _clean_table_value(value):
+    """Keep external identifiers from breaking the Markdown table."""
+    return str(value).replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _validated_trade_values(trade_data):
+    """Extract the GBP-native fields required by the Gist row."""
+    timestamp = float(trade_data["ts"])
+    cost_gbp = float(trade_data["cost_gbp"])
+    fee_gbp = float(trade_data["fee_gbp"])
+    gbp_fee_debit = float(trade_data["gbp_fee_debit"])
+    total_gbp = float(trade_data["amount_gbp"])
+    amount_crypto = float(trade_data["amount_crypto"])
+    gbp_price = float(trade_data["gbp_price_per_unit"])
+
+    if cost_gbp <= 0 or fee_gbp < 0 or gbp_fee_debit < 0 or total_gbp <= 0:
+        raise ValueError("GBP cost and total must be positive; fee cannot be negative")
+    if amount_crypto <= 0 or gbp_price <= 0:
+        raise ValueError("Crypto amount and GBP price must be positive")
+    if abs(total_gbp - (cost_gbp + gbp_fee_debit)) > 0.01:
+        raise ValueError("Total GBP debit must equal order cost plus GBP fee debit")
+
+    fee_details = trade_data.get("fee_details") or []
+    if not isinstance(fee_details, list) or not fee_details:
+        raise ValueError("Kraken fee details are required")
+    fee_text = ", ".join(
+        f"{float(item['amount']):.8f} {_clean_table_value(item['currency'])} "
+        f"(GBP equiv {float(item['gbp_equivalent']):.2f})"
+        for item in fee_details
+    )
+
+    return timestamp, cost_gbp, fee_text, total_gbp, amount_crypto, gbp_price
+
 
 def update_gist_log(trade_data, symbol="BTC", saved_to_ghostfolio=False):
+    """Append one GBP purchase to the dedicated Gist file.
+
+    Logging is deliberately best-effort: a Gist outage must never affect an
+    already completed Kraken order. ``True`` means the Gist PATCH succeeded;
+    all skipped or failed attempts return ``False``.
+    """
     if not GIST_ID or not GIST_TOKEN:
-        print("GIST_ID or GIST_TOKEN not set. Skipping log.")
-        return
+        print("GIST_ID or GIST_TOKEN not set. Skipping Gist log.")
+        return False
 
     try:
-        # Fetch THB/USD rate at the time of logging
-        fx_rate = get_thb_usd_rate()
-        
+        (
+            timestamp,
+            cost_gbp,
+            fee_text,
+            total_gbp,
+            amount_crypto,
+            gbp_price,
+        ) = _validated_trade_values(trade_data)
         headers = {
-            "Authorization": f"token {GIST_TOKEN}",
-            "Accept": "application/vnd.github.v3+json"
+            "Authorization": f"Bearer {GIST_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
         }
-        
-        # 1. Get current content
-        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers)
-        r.raise_for_status()
-        gist_obj = r.json()
-        
-        # Use single file strategy
-        files_map = gist_obj['files']
-        if len(files_map) > 0:
-            filename = list(files_map.keys())[0]
-            current_content = files_map[filename]['content']
-        else:
-            filename = "trade_log.md"
-            current_content = ""
-            
-        # 2. Format new row
-        ts = datetime.fromtimestamp(trade_data['ts'], tz=SELECTED_TZ)
-        datetime_str = ts.strftime("%Y-%m-%d %H:%M %Z")
-        
-        # Calculate USD Value of the purchase directly from THB amount
-        if fx_rate > 0:
-            usd_value = trade_data['amount_thb'] * fx_rate
-        else:
-            # Fallback if FX API failed: use the passed Bitcoin USD rate to estimate
-            # (BTC Amount * BTC Price USD)
-            usd_value = trade_data.get('amount_btc', 0) * trade_data.get('usd_rate', 0)
+        url = f"https://api.github.com/gists/{GIST_ID}"
 
-        # Check if header exists, if not add it
-        header_line = "| Date                 | THB Spent | USD Spent | Price (THB)    | Price (USD)      | Crypto             | Saved |\n"
-        
-        if "Date" not in current_content:
-            current_content = header_line + current_content
-            
-        # Append symbol to crypto amount for clarity (e.g. 0.0001 BTC)
-        crypto_val = f"{trade_data['amount_btc']:.8f} {symbol}"
-        
-        # Calculate USD price per crypto unit
-        usd_price = (usd_value / trade_data['amount_btc']) if trade_data['amount_btc'] > 0 else 0
-        
-        # Format currency values with symbols directly next to number
-        thb_spent_formatted = f"฿{trade_data['amount_thb']:.2f}"
-        usd_spent_formatted = f"${usd_value:.2f}"
-        thb_price_formatted = f"฿{trade_data['price']:,.2f}"
-        usd_price_formatted = f"${usd_price:,.4f}"
-        
-        # Determine saved status
-        saved_status = "true" if saved_to_ghostfolio else "false"
-        
-        # Format row with fixed column widths
-        row = f"| {datetime_str:20} | {thb_spent_formatted:>10} | {usd_spent_formatted:>10} | {thb_price_formatted:>16} | {usd_price_formatted:>17} | {crypto_val:18} | {saved_status:5} |"
-        
-        # Ensure newline
-        if not current_content.endswith('\n'):
-            current_content += '\n'
-        
-        new_content = current_content + row
-        
-        # 3. Update
-        payload = {
-            "files": {
-                filename: {"content": new_content}
-            }
-        }
-        requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=payload)
-        print(f"✅ Gist log updated for {symbol} in {filename}.")
-        
-    except Exception as e:
-        print(f"❌ Failed to update Gist: {e}")
+        response = requests.get(
+            url, headers=headers, timeout=GIST_REQUEST_TIMEOUT_SECONDS
+        )
+        response.raise_for_status()
+        gist = response.json()
+        current_content = (
+            gist.get("files", {}).get(GIST_FILENAME, {}).get("content", "")
+        )
+
+        if not current_content.strip():
+            current_content = TABLE_HEADER
+        elif not current_content.endswith("\n"):
+            current_content += "\n"
+
+        timestamp_text = datetime.fromtimestamp(
+            timestamp, tz=SELECTED_TZ
+        ).strftime("%Y-%m-%d %H:%M %Z")
+        crypto_text = f"{amount_crypto:.8f} {_clean_table_value(symbol.upper())}"
+        order_id = _clean_table_value(trade_data.get("order_id", "unknown"))
+        saved = "yes" if saved_to_ghostfolio else "no"
+        row = (
+            f"| {timestamp_text} | GBP {cost_gbp:.2f} | {fee_text} | "
+            f"GBP {total_gbp:.2f} | GBP {gbp_price:,.4f} | {crypto_text} | "
+            f"{order_id} | {saved} |\n"
+        )
+
+        response = requests.patch(
+            url,
+            headers=headers,
+            json={"files": {GIST_FILENAME: {"content": current_content + row}}},
+            timeout=GIST_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        print(f"Gist log updated for {symbol.upper()} in {GIST_FILENAME}.")
+        return True
+    except (KeyError, TypeError, ValueError, requests.RequestException) as error:
+        print(f"Failed to update Gist: {error}")
+    except Exception as error:
+        # Gist logging must remain nonblocking even for unexpected response data.
+        print(f"Failed to update Gist: {error}")
+
+    return False
+
 
 if __name__ == "__main__":
-    # Test execution
-    print("Testing Gist Logger...")
-    # Pre-fetch rate to show user what is being used
-    current_rate = get_thb_usd_rate()
-    print(f"Current FX Rate (THB -> USD): {current_rate}")
-
-    if not GIST_ID or not GIST_TOKEN:
-        print("⚠️  Please set GIST_ID and GIST_TOKEN environment variables to test.")
-        print("Example: export GIST_ID='...' && export GIST_TOKEN='...' && python gist_logger.py")
-    else:
-        dummy_data = {
-            "ts": datetime.now().timestamp(),
-            "amount_thb": 100.0,
-            "price": 1000000.0,
-            "amount_btc": 0.0001,
-            "usd_rate": 0, # Ignored unless API fails
-            "order_id": "TEST_ORDER_123"
-        }
-        print(f"Payload: {dummy_data}")
-        update_gist_log(dummy_data)
+    print("This module is called by crypto_dca.py after a completed Kraken order.")

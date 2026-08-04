@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 .env
 venv/
+.venv/
 
 # Bot launcher with hardcoded secrets
 run_bot.sh
