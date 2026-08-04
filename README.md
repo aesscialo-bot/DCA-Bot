@@ -1,83 +1,69 @@
 # Smart DCA Automation (Multi-Symbol Analysis + Execution)
 
-A complete system that automatically analyzes market data to find the best time of day to buy for **multiple cryptocurrencies**, and then executes trades automatically on your configured exchange.
+A complete system that analyzes market data to find the best time of day to buy **multiple cryptocurrencies**, executes spot market orders on **Kraken in GBP**, and exposes natural-language controls through a Discord bot hosted continuously on Railway.
 
 The system consists of the following files:
 
 | File | Role |
 |------|------|
-| `bitkub_client.py` | Shared API client — HMAC signing, server-time sync, FX rates. Used by all other modules. |
+| `kraken_client.py` | Kraken spot client — CCXT authentication, THB-budget-to-GBP conversion, market validation, order placement, and fill normalization. |
+| `bitkub_client.py` | Legacy Bitkub client used by the separate portfolio balance/report workflow and THB/USD logging helpers. It is not used to place trades on the Kraken path. |
 | `crypto_analysis.py` | Daily market analysis using CCXT + Gemini AI. Updates `DCA_TARGET_MAP` with optimal buy times. |
-| `crypto_dca.py` | Trade executor — reads `DCA_TARGET_MAP`, places market buy orders, logs to Gist + Ghostfolio. |
-| `portfolio_balance.py` | Portfolio reporter — fetches balances, calculates THB/USD value, sends Discord report. |
+| `crypto_dca.py` | Trade executor — reads `DCA_TARGET_MAP`, places Kraken GBP market buys, and logs to Gist + Ghostfolio. |
+| `portfolio_balance.py` | Legacy Bitkub portfolio reporter — fetches Bitkub balances and reports THB/USD values. It does not currently report the Kraken wallet. |
 | `portfolio_logger.py` | Logs individual trades to Ghostfolio portfolio tracker. |
 | `gist_logger.py` | Appends trade records to a GitHub Gist as a markdown ledger. |
-| `discord_bot.py` | Discord bot — natural language control of workflows and DCA config. Runs separately. |
+| `discord_bot.py` | Railway-hosted Discord bot — natural-language control of workflows and DCA config, plus the built-in DCA scheduler. |
 
 **Workflows** (`.github/workflows/`):
 
 1. **`crypto_analysis.yml`** — Runs daily (04:00 BKK / 21:00 UTC). Analyzes **60 days** of price data across **4 periods** (14, 30, 45, 60 days) for **all pairs in `DCA_TARGET_MAP`** to find the "Champion Time" for each. Uses AI synthesis to pick optimal buy time. Updates `DCA_TARGET_MAP`.
-2. **`daily_dca.yml`** — Triggered on **manual dispatch** + **daily 22:00 UTC safety net** (05:00 Bangkok). Checks if current time matches target time for any enabled symbol. Executes market buy orders.
-3. **`portfolio_check.yml`** — Runs **monthly on the 5th at 07:00 BKK** (00:00 UTC). Fetches balances for all configured coins, calculates portfolio value in THB and USD, includes the previous month's trade history (5th-to-5th window), sends Discord report. Also runs on every push to main (short balance-only report).
+2. **`daily_dca.yml`** — Triggered by the Railway scheduler, manual dispatch, or the **daily 22:00 UTC safety net** (05:00 Bangkok). Checks enabled symbols and executes Kraken `COIN/GBP` market buys using a THB-denominated strategy budget converted to GBP immediately before ordering. GitHub cron schedules run from the default branch, so this Kraken safety net becomes active after the branch is merged.
+3. **`portfolio_check.yml`** — Legacy Bitkub reporting workflow. Runs **monthly on the 5th at 07:00 BKK** (00:00 UTC), on manual dispatch, and on every push to `main`. It does not read Kraken balances.
 
 ## System Orchestration
 
 ```mermaid
 flowchart LR
-    subgraph TRIGGERS["⚡ Triggers"]
-        T1["🕓 Daily 04:00 BKK\ncron"]
-        T2["📅 Monthly 5th 07:00 BKK\ncron"]
-        T3["📤 Push to main"]
-        T4["⏰ Built-in scheduler\n-30/+60 min window"]
-        T5["👤 Manual / Discord Bot"]
-        T6["🕙 Daily 22:00 UTC\nsafety net cron"]
-        T7["🚀 Discord Buy Now\nimmediate dispatch"]
-    end
+    U["Discord user"] --> DG["Discord Gateway"]
+    DG --> RB["Railway<br/>discord_bot.py"]
+    RB -->|"read/write"| CFG["GitHub variable<br/>DCA_TARGET_MAP"]
+    RB -->|"workflow_dispatch<br/>configured ref"| W1
+    RB -->|"scheduled dispatch<br/>-30/+60 min window"| W2
+    RB -->|"portfolio command"| W3
 
-    subgraph WORKFLOWS["🔄 GitHub Actions Workflows"]
-        W1["crypto_analysis.yml\n(Analysis)"]
-        W2["daily_dca.yml\n(Trader)"]
-        W3["portfolio_check.yml\n(Portfolio)"]
-    end
+    C1["Daily 21:00 UTC"] --> W1["crypto_analysis.yml"]
+    C2["Daily 22:00 UTC safety net<br/>default branch only"] --> W2["daily_dca.yml"]
+    C3["Monthly / push to main<br/>/ manual"] --> W3["portfolio_check.yml"]
 
-    subgraph OUTPUTS["📤 Outputs"]
-        O1["💬 Discord\n(AI summary / full analysis)"]
-        O2["🗄️ DCA_TARGET_MAP\n(optimal buy times updated)"]
-        O3["💬 Discord\n(trade confirmation)"]
-        O4["📓 GitHub Gist\n(trade ledger)"]
-        O5["📊 Ghostfolio\n(portfolio activity)"]
-        O6["💬 Discord\n(full monthly report)"]
-        O7["💬 Discord\n(short balance report)"]
-    end
+    W1 -->|"BTC_THB → BTC/USDT"| BIN["Binance US market data"]
+    W1 --> GEM["Gemini analysis"]
+    W1 --> CFG
 
-    T1 -->|"all symbols"| W1
-    T5 -->|"specific symbol optional"| W1
-    W1 --> O1
-    W1 --> O2
+    W2 -->|"read rules / write LAST_BUY_DATE"| CFG
+    W2 -->|"THB budget → GBP"| FX["Frankfurter<br/>Open ER API fallback"]
+    W2 -->|"COIN/GBP market buy"| KR["Kraken spot"]
+    W2 --> LOG["Optional post-fill logging<br/>Ghostfolio + GitHub Gist"]
 
-    T4 -->|"dispatch API"| W2
-    T5 --> W2
-    T6 -->|"catch-up"| W2
-    T7 -->|"sets TIME + dispatch"| W2
-    W2 --> O3
-    W2 --> O4
-    W2 --> O5
-
-    T2 -->|"full report"| W3
-    T5 -->|"configurable"| W3
-    T3 -->|"short report"| W3
-    W3 --> O6
-    W3 --> O7
+    W3 -->|"legacy balances and history"| BK["Bitkub"]
+    W1 --> DIS["Discord Webhook<br/>notifications"]
+    W2 --> DIS
+    W3 --> DIS
 ```
+
+The trading and portfolio paths are intentionally shown separately: `daily_dca.yml` trades on Kraken in GBP, while `portfolio_check.yml` is still a legacy Bitkub report until it is migrated.
+
+For an unmerged branch deployment, set Railway's `GITHUB_WORKFLOW_REF` to that branch so Discord-triggered runs use its code. GitHub's scheduled events always use the default branch; they will not run the Kraken workflow until this branch is merged into `main`.
 
 ## Features
 
 - **Multi-Symbol Support**: Analyze and trade multiple pairs independently (e.g., BTC at 23:00, LINK at 23:45).
 - **Self-Optimizing**: Buy time adjusts daily based on 60-day historical analysis with AI-powered recommendations.
 - **Configurable Report Verbosity**: Analysis workflow supports short (AI summary only) or full (detailed breakdown) Discord reports.
-- **Portfolio Balance Tracking**: Automatic monthly balance checking and reporting via Discord with real-time valuations in THB and USD. Short balance-only report on every push to main.
+- **Kraken GBP Execution**: Converts each THB-denominated strategy budget to GBP at execution time and submits a Kraken `COIN/GBP` spot market order.
+- **Legacy Portfolio Balance Tracking**: The separate Bitkub workflow reports Bitkub holdings in THB and USD; it is not a Kraken wallet report.
 - **Multi-Layer Safeguards**: Prevents double-buying with `LAST_BUY_DATE` tracking and workflow concurrency control.
-- **Detailed Logging**: All trades logged to GitHub Gist with THB and USD amounts for portfolio tracking.
+- **Detailed Logging**: Kraken fills are normalized back to THB and USD for the existing GitHub Gist and Ghostfolio records; Discord also shows the actual GBP spent.
 - **Portfolio Integration**: Automatic trade logging to Ghostfolio portfolio tracker with 8-decimal precision and timezone-aware timestamps.
 - **Discord Integration**: Real-time notifications for trades (with THB+USD amounts and Ghostfolio status), errors, and critical alerts including FX rate failures.
 - **Timezone Aware**: Fully configurable timezone support via `TIMEZONE` env variable (defaults to Asia/Bangkok).
@@ -88,8 +74,10 @@ Go to `Settings` -> `Secrets and variables` -> `Actions` -> `New repository secr
 
 | Secret Name | Value Description |
 | :--- | :--- |
-| `BITKUB_API_KEY` | Your exchange API Key. |
-| `BITKUB_API_SECRET` | Your exchange API Secret. |
+| `KRAKEN_API_KEY` | Kraken API key used by `daily_dca.yml` for spot trading. |
+| `KRAKEN_API_SECRET` | Kraken API secret used by `daily_dca.yml`. |
+| `BITKUB_API_KEY` | Bitkub API key used only by the legacy `portfolio_check.yml` workflow. |
+| `BITKUB_API_SECRET` | Bitkub API secret used only by the legacy portfolio workflow. |
 | `GEMINI_API_KEY` | Google AI Studio Key. |
 | `DISCORD_WEBHOOK_URL` | Your Discord Webhook URL. |
 | `GH_PAT_FOR_VARS` | Personal Access Token (Classic) with `repo` and **`gist`** scope. Used to update variables and write to your log. |
@@ -102,7 +90,7 @@ Go to `Settings` -> `Secrets and variables` -> `Actions` -> `New repository vari
 
 | Variable Name | Example Value | Description |
 | :--- | :--- | :--- |
-| `DCA_TARGET_MAP` | `{"BTC_THB": {"TIME": "07:00", "AMOUNT": 800, "BUY_ENABLED": true, "LAST_BUY_DATE": "", "DYNAMIC_DCA": {"ENABLED": true, "THRESHOLD_PERCENT": -2, "REDUCED_MULTIPLIER": 0.5}}}` | **Key config.** Dictionary mapping Symbol to settings (time, amount, enabled state, last buy date, and optional dynamic DCA policy). |
+| `DCA_TARGET_MAP` | `{"BTC_THB": {"TIME": "07:00", "AMOUNT": 800, "BUY_ENABLED": true, "LAST_BUY_DATE": "", "DYNAMIC_DCA": {"ENABLED": true, "THRESHOLD_PERCENT": -2, "REDUCED_MULTIPLIER": 0.5}}}` | **Key config.** `*_THB` and `AMOUNT` remain strategy/config conventions. The Kraken executor converts `AMOUNT` from THB to GBP and maps `BTC_THB` to `BTC/GBP`. |
 | `TIMEZONE` | `Asia/Bangkok` | Timezone for operations. |
 | `PORTFOLIO_ACCOUNT_MAP` | `{"BTC": "3cced5d3-f219-47c8-bb73-878466060d7a", "DEFAULT": "9069984b-3c2b-48d8-831d-b7d73b5bafb7"}` | Maps crypto symbols to Ghostfolio account IDs. Falls back to DEFAULT if symbol not found. |
 | `GHOSTFOLIO_URL` | `https://ghostfol.io` | Ghostfolio instance URL (optional, defaults to https://ghostfol.io). |
@@ -116,7 +104,8 @@ holdings table before placing the order:
 - ROI at or above `THRESHOLD_PERCENT` (default `-2`) buys `AMOUNT * REDUCED_MULTIPLIER` (default `0.5`).
 - ROI below the threshold buys the configured `AMOUNT` at `x1`.
 - Missing, invalid, or unavailable Ghostfolio ROI also buys the configured `AMOUNT` at `x1`.
-- If the reduced amount would be below Bitkub's 10 THB minimum, the bot buys the configured `AMOUNT` at `x1`.
+- If the reduced strategy amount would be below the internal 10 THB floor, the bot falls back to the configured `AMOUNT` at `x1`.
+- Kraken's live minimum order cost and minimum base amount are checked after conversion to GBP. The order is rejected safely if the GBP budget is too small.
 
 Every successful DCA Discord notification includes the asset ROI and the full- or half-buy reason.
 
@@ -133,13 +122,15 @@ Every successful DCA Discord notification includes the asset ROI and the full- o
   - **Full Report (false)**: Sends detailed analysis with all time period breakdowns - use for deep dives
 
 **Trader Workflow (`daily_dca.yml`)**:
-- **Trigger**: Manual dispatch + **daily 22:00 UTC cron** (05:00 Bangkok) as a safety net in case the Discord bot or external cron is down
+- **Trigger**: Railway/manual dispatch + **daily 22:00 UTC cron** (05:00 Bangkok). The cron is a limited catch-up for targets already passed by 05:00; it cannot cover later target times if Railway is down.
 - **Concurrency**: Only one trade workflow runs at a time (queued, not cancelled)
 - **Pre-Check**: Bash Quick Check runs first (no checkout/Python needed). Only checks out code and installs dependencies if a trade is needed
 - **Safeguards**: Multiple layers check `BUY_ENABLED`, `LAST_BUY_DATE`, and time window
-- **Rationale**: Manual dispatch gives you full control over when trades execute. Analysis updates DCA_TARGET_MAP daily, but you decide when to run the trader
+- **Exchange**: `TRADING_EXCHANGE=kraken` and `KRAKEN_QUOTE_CURRENCY=GBP`; config symbols map from `COIN_THB` to Kraken `COIN/GBP`
+- **Budgeting**: `AMOUNT` is a THB-denominated strategy budget converted to GBP immediately before the order
 
 **Portfolio Balance Workflow (`portfolio_check.yml`)**:
+- **Scope**: Legacy Bitkub-only reporting. It does not fetch Kraken balances or Kraken order history.
 - **Schedule**: Monthly on the 5th at 07:00 Bangkok time (00:00 UTC)
 - **Trigger**: Also runs on every push to main + manual dispatch available
 - **Optimized**: Only installs minimal dependencies (requests library), uses pip caching for speed
@@ -156,22 +147,23 @@ Every successful DCA Discord notification includes the asset ROI and the full- o
 
 ```mermaid
 flowchart TD
-    A["⏰ Trigger\n04:00 BKK daily cron\nOR manual dispatch"] --> B["Resolve symbols\nfrom DCA_TARGET_MAP keys\ne.g. BTC_THB → BTC/USDT"]
-    B --> C["Fetch 60 days of 15-min\nOHLCV data from Binance\nfor each symbol"]
-    C --> D["Analyze 4 periods\n14 / 30 / 45 / 60 days\nmedian_miss, win_rate, dca_price"]
-    D --> E["Gemini AI synthesis\nPicks RECOMMENDED_TIME\nacross all periods"]
+    A["Trigger<br/>daily 21:00 UTC<br/>or manual dispatch"] --> B["Resolve symbols from DCA_TARGET_MAP<br/>BTC_THB → BTC/USDT"]
+    B --> C["Fetch 60 days of 15-minute OHLCV<br/>from Binance US through CCXT"]
+    C --> D["Analyze 14 / 30 / 45 / 60 days<br/>median_miss, win_rate, dca_price"]
+    D --> E["Gemini synthesis<br/>select RECOMMENDED_TIME"]
     E --> F{AI succeeded?}
     F -->|Yes| G["Use AI time"]
-    F -->|No| H["Use 30-day\nquantitative best time"]
-    G --> I["Send Discord report\nshort=AI summary only\nfull=all period tables"]
+    F -->|No| H["Use 30-day quantitative best time"]
+    G --> I["Send per-symbol Discord report<br/>short summary or full tables"]
     H --> I
-    I --> J["Update DCA_TARGET_MAP\nCOIN_THB.TIME = recommended time\nfor each symbol"]
-    J --> K["GitHub Actions writes\nDCA_TARGET_MAP repo variable\n→ takes effect next trade run"]
+    I --> J["Update in-memory TIME<br/>for existing COIN_THB entries"]
+    J --> K["Emit best_time_map<br/>through GITHUB_OUTPUT"]
+    K --> L["Workflow fetches the live map<br/>and merges TIME fields only"]
 ```
 
 1. At 04:00 Bangkok time, `crypto_analysis.yml` triggers
 2. Resolves symbols from `DCA_TARGET_MAP` keys (e.g., `BTC_THB` → `BTC/USDT`, `LINK_THB` → `LINK/USDT`, `SUI_THB` → `SUI/USDT`). Can be overridden via explicit input.
-3. Fetches 60 days of 15-minute OHLCV data from Binance for each symbol
+3. Fetches 60 days of 15-minute OHLCV data from Binance US for each symbol
 4. Calculates metrics: `median_miss`, `win_rate`, `dca_price` for each 15-min slot
 5. Gemini AI synthesizes recommendation across 14/30/45/60-day periods
 6. Sends Discord report (short AI summary by default, full analysis if configured)
@@ -181,65 +173,68 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A["⏰ Trigger\nbuilt-in scheduler ~15 min\nOR daily 22:00 UTC safety net\nOR Discord Buy Now\nOR manual dispatch"] --> B["⚡ Bash Quick Check\nno checkout required"]
-    B --> C{Any symbol has\nBUY_ENABLED=true\nand LAST_BUY_DATE ≠ today\nand time match?}
-    C -->|No match| D["🛑 Exit immediately\n0 resources used"]
-    C -->|Match found| E["Checkout repo\nSetup Python\nInstall deps"]
-    E --> F["Python validation\ntime window ±5 min\nor catch-up mode"]
-    F --> G{Already bought\ntoday?}
+    A["Trigger<br/>Railway scheduler, Buy Now,<br/>manual, or 22:00 UTC safety net"] --> B["Bash quick check<br/>no checkout required"]
+    B --> C{Enabled, not handled today,<br/>and target time reached?}
+    C -->|No| D["Exit before setup"]
+    C -->|Yes| E["Checkout, Python 3.12,<br/>install dependencies"]
+    E --> F["Python validates time window<br/>and LAST_BUY_DATE"]
+    F --> G{Already handled today?}
     G -->|Yes| H["Skip symbol"]
-    G -->|No| I["Place market bid\nBitkub API"]
-    I --> J["Wait 5s for fill\nFetch order details"]
-    J --> K["Fetch THB→USD rate\nfor logging"]
-    K --> L["Log to Ghostfolio\nnon-blocking"]
-    K --> M["Log to GitHub Gist\nnon-blocking"]
-    L --> N["Send Discord alert\n✅ trade details + Ghostfolio status"]
-    M --> N
-    N --> O["Update LAST_BUY_DATE\nin DCA_TARGET_MAP\n3 retries — fails loudly"]
+    G -->|No| ROI["Optional Dynamic DCA<br/>read Ghostfolio ROI"]
+    ROI --> I["Convert THB strategy budget to GBP<br/>validate Kraken COIN/GBP minimums"]
+    I --> J["Submit Kraken market buy<br/>wait 5 seconds and fetch fill"]
+    J --> K["Normalize fill to THB and USD<br/>for existing logs"]
+    K --> L["Log to Ghostfolio<br/>non-blocking"]
+    L --> M["Log to GitHub Gist<br/>non-blocking"]
+    M --> N["Send Discord result<br/>GBP, THB, USD, fill, ROI"]
+    I -->|"validation / FX error"| ERR["Send Discord failure"]
+    J -->|"order / fill error"| ERR
+    N --> O["Write LAST_BUY_DATE<br/>3 retries; fail loudly"]
+    ERR --> O
 ```
 
 1. **Trigger** via built-in DCA scheduler (-30/+60 min window), daily 22:00 UTC safety net cron, Discord "Buy Now" command, or manual GitHub Actions UI dispatch
 2. **Bash Quick Check** (no checkout/Python required): Filters by `BUY_ENABLED`, `LAST_BUY_DATE`, time window
-3. If no match → Workflow ends (fast exit, no resources used)
+3. If no match → Workflow exits before checkout, Python setup, or dependency installation
 4. If match found → Checkout repo → Setup Python → Install deps → Run Python
-5. **Python**: Validates time window (±5 min or catch-up), checks `LAST_BUY_DATE`
-6. Places market bid order (waits 5 seconds for fill)
-7. Fetches THB→USD exchange rate for logging
-8. **Logs to Ghostfolio** (non-blocking): Authenticates with 30s timeout, creates activity with 8-decimal precision, maps symbol to account (falls back to DEFAULT)
-9. **Logs to Gist** (non-blocking): Records trade with THB+USD amounts and Ghostfolio save status
-10. Sends Discord alert with trade details and Ghostfolio status
-11. Updates `LAST_BUY_DATE` with 3 retries (fails loudly on error)
+5. **Python**: Validates the time window (±5 minutes or catch-up), checks `LAST_BUY_DATE`, and optionally adjusts the budget using Ghostfolio ROI.
+6. Converts the THB-denominated strategy budget to GBP using Frankfurter with Open ER API fallback.
+7. Maps the config symbol to Kraken (`BTC_THB` → `BTC/GBP`), validates Kraken's live market minimums, and submits a market buy by quote cost.
+8. Waits five seconds, fetches the confirmed Kraken fill, and normalizes the GBP spend to THB and USD for the existing logs.
+9. **Logs to Ghostfolio and Gist** (non-blocking) and sends a Discord result containing the Kraken pair, actual GBP spend, normalized THB/USD values, fill and Dynamic DCA reason.
+10. Writes `LAST_BUY_DATE` with three retries and fails loudly if the repository-variable update fails. This date is written after an order error too, preventing retries from hammering a broken API or an underfunded account for the rest of that day.
 
-**Daily Safety Net**: The 22:00 UTC cron ensures trades still execute even if the Discord bot or external cron service is down. The bash quick-check's `DIFF >= -5` logic means it catches any enabled symbol whose target TIME has already passed today, while `LAST_BUY_DATE` prevents double-buys if the bot already triggered it earlier.
+**Daily Safety Net**: The 22:00 UTC cron runs at 05:00 Bangkok and catches enabled targets that have already passed since local midnight. It does not cover target times later than 05:00 if Railway is unavailable. The bash quick check uses `DIFF >= -5`, while `LAST_BUY_DATE` prevents duplicate attempts when Railway already dispatched the workflow.
 
-**Automating the trigger (optional)**: To run the trader automatically every 15 minutes without adding a cron schedule to the workflow itself, you can call the `workflow_dispatch` API externally:
-- **Local cron job**: Add a crontab entry on any always-on machine: `*/15 * * * * curl -s -X POST -H "Authorization: token YOUR_PAT" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/YOUR_USER/YOUR_REPO/actions/workflows/daily_dca.yml/dispatches -d '{"ref":"main"}'`
-- **Online cron service**: Use [cron-job.org](https://cron-job.org/en/) (free) — point it at the same GitHub API URL above with your PAT in the `Authorization` header, scheduled every 15 minutes. The workflow's Bash Quick Check will exit immediately if no trade is due, so unnecessary triggers are near-free.
+**Automating the trigger**: The continuously running Railway bot is the primary scheduler. It dispatches the workflow reference in `GITHUB_WORKFLOW_REF`; use `main` after the Kraken pull request is merged, or the feature branch while validating an unmerged build. The daily GitHub cron remains the safety net.
 
-## Portfolio Balance Reporting
+## Legacy Bitkub Portfolio Balance Reporting
 
-The balance checker provides automated portfolio tracking and valuation:
+This independent workflow still reads the Bitkub wallet and Bitkub order history. It does not confirm Kraken GBP holdings and is retained only for backward-compatible reporting:
+
+It requires `BITKUB_API_KEY` and `BITKUB_API_SECRET`; without those legacy secrets, the Discord portfolio command will fail rather than report Kraken holdings.
 
 ```mermaid
 flowchart TD
-    A1["📅 Monthly cron\n5th at 07:00 BKK"] -->|SHORT_REPORT=false| C
+    A1["Monthly cron<br/>5th at 07:00 BKK"] -->|SHORT_REPORT=false| C
     A2["📤 Push to main"] -->|SHORT_REPORT=true| C
-    A3["👤 GitHub Actions UI\nmanual dispatch"] -->|SHORT_REPORT=false default| C
-    A4["🤖 Discord Bot"] -->|"SHORT_REPORT=true default\n(false if full requested)"| C
+    A3["GitHub Actions UI<br/>manual dispatch"] -->|SHORT_REPORT=false default| C
+    A4["Railway Discord bot"] -->|"short by default<br/>full when requested"| API["GitHub workflow_dispatch API"]
+    API --> C
 
-    C["Fetch live wallet balances\nBitkub /api/v3/market/balances"]
-    C --> D["Fetch current prices\nBitkub TradingView API"]
-    D --> E["Fetch THB→USD rate\n(2-source fallback)"]
-    E --> F["Build CURRENT HOLDINGS\nbalance × price for each coin\nTHB + USD values"]
+    C["Fetch Bitkub wallet balances<br/>/api/v3/market/balances"]
+    C --> D["Fetch current prices<br/>Bitkub TradingView API"]
+    D --> E["Fetch THB→USD rate<br/>two-source fallback"]
+    E --> F["Build Bitkub current holdings<br/>THB and USD values"]
     F --> G{SHORT_REPORT?}
-    G -->|true| H["Send short Discord report\nHoldings + total value only"]
-    G -->|false| I["Compute 5th-to-5th window\nstart_dt = prev month 5th 07:00 BKK\nend_dt = this month 5th 07:00 BKK"]
-    I --> J["Fetch order history\nlimit 200 per coin\nfilter: buy + within window"]
-    J --> K["Build TRADE HISTORY\nper-coin totals + individual trades\nhistorical FX rate per trade"]
-    K --> L["Send full Discord report\nHoldings + trade history"]
+    G -->|true| H["Send short Discord report<br/>holdings and total only"]
+    G -->|false| I["Compute previous<br/>5th-to-5th window"]
+    I --> J["Fetch up to 200 Bitkub orders per coin<br/>filter filled buys in window"]
+    J --> K["Build Bitkub trade history<br/>with historical THB→USD FX"]
+    K --> L["Send full Discord report<br/>holdings and trade history"]
 ```
 
-### Features
+### Legacy report features
 - **Multi-Coin Support**: Automatically fetches balances for all coins in `DCA_TARGET_MAP`
 - **Real-Time Pricing**: Gets current market prices from Bitkub API
 - **Dual Currency**: Shows values in both THB and USD
@@ -290,10 +285,10 @@ LINK (10 trades) — Crypto amount: 14.66775216 — Spent: ฿2,400.00 ($77.24)
 
 ## Currency Conversion
 
-The system fetches real-time THB→USD exchange rates from multiple sources:
+The Kraken trader fetches THB→GBP immediately before an order, then normalizes the confirmed GBP fill back to THB for the existing THB/USD logs. The legacy reporter and loggers fetch THB→USD. Both paths use:
 - **Primary**: Frankfurter API (`api.frankfurter.app`)
 - **Secondary**: Open Exchange Rate API (`open.er-api.com`)
-- **Fallback**: If all sources fail, USD values show as `$0.00` and an error notification is sent to Discord
+- **Trade behavior**: A THB→GBP failure stops the Kraken order safely; a post-trade THB→USD failure leaves USD log values at `$0.00` and sends a Discord warning.
 
 ## Portfolio Logging
 
@@ -316,11 +311,11 @@ Trades are automatically logged to Ghostfolio for portfolio tracking:
 | **Python Filter** | Symbol processing | `BUY_ENABLED == false` | Disabled symbols |
 | **Time Window** | `is_time_to_trade()` | Within ±5 min or catch-up | Out-of-window execution |
 | **Date Check** | Per-symbol loop | `LAST_BUY_DATE == today` | Same-day duplicate |
-| **API Update** | Post-trade | 3 retries, fail loudly | Silent failure risk |
+| **API Update** | Post-attempt (success or failure) | 3 retries, fail loudly | Repeated same-day attempts and silent state failure |
 
 ## Discord Bot (Natural Language Control)
 
-A self-hosted Discord bot (`discord_bot.py`) that lets you control the DCA system via natural language chat.
+A continuously running Discord bot (`discord_bot.py`) hosted on Railway that lets you control the DCA system through natural-language chat. Local Docker remains available for development, but should not run at the same time as the Railway service with the same token.
 
 ### Capabilities
 - **Trigger Analysis**: "Run analysis" (analyzes all symbols in DCA config) / "Analyze BTC" (specific symbol)
@@ -328,7 +323,7 @@ A self-hosted Discord bot (`discord_bot.py`) that lets you control the DCA syste
 - **View Config**: "Show status" / "What's the current config?"
 - **View Accounts**: "Show accounts" / "Portfolio account map"
 - **Update DCA Config**: "Set BTC amount to 600" / "Set BTC time to 22:00" / "Disable LINK"
-- **Buy Now**: "Buy LINK now" / "Purchase SUI immediately" — sets TIME to next quarter hour, enables the symbol, and dispatches the workflow immediately
+- **Buy Now**: "Buy LINK now" / "Purchase SUI immediately" — sets `TIME` to the current local `HH:MM`, enables the symbol, and dispatches the configured workflow reference immediately
 
 All commands are interpreted via Gemini AI — just type naturally.
 
@@ -345,6 +340,7 @@ export DISCORD_BOT_TOKEN="your-bot-token"
 export GEMINI_API_KEY="your-gemini-key"
 export GH_PAT="your-github-pat"           # Same PAT as GH_PAT_FOR_VARS (repo scope)
 export GITHUB_REPO="owner/repo"            # e.g. "simon/DCA-Analysis"
+export GITHUB_WORKFLOW_REF="main"           # Use a feature branch only while validating an unmerged build
 export DISCORD_CHANNEL_ID="123456789"      # Optional: restrict to one channel
 export DISCORD_ALLOWED_USERS="111,222"     # Optional: restrict to specific Discord user IDs
 export DCA_CRON_ENABLED="true"             # Optional: enable built-in DCA scheduler
@@ -361,13 +357,14 @@ python discord_bot.py
 
 ### Built-in DCA Scheduler
 When `DCA_CRON_ENABLED=true`, the bot replaces the need for an external cron service (e.g., cron-job.org) by dispatching `daily_dca.yml` at the right times:
+- Dispatches the branch or tag configured by `GITHUB_WORKFLOW_REF` (default `main`)
 - Reads target buy times from `DCA_TARGET_MAP` and triggers the workflow within a **-30/+60 min window** (clock-aligned ticks at :00, :15, :30, :45), giving ~7 attempts per target to handle GitHub Actions flakiness
 - Status and update commands show planned dispatch times so you can verify the schedule at a glance
 - Schedule refreshes **every 30 minutes**, on **startup**, and **opportunistically** whenever any Discord command reads/updates `DCA_TARGET_MAP`. A Discord notification is sent if the schedule changes or if the GitHub API call fails during refresh
 - The `daily_dca.yml` bash quick-check still handles all safety logic (time matching, double-buy prevention), so early triggers exit cheaply
 
 ### Hosting
-The bot runs separately from GitHub Actions — anywhere with Python 3.9+ and internet:
-- Local machine / Raspberry Pi
-- Free tier: [Railway](https://railway.app), [Render](https://render.com), [Fly.io](https://fly.io), [Oracle Cloud free VM](https://www.oracle.com/cloud/free/)
+The production Discord process runs as the Railway `discord-bot` service built from this repository's `Dockerfile`. Railway stores its runtime configuration as protected service variables and automatically redeploys the configured GitHub branch. The process needs no public HTTP endpoint because it maintains an outbound Discord gateway connection.
+
+For local development, use `docker compose up -d --build`, but stop the local container before starting Railway to avoid two processes competing for the same Discord bot session.
 

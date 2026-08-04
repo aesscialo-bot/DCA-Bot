@@ -77,3 +77,19 @@ class DiscordBotDcaAmountTests(unittest.TestCase):
 
                 write.assert_not_called()
                 self.assertIn("between 50 and 2000", message.replies[0])
+
+
+class DiscordBotWorkflowDispatchTests(unittest.TestCase):
+    @patch.object(discord_bot.requests, "post")
+    def test_dispatch_uses_configured_workflow_ref(self, post):
+        post.return_value.status_code = 204
+
+        with patch.object(
+            discord_bot, "GITHUB_WORKFLOW_REF", "codex/kraken-gbp"
+        ):
+            result = discord_bot.trigger_workflow("daily_dca.yml")
+
+        self.assertTrue(result)
+        self.assertEqual(
+            post.call_args.kwargs["json"], {"ref": "codex/kraken-gbp"}
+        )

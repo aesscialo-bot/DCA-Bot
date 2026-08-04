@@ -11,20 +11,21 @@
 
 ## Project Overview
 
-This is a **Python 3.12** cryptocurrency DCA (Dollar-Cost Averaging) automation system running on **GitHub Actions**. It consists of:
+This is a **Python 3.12** cryptocurrency DCA (Dollar-Cost Averaging) system. GitHub Actions performs analysis and Kraken GBP execution; Railway hosts the continuously running Discord controller. The portfolio report is still a separate legacy Bitkub path.
 
 | File | Role |
 |------|------|
-| `bitkub_client.py` | Shared API client — HMAC signing, server-time sync, FX rates |
+| `kraken_client.py` | Kraken spot client — CCXT authentication, THB-budget-to-GBP conversion, market minimum validation, orders and fills |
+| `bitkub_client.py` | Legacy Bitkub API client plus THB/USD FX helpers used by reporting/logging |
 | `crypto_analysis.py` | Daily market analysis using CCXT + Gemini AI, updates `DCA_TARGET_MAP` |
-| `crypto_dca.py` | Trade executor — reads `DCA_TARGET_MAP`, places market buy orders |
-| `portfolio_balance.py` | Portfolio reporter — fetches balances, sends Discord notifications |
+| `crypto_dca.py` | Trade executor — reads `DCA_TARGET_MAP` and places Kraken `COIN/GBP` market buys |
+| `portfolio_balance.py` | Legacy Bitkub portfolio reporter — does not report Kraken balances |
 | `portfolio_logger.py` | Logs trades to Ghostfolio portfolio tracker |
 | `gist_logger.py` | Logs trades to a GitHub Gist as a markdown trade ledger |
-| `discord_bot.py` | Discord bot — NL control of workflows, DCA config, and instant buy (runs separately, not on GitHub Actions) |
+| `discord_bot.py` | Railway-hosted Discord bot — NL control, DCA scheduler, repository variables, and configurable-ref workflow dispatch |
 
 Workflows live in `.github/workflows/`. All secrets and config are injected via GitHub Actions environment variables — **never hardcoded**.
-The Discord bot runs separately and uses its own env vars (`DISCORD_BOT_TOKEN`, `GH_PAT`, `GITHUB_REPO`).
+The Discord bot runs on Railway and uses its own protected env vars, including `DISCORD_BOT_TOKEN`, `GH_PAT`, `GITHUB_REPO`, and `GITHUB_WORKFLOW_REF`.
 
 ---
 
@@ -39,7 +40,7 @@ The Discord bot runs separately and uses its own env vars (`DISCORD_BOT_TOKEN`, 
 ### Imports
 - Standard library imports first, then third-party (`requests`, `ccxt`, etc.), then local modules.
 - Only import what is actually used. Remove unused imports immediately.
-- Import shared utilities from `bitkub_client` — never re-implement `bitkub_request`, `get_thb_usd_rate`, or `get_historical_thb_usd_rate` in other files.
+- Use `kraken_client` for Kraken order placement. Import `bitkub_client` only for the legacy Bitkub workflow or existing THB/USD FX helpers; do not duplicate those helpers.
 
 ### Functions & Structure
 - Keep functions focused on a single concern. If a function does more than one logical thing, split it.
@@ -79,8 +80,8 @@ except Exception as e:
     # Continue — don't re-raise
 ```
 
-### API error codes
-Bitkub returns `{"error": 0}` on success. Always check the error field before reading `result`:
+### Exchange errors
+CCXT/Kraken failures raise exceptions and must stop the order path before state is logged as a successful fill. The legacy Bitkub client returns `{"error": 0}` on success, so legacy consumers must check the field before reading `result`:
 
 ```python
 result = bitkub_request('POST', '/api/v3/market/place-bid', payload)
@@ -103,15 +104,23 @@ Operations that update shared state (e.g., `update_repo_variable`) should retry 
 
 ## Environment Variables & Secrets
 
-- **All secrets and config are injected by GitHub Actions** — read via `os.environ.get(...)`.
-- Secrets (`BITKUB_API_KEY`, `BITKUB_API_SECRET`, `DISCORD_WEBHOOK_URL`, etc.) are **never** committed to the repo.
+- **All secrets and config are injected by GitHub Actions or Railway** — read via `os.environ.get(...)`.
+- Trading secrets (`KRAKEN_API_KEY`, `KRAKEN_API_SECRET`) and notification/control secrets are **never** committed to the repo. Bitkub keys are only for the legacy portfolio workflow.
 - `bitkub_client.py` reads `BITKUB_API_KEY` / `BITKUB_API_SECRET` at module level and raises `ValueError` if they are missing when `bitkub_request()` is called.
 - Configuration variables (`DCA_TARGET_MAP`, `TIMEZONE`, `PORTFOLIO_ACCOUNT_MAP`) are stored as GitHub Actions repository variables and passed via workflow `env:` blocks.
 - Always provide a sensible default for optional env vars: `os.environ.get("TIMEZONE", "Asia/Bangkok")`.
 
 ---
 
-## Shared Module: `bitkub_client.py`
+## Exchange Modules
+
+`kraken_client.py` is the Kraken GBP execution boundary:
+
+- `get_thb_quote_rate()` — current THB→GBP conversion with two-source fallback; raises if both fail
+- `to_kraken_symbol()` — maps compatibility config keys such as `BTC_THB` to `BTC/GBP`
+- `place_market_buy()` — validates Kraken market minimums, buys by quote cost, waits for and normalizes the fill
+
+`bitkub_client.py` remains the single source of truth for legacy Bitkub interaction and THB/USD reporting helpers.
 
 This is the **single source of truth** for all Bitkub API interaction and FX rate fetching.
 
@@ -178,7 +187,8 @@ from bitkub_client import bitkub_request, get_thb_usd_rate
 }
 ```
 - `TIME` is in `HH:MM` local time (controlled by `TIMEZONE`).
-- `LAST_BUY_DATE` is updated post-trade to prevent same-day duplicate buys.
+- `AMOUNT` is a THB-denominated strategy budget. The Kraken executor converts it to GBP immediately before ordering.
+- `LAST_BUY_DATE` is updated after each handled attempt (success or caught order failure) to prevent repeated same-day attempts.
 - Always parse this with `json.loads()` and guard against malformed JSON with `except (json.JSONDecodeError, ValueError)`.
 
 ### Timezone handling
@@ -190,7 +200,8 @@ from bitkub_client import bitkub_request, get_thb_usd_rate
 
 ## Testing & Validation
 
-- Before any manual or local test run that touches the Bitkub API, verify `BITKUB_API_KEY` and `BITKUB_API_SECRET` are set.
+- Never perform a live Kraken trade as a test. Use mocks for order-path tests and a read-only credential/balance call only when the user explicitly authorizes live validation.
+- Before running the legacy portfolio workflow, verify `BITKUB_API_KEY` and `BITKUB_API_SECRET` are available; it cannot validate Kraken holdings.
 - For syntax checks across all Python files: `python -m py_compile <file>.py` or `python -c "import ast; ast.parse(open('<file>.py').read())"`.
 - Do not add `print` debug statements permanently — use them during debugging and remove before committing.
-- Non-production test trades should use small amounts and be verified against Bitkub order history.
+- Validate Kraken symbol mapping, GBP conversion, market minimum handling, and normalized fills with mocked CCXT responses.

@@ -20,6 +20,7 @@ Required environment variables:
     GITHUB_REPO         - GitHub repo in "owner/repo" format
 
 Optional environment variables:
+    GITHUB_WORKFLOW_REF - Branch/tag used for workflow dispatches (default: main)
     DISCORD_CHANNEL_ID  - Restrict bot to one channel (responds to all messages there)
     DISCORD_ALLOWED_USERS - Comma-separated Discord user IDs (security restriction)
     DCA_CRON_ENABLED    - "true" to enable built-in DCA scheduler (replaces cron-job.org)
@@ -30,7 +31,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import discord
@@ -47,6 +48,7 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GH_PAT = os.environ.get("GH_PAT", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
+GITHUB_WORKFLOW_REF = os.environ.get("GITHUB_WORKFLOW_REF", "main")
 
 # Optional restrictions
 CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
@@ -194,7 +196,7 @@ GH_API = "https://api.github.com"
 def trigger_workflow(workflow_file: str, inputs: dict | None = None) -> bool:
     """Trigger a GitHub Actions workflow via the dispatch API. Returns True on success."""
     url = f"{GH_API}/repos/{GITHUB_REPO}/actions/workflows/{workflow_file}/dispatches"
-    body = {"ref": "main"}
+    body = {"ref": GITHUB_WORKFLOW_REF}
     if inputs:
         body["inputs"] = inputs
     try:
@@ -574,25 +576,8 @@ async def handle_update_dca(params: dict, message: discord.Message):
         await message.reply("❌ Failed to save DCA_TARGET_MAP to GitHub")
 
 
-def _next_quarter_hour() -> str:
-    """Return the next clock-aligned quarter hour (HH:MM) in the configured timezone.
-
-    If the current time is already on a quarter boundary, return that time.
-    E.g. 16:05 → '16:15', 16:15 → '16:15', 16:16 → '16:30', 23:59 → '00:00'.
-    """
-    now = datetime.now(TIMEZONE)
-    minute = now.minute
-    # Round up to next multiple of 15 (stay if already aligned)
-    remainder = minute % 15
-    if remainder == 0:
-        target = now
-    else:
-        target = now.replace(second=0, microsecond=0) + timedelta(minutes=15 - remainder)
-    return target.strftime("%H:%M")
-
-
 async def handle_buy_now(params: dict, message: discord.Message):
-    """Set a symbol's TIME to the next quarter hour, enable it, and dispatch the workflow immediately."""
+    """Set a symbol's TIME to now, enable it, and dispatch the workflow immediately."""
     symbol = str(params.get("symbol", "")).upper().strip()
     if not symbol:
         await message.reply("❌ Please specify which coin to buy (e.g., 'buy LINK now')")
