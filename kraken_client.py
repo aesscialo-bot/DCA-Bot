@@ -97,6 +97,43 @@ def validate_kraken_credentials() -> dict:
     }
 
 
+def get_market_minimum_gbp(config_symbol: str, *, exchange=None) -> dict:
+    """Return Kraken's current effective GBP minimum without creating an order.
+
+    Kraken can publish both a quote-cost minimum and a base-amount minimum.  The
+    effective cash minimum is the larger of those two values at the current ask.
+    This helper is intentionally read-only so configuration and health checks can
+    validate budgets without sharing any order-submission code.
+    """
+    client = exchange or get_kraken_exchange()
+    symbol = to_kraken_symbol(config_symbol)
+    client.load_markets()
+    if symbol not in client.markets:
+        raise ValueError(f"Kraken spot market is unavailable: {symbol}")
+
+    market = client.market(symbol)
+    limits = market.get("limits", {}) or {}
+    minimum_cost = float((limits.get("cost", {}) or {}).get("min") or 0)
+    minimum_amount = float((limits.get("amount", {}) or {}).get("min") or 0)
+    ask = 0.0
+    if minimum_amount > 0:
+        ticker = client.fetch_ticker(symbol)
+        ask = float(ticker.get("ask") or ticker.get("last") or 0)
+        if ask <= 0:
+            raise RuntimeError(f"Kraken returned no usable ask price for {symbol}")
+
+    effective_minimum = max(minimum_cost, minimum_amount * ask)
+    if not math.isfinite(effective_minimum) or effective_minimum < 0:
+        raise RuntimeError(f"Kraken returned invalid market limits for {symbol}")
+    return {
+        "pair": symbol,
+        "minimum_cost_gbp": minimum_cost,
+        "minimum_amount": minimum_amount,
+        "ask_gbp": ask,
+        "effective_minimum_gbp": effective_minimum,
+    }
+
+
 def _positive_gbp_amount(amount_gbp: float) -> float:
     try:
         amount = float(amount_gbp)
@@ -472,17 +509,8 @@ def place_market_buy(
                 "approximate the GBP budget with a base-amount order."
             )
 
-        market = exchange.market(symbol)
-        limits = market.get("limits", {}) or {}
-        minimum_cost = float((limits.get("cost", {}) or {}).get("min") or 0)
-        minimum_amount = float((limits.get("amount", {}) or {}).get("min") or 0)
-
-        ticker = exchange.fetch_ticker(symbol)
-        ask = float(ticker.get("ask") or ticker.get("last") or 0)
-        if minimum_amount > 0 and ask <= 0:
-            raise RuntimeError(f"Kraken returned no usable ask price for {symbol}")
-
-        effective_minimum = max(minimum_cost, minimum_amount * ask)
+        minimum = get_market_minimum_gbp(config_symbol, exchange=exchange)
+        effective_minimum = minimum["effective_minimum_gbp"]
         if requested_gbp < effective_minimum:
             raise ValueError(
                 f"GBP amount {requested_gbp:.2f} is below Kraken's current minimum "
