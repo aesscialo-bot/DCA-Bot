@@ -3,167 +3,128 @@ name: Update DCA Configuration
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: Atomic configuration operation
+        required: true
+        type: choice
+        options:
+          - set_amounts
+          - set_enabled
+          - dry_run
       symbol:
         description: Canonical Kraken GBP key
         required: true
         type: string
-      field:
-        description: One supported rule field
-        required: true
-        type: string
-      value_json:
-        description: JSON-encoded replacement value
-        required: true
-        type: string
-      expected_amount_gbp_json:
-        description: Confirmed amount snapshot required when enabling
+      low_amount_gbp_json:
+        description: JSON number for the LOW tier
         required: false
-        default: ''
+        default: ""
         type: string
-      expected_time:
-        description: Confirmed time snapshot required when enabling
+      up_amount_gbp_json:
+        description: JSON number for the UP tier
         required: false
-        default: ''
+        default: ""
+        type: string
+      enabled_json:
+        description: JSON boolean for set_enabled
+        required: false
+        default: ""
+        type: string
+      expected_rules_hash:
+        description: Exact rules fingerprint reviewed before enabling
+        required: false
+        default: ""
+        type: string
+      expected_decision_id:
+        description: Exact analysis decision reviewed before enabling
+        required: false
+        default: ""
+        type: string
+      expected_global_rules_hash:
+        description: Canonical fingerprint of all four reviewed rules
+        required: false
+        default: ""
         type: string
 
+permissions:
+  contents: read
+
 concurrency:
-  group: dca-target-map-writers
+  # Rule writes serialize with each other but remain independent of the trader,
+  # allowing a disable to reach the trader's final live-state check immediately.
+  group: dca-rule-writers
   queue: max
   cancel-in-progress: false
 
 jobs:
   update:
+    name: Validate and update rules
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - name: Merge one validated field into the latest rules
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Validate atomic update against live state
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          ACTION: ${{ inputs.action }}
           SYMBOL: ${{ inputs.symbol }}
-          FIELD: ${{ inputs.field }}
-          VALUE_JSON: ${{ inputs.value_json }}
-          EXPECTED_AMOUNT_GBP_JSON: ${{ inputs.expected_amount_gbp_json }}
-          EXPECTED_TIME: ${{ inputs.expected_time }}
+          LOW_AMOUNT_GBP_JSON: ${{ inputs.low_amount_gbp_json }}
+          UP_AMOUNT_GBP_JSON: ${{ inputs.up_amount_gbp_json }}
+          ENABLED_JSON: ${{ inputs.enabled_json }}
+          EXPECTED_RULES_HASH: ${{ inputs.expected_rules_hash }}
+          EXPECTED_DECISION_ID: ${{ inputs.expected_decision_id }}
+          EXPECTED_GLOBAL_RULES_HASH: ${{ inputs.expected_global_rules_hash }}
         shell: bash
         run: |
           set -euo pipefail
-          if ! CURRENT_MAP=$(gh variable get DCA_TARGET_MAP --repo "$GITHUB_REPOSITORY" 2>/dev/null); then
-            echo "Could not fetch the live DCA_TARGET_MAP; refusing to update it." >&2
+          if ! DCA_TARGET_MAP=$(gh variable get DCA_TARGET_MAP --repo "$GITHUB_REPOSITORY" 2>/dev/null); then
+            echo "Could not read DCA_TARGET_MAP; refusing the update." >&2
             exit 1
           fi
-          if [ -z "$CURRENT_MAP" ]; then
-            echo "Live DCA_TARGET_MAP is empty; refusing to update it." >&2
-            exit 1
+          if ! DCA_ANALYSIS_STATE=$(gh variable get DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY" 2>/dev/null); then
+            DCA_ANALYSIS_STATE='{}'
           fi
-          export CURRENT_MAP
+          if ! DCA_EXECUTION_STATE=$(gh variable get DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY" 2>/dev/null); then
+            if [ "$ACTION" = "set_enabled" ] && [ "$ENABLED_JSON" = "true" ]; then
+              echo "Could not read DCA_EXECUTION_STATE; refusing enable." >&2
+              exit 1
+            fi
+            DCA_EXECUTION_STATE='{}'
+          fi
+          export DCA_TARGET_MAP DCA_ANALYSIS_STATE DCA_EXECUTION_STATE
 
-          UPDATED_MAP=$(python3 - <<'PY'
-          import json
-          import math
-          import os
-          import re
+          OUTPUT_FILE="$RUNNER_TEMP/dca-target-map.json"
+          python -u dca_config_writer.py \
+            --action "$ACTION" \
+            --symbol "$SYMBOL" \
+            --low-amount-gbp-json "$LOW_AMOUNT_GBP_JSON" \
+            --up-amount-gbp-json "$UP_AMOUNT_GBP_JSON" \
+            --enabled-json "$ENABLED_JSON" \
+            --expected-rules-hash "$EXPECTED_RULES_HASH" \
+            --expected-decision-id "$EXPECTED_DECISION_ID" \
+            --expected-global-rules-hash "$EXPECTED_GLOBAL_RULES_HASH" \
+            --output "$OUTPUT_FILE"
 
-          key_pattern = re.compile(r"^[A-Z0-9]+_GBP$")
-          time_pattern = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
-          rules = json.loads(os.environ["CURRENT_MAP"])
-          symbol = os.environ["SYMBOL"]
-          field = os.environ["FIELD"]
-          value = json.loads(os.environ["VALUE_JSON"])
-          expected_amount_json = os.environ.get("EXPECTED_AMOUNT_GBP_JSON", "")
-          expected_time = os.environ.get("EXPECTED_TIME", "")
-
-          if not isinstance(rules, dict) or not rules:
-              raise ValueError("DCA_TARGET_MAP must be a non-empty object")
-
-          def is_finite_number(value):
-              return (
-                  not isinstance(value, bool)
-                  and isinstance(value, (int, float))
-                  and math.isfinite(value)
-              )
-
-          def validate_dynamic_dca(key, dynamic_dca):
-              if dynamic_dca is None:
-                  return
-              if not isinstance(dynamic_dca, dict):
-                  raise ValueError(f"{key}.DYNAMIC_DCA must be an object")
-              if "ENABLED" in dynamic_dca and not isinstance(dynamic_dca["ENABLED"], bool):
-                  raise ValueError(f"{key}.DYNAMIC_DCA.ENABLED must be boolean")
-              if "THRESHOLD_PERCENT" in dynamic_dca and not is_finite_number(
-                  dynamic_dca["THRESHOLD_PERCENT"]
-              ):
-                  raise ValueError(f"{key}.DYNAMIC_DCA.THRESHOLD_PERCENT must be numeric")
-              if "REDUCED_MULTIPLIER" in dynamic_dca:
-                  multiplier = dynamic_dca["REDUCED_MULTIPLIER"]
-                  if not is_finite_number(multiplier) or not 0 < multiplier <= 1:
-                      raise ValueError(
-                          f"{key}.DYNAMIC_DCA.REDUCED_MULTIPLIER must be above 0 and at most 1"
-                      )
-
-          def validate_entry(key, entry):
-              if not key_pattern.fullmatch(key) or not isinstance(entry, dict):
-                  raise ValueError(f"Invalid GBP rule entry: {key!r}")
-              if "AMOUNT" in entry:
-                  raise ValueError(f"Unsupported amount field in {key}")
-              execution_fields = {"LAST_BUY_DATE", "PENDING_ORDER"}.intersection(entry)
-              if execution_fields:
-                  fields = ", ".join(sorted(execution_fields))
-                  raise ValueError(f"Execution-only field(s) in {key}: {fields}")
-              if not isinstance(entry.get("TIME"), str) or not time_pattern.fullmatch(entry["TIME"]):
-                  raise ValueError(f"Invalid TIME in {key}")
-              enabled = entry.get("BUY_ENABLED")
-              amount = entry.get("AMOUNT_GBP")
-              if not isinstance(enabled, bool):
-                  raise ValueError(f"Invalid BUY_ENABLED in {key}")
-              if not is_finite_number(amount):
-                  raise ValueError(f"Invalid AMOUNT_GBP in {key}")
-              minimum = 5 if enabled else 0
-              if not minimum <= amount <= 1000:
-                  raise ValueError(f"AMOUNT_GBP outside guardrails in {key}")
-              validate_dynamic_dca(key, entry.get("DYNAMIC_DCA"))
-
-          for key, entry in rules.items():
-              validate_entry(key, entry)
-
-          if symbol not in rules or not key_pattern.fullmatch(symbol):
-              raise ValueError(f"Unknown GBP target: {symbol}")
-          if field not in {"TIME", "AMOUNT_GBP", "BUY_ENABLED"}:
-              raise ValueError(f"Unsupported field: {field}")
-          if field == "TIME" and (not isinstance(value, str) or not time_pattern.fullmatch(value)):
-              raise ValueError("TIME must use 24-hour HH:MM")
-          if field == "AMOUNT_GBP":
-              if not is_finite_number(value):
-                  raise ValueError("AMOUNT_GBP must be numeric")
-              if not 0 <= value <= 1000:
-                  raise ValueError("AMOUNT_GBP must be between 0 and 1000")
-          if field == "BUY_ENABLED" and not isinstance(value, bool):
-              raise ValueError("BUY_ENABLED must be boolean")
-
-          if field == "BUY_ENABLED" and value is True:
-              if not expected_amount_json or not expected_time:
-                  raise ValueError(
-                      "Enabling requires the confirmed amount and time snapshot"
-                  )
-              expected_amount = json.loads(expected_amount_json)
-              if not is_finite_number(expected_amount):
-                  raise ValueError("Confirmed AMOUNT_GBP snapshot must be numeric")
-              if rules[symbol]["AMOUNT_GBP"] != expected_amount:
-                  raise ValueError(
-                      "AMOUNT_GBP changed after enable confirmation; refusing to enable"
-                  )
-              if rules[symbol]["TIME"] != expected_time:
-                  raise ValueError(
-                      "TIME changed after enable confirmation; refusing to enable"
-                  )
-
-          candidate = dict(rules[symbol])
-          candidate[field] = value
-          validate_entry(symbol, candidate)
-          rules[symbol] = candidate
-          print(json.dumps(rules, separators=(",", ":")))
-          PY
-          )
-
+          if [ "$ACTION" = "dry_run" ]; then
+            echo "Dry run passed; DCA_TARGET_MAP was not changed."
+            exit 0
+          fi
           gh variable set DCA_TARGET_MAP \
             --repo "$GITHUB_REPOSITORY" \
-            --body "$UPDATED_MAP"
-          echo "Updated $SYMBOL.$FIELD through the serialized writer queue."
+            --body "$(<"$OUTPUT_FILE")"
+          echo "Applied one serialized configuration update for $SYMBOL."

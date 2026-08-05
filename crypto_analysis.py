@@ -1,490 +1,843 @@
+"""Deterministic Kraken GBP regime and daily execution-time analysis.
+
+Gemini is an optional narrator only.  All spend-affecting outputs (regime,
+amount tier, and execution time) are calculated locally from completed Kraken
+candles and are persisted as ``DCA_ANALYSIS_STATE``.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, time as clock_time, timedelta, timezone
+import json
+import math
+import os
+from pathlib import Path
+import re
+from statistics import median
+from typing import Any, Iterable, Mapping
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
 import ccxt
+from google import genai
 import pandas as pd
 import requests
-import os
-import re
-import json
-import time
-from google import genai
-from datetime import datetime, timedelta, timezone
 
-# --- Config ---
+from dca_config import (
+    ANALYSIS_STATE_VERSION,
+    ERROR_STATUS,
+    READY_STATUS,
+    TARGET_KEYS,
+    TARGET_SYMBOLS,
+    default_rules_map,
+    empty_analysis_state,
+    rules_hash,
+    validate_analysis_state,
+    validate_rules_map,
+)
+
+
 EXCHANGE_ID = os.environ.get("EXCHANGE_ID", "kraken")
-# Support comma-separated list OR JSON array
 SYMBOLS_ENV = os.environ.get("SYMBOL", "")
-
-def _parse_symbols(symbols_env: str, dca_map_env: str) -> list:
-    """Resolve the list of symbols to analyze.
-
-    Priority:
-      1. Explicit SYMBOL env var (comma-separated or JSON array).
-      2. Derive from canonical DCA_TARGET_MAP keys (BTC_GBP -> BTC/GBP).
-
-    When neither source is valid, fail closed instead of analyzing an asset that
-    was never configured.
-    """
-    # 1. Explicit SYMBOL env var
-    if symbols_env.strip():
-        try:
-            parsed = json.loads(symbols_env)
-            if isinstance(parsed, list):
-                result = [str(s) for s in parsed]
-            else:
-                result = [str(parsed)]
-        except (json.JSONDecodeError, ValueError):
-            result = [s.strip() for s in symbols_env.split(",") if s.strip()]
-        normalized = []
-        for symbol in result:
-            candidate = symbol.upper().replace("_", "/")
-            if "/" not in candidate:
-                candidate = f"{candidate}/GBP"
-            if not re.fullmatch(r"[A-Z0-9]+/GBP", candidate):
-                raise ValueError(f"Only GBP analysis pairs are supported: {symbol}")
-            normalized.append(candidate)
-        result = normalized
-        print(f"📋 Symbols from SYMBOL env var: {result}")
-        return result
-
-    # 2. Derive from DCA_TARGET_MAP
-    try:
-        dca_map = json.loads(dca_map_env) if dca_map_env else {}
-    except (json.JSONDecodeError, ValueError) as error:
-        raise ValueError("DCA_TARGET_MAP is not valid JSON") from error
-
-    if not isinstance(dca_map, dict):
-        raise ValueError("DCA_TARGET_MAP must be a JSON object")
-
-    if dca_map:
-        symbols = []
-        for key in dca_map:
-            if isinstance(key, str) and re.fullmatch(r"[A-Z0-9]+_GBP", key):
-                symbols.append(f"{key[:-4]}/GBP")
-        if symbols:
-            print(f"📋 Symbols derived from DCA_TARGET_MAP: {symbols}")
-            return symbols
-        raise ValueError("DCA_TARGET_MAP contains no canonical COIN_GBP keys")
-
-    raise ValueError(
-        "No Kraken GBP analysis symbols were provided and DCA_TARGET_MAP is empty"
-    )
-
-
-TIMEFRAME = "15m"
 LOCAL_TZ = os.environ.get("TIMEZONE", "Asia/Bangkok")
-# Kraken Spot REST returns at most 720 candles. At 15 minutes that is 7.5 days,
-# so these periods deliberately stay within the exchange's documented window.
-PERIODS = [3, 5, 7]
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 DCA_TARGET_MAP_ENV = os.environ.get("DCA_TARGET_MAP", "{}")
-SHORT_REPORT = os.environ.get("SHORT_REPORT", "true").lower() == "true"
-try:
-    EXISTING_MAP = json.loads(DCA_TARGET_MAP_ENV)
-except Exception:
-    EXISTING_MAP = {}
+DCA_ANALYSIS_STATE_ENV = os.environ.get("DCA_ANALYSIS_STATE", "")
+ANALYSIS_VARIABLE = "DCA_ANALYSIS_STATE"
+PERIODS = (3, 5, 7)
+
+DAILY_TIMEFRAME_MS = 24 * 60 * 60 * 1000
+WEEKLY_TIMEFRAME_MS = 7 * DAILY_TIMEFRAME_MS
+QUARTER_HOUR_MS = 15 * 60 * 1000
+MIN_DAILY_CANDLES = 220
+MIN_WEEKLY_CANDLES = 20
+KRAKEN_OHLCV_LIMIT = 720
+INTRADAY_CANDLES_PER_DAY = 96
+INTRADAY_HISTORY_CANDLES = 7 * INTRADAY_CANDLES_PER_DAY
+MAX_DAILY_DATA_AGE = timedelta(hours=30)
+MAX_WEEKLY_DATA_AGE = timedelta(days=7, hours=12)
+MAX_INTRADAY_DATA_AGE = timedelta(minutes=45)
 
 
-# --- Helpers ---
-
-def _harmonic_mean(series):
-    """Harmonic mean of a numeric series — used for DCA price averaging."""
-    return len(series) / (1 / series).sum()
+class AnalysisError(RuntimeError):
+    """A fail-closed market-data or deterministic-analysis error."""
 
 
-def get_analysis_exchange(exchange_id=EXCHANGE_ID):
-    """Return the one supported public market-data client."""
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_utc(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise AnalysisError("Analysis timestamps must include a timezone")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _target_from_symbol(value: str) -> str:
+    candidate = value.strip().strip("\"'").upper().replace("_", "/")
+    if "/" not in candidate:
+        candidate = f"{candidate}/GBP"
+    target = candidate.replace("/", "_")
+    if target not in TARGET_KEYS:
+        raise ValueError(
+            f"Only BTC/GBP, ETH/GBP, SOL/GBP, and ADA/GBP are supported: {value}"
+        )
+    return target
+
+
+def _parse_symbols(symbols_env: str, dca_map_env: str) -> list[str]:
+    """Return a deterministic list of supported Kraken GBP pair strings."""
+
+    if symbols_env.strip() and symbols_env.strip().lower() != "all":
+        try:
+            decoded = json.loads(symbols_env)
+            values = decoded if isinstance(decoded, list) else [decoded]
+        except (json.JSONDecodeError, ValueError):
+            values = [item.strip() for item in symbols_env.split(",") if item.strip()]
+        targets = []
+        for value in values:
+            if str(value).strip().lower() == "all":
+                return _parse_symbols("", dca_map_env)
+            target = _target_from_symbol(str(value))
+            if target not in targets:
+                targets.append(target)
+        if not targets:
+            raise ValueError("SYMBOL did not contain a supported Kraken GBP pair")
+        return [TARGET_SYMBOLS[target] for target in targets]
+
+    try:
+        rules = validate_rules_map(dca_map_env)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    return [TARGET_SYMBOLS[target] for target in TARGET_KEYS if target in rules]
+
+
+def get_analysis_exchange(exchange_id: str = EXCHANGE_ID):
+    """Create the one supported public market-data client."""
+
     if str(exchange_id).strip().lower() != "kraken":
         raise ValueError("Crypto analysis supports Kraken GBP markets only")
     return ccxt.kraken({"enableRateLimit": True})
 
 
-# --- Fetch helper ---
-def fetch_ohlcv_last_n_days(exchange, symbol, timeframe, days):
-    # Add a small buffer to ensure we cover the range fully
-    since = int((datetime.now(timezone.utc) - timedelta(days=days + 1)).timestamp() * 1000)
-    all_rows = []
-    while True:
-        batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=1500)
-        if not batch:
-            break
-        all_rows.extend(batch)
-        last_ts = batch[-1][0]
-        since = last_ts + 1
-        # stop if we're mostly caught up
-        if last_ts >= int(datetime.now(timezone.utc).timestamp() * 1000) - 3600 * 1000:
-            break
-    return all_rows
+def fetch_ohlcv_last_n_days(exchange, symbol: str, timeframe: str, days: int) -> list:
+    """Fetch Kraken's latest bounded OHLCV page without false pagination.
 
-def analyze_period(df, days, local_tz):
-    # Filter for the specific lookback period based on the max timestamp in df
-    # (assuming df end is "now", so we subtract days from the end time)
-    end_time = df["ts"].max()
-    start_time = end_time - pd.Timedelta(days=days)
-    period_df = df[df["ts"] >= start_time].copy()
-    
-    # Analysis 1: Most common daily-low time
-    idx = period_df.groupby("local_date")["low"].idxmin()
-    daily_lows = period_df.loc[idx, ["local_date", "local_time", "low"]]
-
-    most_common = (
-        daily_lows["local_time"]
-        .value_counts()
-        .sort_index()
-        .rename("days_won")
-        .reset_index()
-        .rename(columns={"index": "time"})
-    )
-    most_common["share"] = most_common["days_won"] / most_common["days_won"].sum()
-    top_common = most_common.sort_values("days_won", ascending=False).head(5)
-
-    # Analysis 2: Lowest average Low by time-of-day
-    # (Existing arithmetic mean of 'low')
-    avg_low_by_time = (
-        period_df.groupby("local_time")["low"]
-        .mean()
-        .reset_index()
-        .rename(columns={"local_time": "time", "low": "avg_low"})
-        .sort_values("avg_low", ascending=True)
-    )
-    # Fix: Define top_avg here so it can be returned
-    top_avg = avg_low_by_time.head(5)
-
-    # Analysis 3: Advanced DCA Metrics
-    # A. Calculate Daily Average (Mean of O,H,L,C for the day)
-    period_df["candle_avg"] = period_df[["open", "high", "low", "close"]].mean(axis=1)
-    
-    # map daily average back to each row
-    daily_means = period_df.groupby("local_date")["candle_avg"].transform("mean")
-    period_df["diff_from_daily_avg"] = (period_df["close"] - daily_means) / daily_means * 100
-
-    # B. Calculate "Proximity to Daily Low" (The "Regret" Metric)
-    # How much did we overpay vs the absolute bottom of that specific day?
-    daily_min_low = period_df.groupby("local_date")["low"].transform("min")
-    period_df["miss_pct"] = (period_df["close"] - daily_min_low) / daily_min_low * 100
-    
-    # NEW: Win Rate (Consistency Metric)
-    # "Win" = Price is within 0.5% (50bps) of the absolute daily low
-    period_df["is_snipe"] = period_df["miss_pct"] < 0.5
-
-    # C. Group by time
-    dca_group = period_df.groupby("local_time")
-
-    dca_stats = dca_group.agg(
-        dca_price=("close", _harmonic_mean),
-        median_miss=("miss_pct", "median"),
-        win_rate=("is_snipe", "mean")
-    ).reset_index().rename(columns={"local_time": "time"})
-    
-    dca_stats["win_rate"] = dca_stats["win_rate"] * 100
-    
-    # Sort by lowest "miss" from the daily bottom (Median is more robust against crash wicks)
-    top_dca = dca_stats.sort_values("median_miss", ascending=True).head(5)
-
-    return top_common, top_avg, top_dca, period_df["ts"].min(), period_df["ts"].max()
-
-def get_ai_summary(full_report, current_symbol):
-    if not GEMINI_API_KEY:
-        return "No GEMINI_API_KEY found. Skipping AI analysis.", None, None
-
-    try:
-        prompt = f"""
-        You are a crypto DCA timing analyst. Your job is to choose ONE daily buy time (HH:MM) for {current_symbol} from the report below.
-
-        METRICS (from the report):
-        - median_miss: Median % overpayment vs the day’s absolute low. LOWER is better. This is the PRIMARY objective.
-        - win_rate: % of days where buying at that time was within 0.5% of the absolute low. HIGHER is better. This is SECONDARY (stability).
-
-        IMPORTANT:
-        - median_miss is robust; win_rate depends on the 0.5% threshold and can be noisy.
-        - Do NOT invent numbers. Only use values in the report.
-        - Only choose times that appear in the report’s “Best DCA Time” tables.
-
-        TASK:
-        1) Pick ONE RECOMMENDED_TIME using the decision rules below.
-        2) Give a short reason (max 3 sentences) mentioning which timeframe(s) drove the decision.
-
-        DECISION RULES (follow in order):
-        A) Recency Shift Check (3-day override)
-        - Identify the best 3-day candidate by PRIMARY objective (lowest median_miss).
-        - Only override longer timeframes with the 3-day candidate if BOTH are true:
-        1) Its win_rate is at least 10 percentage points higher than the best 7-day candidate, AND
-        2) Its median_miss is no more than 0.20 percentage points worse than the best 7-day candidate.
-
-        B) Base Selection (5/7-day weighted, median_miss-first)
-        - Compare the best 5-day and 7-day candidates.
-        - Prefer the 7-day candidate unless the 5-day median_miss is better by at least 0.15 percentage points.
-
-        C) Consistency Bonus (only as tie-break)
-        - If multiple candidates are within 0.10 percentage points median_miss of the current choice in the chosen base timeframe:
-        - Pick the one that appears in the Top 5 across the most timeframes (3/5/7).
-        - If still tied, pick the higher win_rate in the 7-day table.
-        - If still tied, pick the earlier time (HH:MM).
-
-        OUTPUT FORMAT (exactly, no extra text):
-        RECOMMENDED_TIME: HH:MM
-        REASON: <max 5 sentences, cite which rules/timeframes caused the decision>
-
-        Report:
-        {full_report}
-        """
-        
-        # Use only the Flash family selected for this deployment. This task needs
-        # structured extraction, not a higher-cost reasoning-first model.
-        candidates = [
-            'gemini-2.5-flash-lite',   # Optimized for speed/volume
-            'gemini-2.5-flash',        # More capable Flash fallback
-        ]
-
-        result_text = None
-        last_error = None
-
-        for model_name in candidates:
-            try:
-                print(f"Trying AI model: {model_name}...")
-                with genai.Client(api_key=GEMINI_API_KEY) as ai_client:
-                    response = ai_client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                    )
-                result_text = response.text.strip()
-                break # Stop after the first successful model
-            except Exception as e:
-                last_error = e
-                # creating a short error string to print
-                err_str = str(e).split('\n')[0] 
-                print(f"  -> Failed: {err_str}...")
-                # Wait before trying the next candidate to avoid rate-locking
-                if model_name != candidates[-1]:
-                    print("  -> Waiting 1mn before next model attempt...")
-                    time.sleep(60)
-        
-        if result_text:
-            # Try to extract the time
-            match = re.search(r"RECOMMENDED_TIME:\s*(\d{2}:\d{2})", result_text)
-            extracted_time = match.group(1) if match else None
-            return result_text, extracted_time, model_name
-        else:
-            return f"AI Analysis failed after trying all candidates. Last error: {last_error}", None, None
-    except Exception as e:
-        return f"AI Analysis failed: {e}", None, None
-
-def send_to_discord(report_content, color=3447003):
-    """Send a report to Discord via webhook.
-
-    Args:
-        report_content: Text to send.
-        color: Embed sidebar color (default: blue 3447003).
+    Kraken exposes at most 720 recent candles regardless of ``since``.  A
+    pagination loop can therefore create the illusion of an older history while
+    returning overlapping rows.  Timing analysis needs 672 completed 15-minute
+    candles, so one latest-page request is both sufficient and deterministic.
     """
-    if not DISCORD_WEBHOOK_URL:
-        print("No DISCORD_WEBHOOK_URL found. Skipping Discord notification.")
-        return
 
-    # Discord embeds have a 4096 char limit for description
-    # Split into chunks of ~3900 chars to stay safe
-    chunks = [report_content[i:i+3900] for i in range(0, len(report_content), 3900)]
-    
-    for i, chunk in enumerate(chunks):
-        payload = {
-            "embeds": [{
-                "description": chunk,
-                "color": color
-            }]
-        }
+    if timeframe == "15m" and days > 7:
+        raise AnalysisError("15-minute timing history is limited to 7 rolling days")
+    batch = exchange.fetch_ohlcv(
+        symbol,
+        timeframe=timeframe,
+        limit=KRAKEN_OHLCV_LIMIT,
+    )
+    rows: dict[int, list] = {}
+    for row in batch or []:
+        if isinstance(row, (list, tuple)) and len(row) >= 6:
+            rows[int(row[0])] = list(row[:6])
+    return [rows[key] for key in sorted(rows)]
+
+
+def _completed_frame(
+    rows: Iterable[Iterable[Any]],
+    timeframe_ms: int,
+    *,
+    now: datetime,
+    label: str,
+) -> pd.DataFrame:
+    """Normalize OHLCV and remove the current, not-yet-completed candle."""
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise AnalysisError("now must include a timezone")
+    parsed = []
+    for row in rows:
+        values = list(row)
+        if len(values) < 6:
+            continue
         try:
-            r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-            r.raise_for_status()
-            print(f"Sent chunk {i+1}/{len(chunks)} to Discord")
-        except Exception as e:
-            print(f"Failed to send to Discord: {e}")
-
-def main():
-    symbols = _parse_symbols(SYMBOLS_ENV, DCA_TARGET_MAP_ENV)
-    exchange = get_analysis_exchange()
-
-    map_was_updated = False  # Track whether any TIME value was actually changed
-
-    for symbol in symbols:
-        print(f"\nExample: PROCESSING {symbol}...")
-        report_lines = []
-        summary_lines = []  # For short report
-        
-        def log(s, summary_only=False):
-            """Log to console and report. If summary_only=True, only add to summary."""
-            if summary_only:
-                # Summary content - always printed, added to summary lines
-                print(s)
-                summary_lines.append(s)
-                if not SHORT_REPORT:
-                    report_lines.append(s)  # In full mode, summary is part of report
-            else:
-                # Detailed content - always added to report (for AI), conditionally printed
-                if not SHORT_REPORT:
-                    print(s)
-                report_lines.append(s)  # Always build full report for AI analysis
-
-        print(f"Fetching max required data ({max(PERIODS)} days) for {symbol}...")
-        if not SHORT_REPORT:
-            log(f"Fetching max required data ({max(PERIODS)} days) for {symbol}...")
-        
-        try:
-            # Fetch enough data for the largest period
-            rows = fetch_ohlcv_last_n_days(exchange, symbol, TIMEFRAME, max(PERIODS))
-
-            # Process into main DataFrame
-            df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
-            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-            df = df.drop_duplicates(subset=["ts"]).sort_values("ts")
-
-            # Pre-calculate local times
-            df["local_ts"] = df["ts"].dt.tz_convert(LOCAL_TZ)
-            df["local_date"] = df["local_ts"].dt.date
-            df["local_time"] = df["local_ts"].dt.strftime("%H:%M")
-
-            if not SHORT_REPORT:
-                log(f"Timezone: {LOCAL_TZ}")
-
-            best_overall_time = None
-            
-            for days in PERIODS:
-                log(f"\n{'='*40}")
-                log(f" ANALYSIS FOR LAST {days} DAYS ({symbol})")
-                log(f"{'='*40}")
-                
-                try:
-                    top_common, top_avg, top_dca, start, end = analyze_period(df, days, LOCAL_TZ)
-                    
-                    # Use the longest Kraken-supported period as the final candidate.
-                    if days == max(PERIODS) and not top_dca.empty:
-                        best_overall_time = top_dca.iloc[0]['time']
-                        log(f"🏆 CHAMPION TIME ({days} Days): {best_overall_time}")
-                    
-                    log(f"Range: {start} -> {end}")
-                    
-                    log("\n(1) Most frequent DAILY-LOW time:")
-                    log(top_common.to_string(index=False))
-
-                    log("\n(2) Best DCA Time (Lowest Median Miss from Daily Low):")
-                    # Show price and the average discount relative to daily mean
-                    log(top_dca.to_string(index=False))
-                    log("* 'median_miss': Median % overpayment vs day's absolute low.")
-                    log("* 'win_rate': % of days where the buy was within 0.5% of the absolute low.")
-                    
-                except Exception as e:
-                    log(f"Could not analyze {days} days: {e}")
-
-            # After loop, prepare for AI analysis (always use full detailed report)
-            final_time = best_overall_time
-            source_method = "Quantitative (7d Kraken GBP Median Miss)"
-
-            if GEMINI_API_KEY:
-                log("\n" + "="*40, summary_only=True)
-                log("🤖 AI ANALYSIS & RECOMMENDATION", summary_only=True)
-                log("="*40, summary_only=True)
-                
-                # For AI, we need the full detailed report
-                detailed_report = "\n".join(report_lines)
-                ai_summary, ai_time, used_model = get_ai_summary(detailed_report, symbol)
-                
-                if used_model:
-                    log(f"🧠 Model Used: {used_model}", summary_only=True)
-                    
-                log(ai_summary, summary_only=True)
-                
-                if ai_time:
-                    log(f"\n✨ AI Recommendation Identified: {ai_time}", summary_only=True)
-                    if ai_time != final_time:
-                        log(f"🔄 Switching target from {final_time} (Math) to {ai_time} (AI)", summary_only=True)
-                        final_time = ai_time
-                        source_method = "🤖 AI Recommendation"
-                    else:
-                        log("✅ AI agrees with Quantitative Analysis.", summary_only=True)
-                        source_method = f"🤝 Consensus (AI + Math)"
-                else:
-                    log("⚠️ Could not extract valid time from AI. Sticking to math-based time.", summary_only=True)
-
-            # Build final report for Discord
-            log(f"\n🎯 FINAL DECISION for {symbol}: {final_time}", summary_only=True)
-            log(f"ℹ️ SOURCE: {source_method}", summary_only=True)
-            
-            # Update EXISTING_MAP with the final time BEFORE building the Discord report
-            # so the appended DCA_TARGET_MAP snapshot reflects the new recommended times.
-            if final_time:
-                # Normalize to the canonical Kraken GBP configuration key.
-                base = symbol.split('/')[0]
-                gbp_key = f"{base}_GBP"
-
-                target_key = gbp_key
-
-                # Update Logic
-                if target_key in EXISTING_MAP and isinstance(EXISTING_MAP[target_key], dict):
-                    old_time = EXISTING_MAP[target_key].get("TIME")
-                    EXISTING_MAP[target_key]["TIME"] = final_time
-                    if final_time != old_time:
-                        map_was_updated = True
-                    log(
-                        f"✅ Recommended TIME for existing target '{target_key}': "
-                        f"{final_time}. The workflow will merge it if live rules are unchanged."
-                    )
-                elif target_key in EXISTING_MAP:
-                    log(
-                        f"⚠️ '{target_key}' is not an object and was not updated.",
-                        summary_only=True,
-                    )
-                else:
-                    # Symbol not in DCA_TARGET_MAP (new manual-dispatch analysis).
-                    # Analysis is complete and Discord report has been sent below,
-                    # but we intentionally do NOT add it to the map — the user must
-                    # add it manually via the Discord bot or GitHub Variables UI.
-                    log(f"ℹ️ '{target_key}' is not in DCA_TARGET_MAP. Recommended time: {final_time}. Add it manually to start trading.", summary_only=True)
-
-            # Determine what to send to Discord
-            if SHORT_REPORT:
-                full_report = "\n".join(summary_lines)
-            else:
-                full_report = "\n".join(report_lines)
-
-            # Send individual report per symbol
-            send_to_discord(full_report)
+            timestamp = int(values[0])
+            numbers = [float(value) for value in values[1:6]]
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not all(math.isfinite(number) for number in numbers):
+            continue
+        if timestamp + timeframe_ms <= int(now.timestamp() * 1000):
+            parsed.append([timestamp, *numbers])
+    if not parsed:
+        raise AnalysisError(f"{label} has no completed Kraken candles")
+    frame = pd.DataFrame(
+        parsed, columns=["timestamp_ms", "open", "high", "low", "close", "volume"]
+    )
+    frame = frame.drop_duplicates("timestamp_ms", keep="last").sort_values("timestamp_ms")
+    frame["ts"] = pd.to_datetime(frame["timestamp_ms"], unit="ms", utc=True)
+    return frame.reset_index(drop=True)
 
 
-        except Exception as e:
-             error_msg = f"CRITICAL FAILURE processing {symbol}: {e}"
-             print(error_msg)
-             send_to_discord(f"❌ Analysis Failed for {symbol}: {e}")
+def _require_fresh_candle(
+    frame: pd.DataFrame,
+    timeframe_ms: int,
+    max_age: timedelta,
+    *,
+    now: datetime,
+    label: str,
+) -> None:
+    latest_end = frame.iloc[-1]["ts"].to_pydatetime() + timedelta(milliseconds=timeframe_ms)
+    age = now.astimezone(timezone.utc) - latest_end
+    if age < timedelta(0):
+        raise AnalysisError(f"{label} contains a candle from the future")
+    if age > max_age:
+        raise AnalysisError(f"{label} is stale ({age.total_seconds() / 3600:.1f} hours old)")
 
-    # Send final DCA_TARGET_MAP snapshot (reflects all TIME updates from this run)
-    if EXISTING_MAP:
-        label = (
-            "DCA_TARGET_MAP (recommended TIME snapshot)"
-            if map_was_updated
-            else "DCA_TARGET_MAP"
+
+def _contiguous_tail(
+    frame: pd.DataFrame,
+    candle_count: int,
+    timeframe_ms: int,
+    *,
+    label: str,
+) -> pd.DataFrame:
+    """Return the latest exact-cadence candles or fail on shortages and gaps."""
+
+    if len(frame) < candle_count:
+        raise AnalysisError(
+            f"{label} is insufficient: {len(frame)} completed candles; need {candle_count}"
         )
-        lines = [f"**📋 {label}**\n"]
-        for symbol, config in EXISTING_MAP.items():
-            if isinstance(config, dict):
-                enabled = config.get("BUY_ENABLED", False)
-                status = "🟢" if enabled else "🔴"
-                lines.append(
-                    f"{status} **{symbol}** — "
-                    f"Time: `{config.get('TIME', '?')}`, "
-                    f"Amount: `£{config.get('AMOUNT_GBP', '?')}`"
-                )
-            else:
-                lines.append(f"🟢 **{symbol}** — `{config}`")
-        send_to_discord("\n".join(lines))
+    tail = frame.tail(candle_count).copy().reset_index(drop=True)
+    timestamps = tail["timestamp_ms"].astype("int64")
+    gaps = timestamps.diff().dropna()
+    if not bool((gaps == timeframe_ms).all()):
+        bad_gap = int(gaps[gaps != timeframe_ms].iloc[0])
+        expected_minutes = timeframe_ms // 60_000
+        actual_minutes = bad_gap / 60_000
+        raise AnalysisError(
+            f"{label} has a candle gap: expected exact {expected_minutes}-minute "
+            f"cadence, found {actual_minutes:g} minutes"
+        )
+    return tail
 
-    # Export the merged map for GitHub Actions
-    if EXISTING_MAP:
-        # We export the MODIFIED existing map, not just the new results
-        # Ensure json format matches what GH expects
-        json_map = json.dumps(EXISTING_MAP)
-        
-        # If running locally without GITHUB_OUTPUT
-        if os.environ.get("GITHUB_OUTPUT"):
-            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                f.write(f"best_time_map={json_map}\n")
-        else:
-            print(f"DEBUG: (Not in GHA) best_time_map={json_map}")
+
+def classify_trend(
+    daily_rows: Iterable[Iterable[Any]],
+    weekly_rows: Iterable[Iterable[Any]],
+    *,
+    now: datetime | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Classify UPTREND/DOWNTREND/SIDEWAYS from completed candles only."""
+
+    reference = now or _utc_now()
+    daily = _completed_frame(
+        daily_rows, DAILY_TIMEFRAME_MS, now=reference, label="Daily market data"
+    )
+    weekly = _completed_frame(
+        weekly_rows, WEEKLY_TIMEFRAME_MS, now=reference, label="Weekly market data"
+    )
+    if len(daily) < MIN_DAILY_CANDLES:
+        raise AnalysisError(
+            f"Daily market data is insufficient: {len(daily)} completed candles; "
+            f"need {MIN_DAILY_CANDLES}"
+        )
+    if len(weekly) < MIN_WEEKLY_CANDLES:
+        raise AnalysisError(
+            f"Weekly market data is insufficient: {len(weekly)} completed candles; "
+            f"need {MIN_WEEKLY_CANDLES}"
+        )
+    # Indicators and the two-candle confirmation must never bridge a missing
+    # Kraken period. Only the latest data that participates in the decision is
+    # required, preserving harmless older history while failing closed on a
+    # recent daily or weekly gap.
+    daily = _contiguous_tail(
+        daily,
+        MIN_DAILY_CANDLES,
+        DAILY_TIMEFRAME_MS,
+        label="Daily market data",
+    )
+    weekly = _contiguous_tail(
+        weekly,
+        MIN_WEEKLY_CANDLES,
+        WEEKLY_TIMEFRAME_MS,
+        label="Weekly market data",
+    )
+    _require_fresh_candle(
+        daily,
+        DAILY_TIMEFRAME_MS,
+        MAX_DAILY_DATA_AGE,
+        now=reference,
+        label="Daily market data",
+    )
+    _require_fresh_candle(
+        weekly,
+        WEEKLY_TIMEFRAME_MS,
+        MAX_WEEKLY_DATA_AGE,
+        now=reference,
+        label="Weekly market data",
+    )
+
+    daily["sma150"] = daily["close"].rolling(150, min_periods=150).mean()
+    daily["ema20"] = daily["close"].ewm(span=20, adjust=False).mean()
+    daily["ema50"] = daily["close"].ewm(span=50, adjust=False).mean()
+    weekly["ema20"] = weekly["close"].ewm(span=20, adjust=False).mean()
+
+    current = daily.iloc[-1]
+    previous = daily.iloc[-2]
+    slope_start = daily.iloc[-21]["sma150"]
+    slope_end = current["sma150"]
+    if pd.isna(slope_start) or pd.isna(slope_end):
+        raise AnalysisError("SMA150 20-day slope cannot be calculated")
+    weekly_current = weekly.iloc[-1]
+
+    two_day_above = bool(
+        current["close"] > current["sma150"]
+        and current["ema20"] > current["ema50"]
+        and previous["close"] > previous["sma150"]
+        and previous["ema20"] > previous["ema50"]
+    )
+    two_day_below = bool(
+        current["close"] < current["sma150"]
+        and current["ema20"] < current["ema50"]
+        and previous["close"] < previous["sma150"]
+        and previous["ema20"] < previous["ema50"]
+    )
+    weekly_above = bool(weekly_current["close"] > weekly_current["ema20"])
+    weekly_below = bool(weekly_current["close"] < weekly_current["ema20"])
+    slope = float(slope_end - slope_start)
+    slope_positive = slope > 0
+    slope_negative = slope < 0
+
+    if two_day_above and weekly_above and slope_positive:
+        regime = "UPTREND"
+    elif two_day_below and weekly_below and slope_negative:
+        regime = "DOWNTREND"
+    else:
+        regime = "SIDEWAYS"
+
+    signals = {
+        "DAILY_LAST_COMPLETE": _iso_utc(current["ts"].to_pydatetime()),
+        "DAILY_CLOSE": round(float(current["close"]), 8),
+        "DAILY_PREVIOUS_CLOSE": round(float(previous["close"]), 8),
+        "DAILY_SMA150": round(float(current["sma150"]), 8),
+        "DAILY_PREVIOUS_SMA150": round(float(previous["sma150"]), 8),
+        "DAILY_EMA20": round(float(current["ema20"]), 8),
+        "DAILY_EMA50": round(float(current["ema50"]), 8),
+        "DAILY_PREVIOUS_EMA20": round(float(previous["ema20"]), 8),
+        "DAILY_PREVIOUS_EMA50": round(float(previous["ema50"]), 8),
+        "WEEKLY_LAST_COMPLETE": _iso_utc(weekly_current["ts"].to_pydatetime()),
+        "WEEKLY_CLOSE": round(float(weekly_current["close"]), 8),
+        "WEEKLY_EMA20": round(float(weekly_current["ema20"]), 8),
+        "SMA150_SLOPE_20D": round(slope, 8),
+        "TWO_DAY_ABOVE": two_day_above,
+        "TWO_DAY_BELOW": two_day_below,
+        "WEEKLY_ABOVE": weekly_above,
+        "WEEKLY_BELOW": weekly_below,
+        "SLOPE_POSITIVE": slope_positive,
+        "SLOPE_NEGATIVE": slope_negative,
+    }
+    return regime, signals
+
+
+def _time_stats(frame: pd.DataFrame, dates: list[date]) -> list[dict[str, Any]]:
+    selected = frame[frame["local_date"].isin(dates)].copy()
+    daily_low = selected.groupby("local_date")["low"].transform("min")
+    selected["miss_pct"] = (selected["close"] - daily_low) / daily_low * 100
+    selected["is_snipe"] = selected["miss_pct"] < 0.5
+    stats = []
+    for local_time, group in selected.groupby("local_time", sort=True):
+        if group["local_date"].nunique() != len(dates):
+            continue
+        stats.append(
+            {
+                "TIME": str(local_time),
+                "MEDIAN_MISS": float(median(group["miss_pct"].tolist())),
+                "WIN_RATE": float(group["is_snipe"].mean() * 100),
+                "DAYS": len(dates),
+            }
+        )
+    if not stats:
+        raise AnalysisError(f"No complete time-of-day candidates for the {len(dates)}-day window")
+    return sorted(stats, key=lambda item: (item["MEDIAN_MISS"], -item["WIN_RATE"], item["TIME"]))
+
+
+def _rolling_time_stats(frame: pd.DataFrame, days: int) -> list[dict[str, Any]]:
+    """Score one deterministic rolling 24-hour window per requested day.
+
+    Calendar-day grouping cannot produce seven full days late in Bangkok from
+    Kraken's 720-candle page.  Exact contiguous 96-candle blocks do: every
+    block contains each Bangkok HH:MM once, without depending on analysis time.
+    """
+
+    expected = days * INTRADAY_CANDLES_PER_DAY
+    if len(frame) != expected:
+        raise AnalysisError(
+            f"The {days}-day timing window requires exactly {expected} candles"
+        )
+    selected = frame.copy().reset_index(drop=True)
+    selected["rolling_day"] = [
+        index // INTRADAY_CANDLES_PER_DAY for index in range(expected)
+    ]
+    rolling_low = selected.groupby("rolling_day")["low"].transform("min")
+    selected["miss_pct"] = (selected["close"] - rolling_low) / rolling_low * 100
+    selected["is_snipe"] = selected["miss_pct"] < 0.5
+    stats: list[dict[str, Any]] = []
+    for local_time, group in selected.groupby("local_time", sort=True):
+        if len(group) != days or group["rolling_day"].nunique() != days:
+            raise AnalysisError(
+                f"The {days}-day timing window is missing local time {local_time}"
+            )
+        stats.append(
+            {
+                "TIME": str(local_time),
+                "MEDIAN_MISS": float(median(group["miss_pct"].tolist())),
+                "WIN_RATE": float(group["is_snipe"].mean() * 100),
+                "DAYS": days,
+            }
+        )
+    if len(stats) != INTRADAY_CANDLES_PER_DAY:
+        raise AnalysisError(
+            f"The {days}-day timing window has {len(stats)} local time slots; "
+            f"need {INTRADAY_CANDLES_PER_DAY}"
+        )
+    return sorted(
+        stats,
+        key=lambda item: (item["MEDIAN_MISS"], -item["WIN_RATE"], item["TIME"]),
+    )
+
+
+def _rounded_candidate(item: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "TIME": item["TIME"],
+        "MEDIAN_MISS": round(float(item["MEDIAN_MISS"]), 6),
+        "WIN_RATE": round(float(item["WIN_RATE"]), 4),
+        "DAYS": int(item["DAYS"]),
+    }
+
+
+def choose_timing_candidate(
+    tables: Mapping[int, list[dict[str, Any]]],
+) -> tuple[dict[str, Any], int, str, int]:
+    """Apply recency, base-window, and deterministic tie-break rules."""
+
+    if any(days not in tables or not tables[days] for days in PERIODS):
+        raise AnalysisError("Timing tables must contain non-empty 3, 5, and 7-day windows")
+    best3, best5, best7 = (tables[days][0] for days in PERIODS)
+    if (
+        best3["WIN_RATE"] >= best7["WIN_RATE"] + 10.0
+        and best3["MEDIAN_MISS"] <= best7["MEDIAN_MISS"] + 0.20
+    ):
+        selected_window = 3
+        selection_rule = "RECENCY_3D_OVERRIDE"
+        initial = best3
+    elif best5["MEDIAN_MISS"] <= best7["MEDIAN_MISS"] - 0.15:
+        selected_window = 5
+        selection_rule = "BASE_5D_MATERIAL_IMPROVEMENT"
+        initial = best5
+    else:
+        selected_window = 7
+        selection_rule = "BASE_7D"
+        initial = best7
+
+    near_ties = [
+        item
+        for item in tables[selected_window]
+        if item["MEDIAN_MISS"] <= initial["MEDIAN_MISS"] + 0.10
+    ]
+    top_five_times = {
+        days: {item["TIME"] for item in tables[days][:5]} for days in PERIODS
+    }
+    seven_day_by_time = {item["TIME"]: item for item in tables[7]}
+
+    def tie_key(item: Mapping[str, Any]):
+        appearances = sum(item["TIME"] in top_five_times[days] for days in PERIODS)
+        seven_day_win_rate = seven_day_by_time.get(item["TIME"], {}).get("WIN_RATE", -1.0)
+        return (-appearances, -seven_day_win_rate, item["TIME"])
+
+    selected = min(near_ties, key=tie_key)
+    appearances = sum(selected["TIME"] in top_five_times[days] for days in PERIODS)
+    return dict(selected), selected_window, selection_rule, appearances
+
+
+def select_best_time(
+    rows: Iterable[Iterable[Any]],
+    *,
+    now: datetime | None = None,
+    local_tz: str = LOCAL_TZ,
+) -> tuple[str, dict[str, Any]]:
+    """Select a local buy time using the deterministic 3/5/7-day policy."""
+
+    reference = now or _utc_now()
+    try:
+        zone = ZoneInfo(local_tz)
+    except Exception as exc:
+        raise AnalysisError(f"Unknown analysis timezone: {local_tz}") from exc
+    frame = _completed_frame(
+        rows, QUARTER_HOUR_MS, now=reference, label="15-minute market data"
+    )
+    _require_fresh_candle(
+        frame,
+        QUARTER_HOUR_MS,
+        MAX_INTRADAY_DATA_AGE,
+        now=reference,
+        label="15-minute market data",
+    )
+    frame = _contiguous_tail(
+        frame,
+        INTRADAY_HISTORY_CANDLES,
+        QUARTER_HOUR_MS,
+        label="15-minute market data",
+    )
+    frame["local_ts"] = frame["ts"].dt.tz_convert(zone)
+    frame["local_time"] = frame["local_ts"].dt.strftime("%H:%M")
+
+    tables = {
+        days: _rolling_time_stats(
+            frame.tail(days * INTRADAY_CANDLES_PER_DAY).copy(), days
+        )
+        for days in PERIODS
+    }
+    selected, selected_window, selection_rule, appearances = choose_timing_candidate(tables)
+    timing = {
+        "ANALYZED_AT": _iso_utc(reference),
+        "TIMEZONE": local_tz,
+        "SELECTED_LOCAL_TIME": selected["TIME"],
+        "SELECTED_WINDOW_DAYS": selected_window,
+        "SELECTION_RULE": selection_rule,
+        "TOP_FIVE_APPEARANCES": appearances,
+        "SELECTED_METRICS": _rounded_candidate(selected),
+        "HISTORY_CANDLES": INTRADAY_HISTORY_CANDLES,
+        "HISTORY_START": _iso_utc(frame.iloc[0]["ts"].to_pydatetime()),
+        "HISTORY_END": _iso_utc(frame.iloc[-1]["ts"].to_pydatetime()),
+        "WINDOWS": {
+            str(days): {
+                "BEST": _rounded_candidate(tables[days][0]),
+                "TOP_5": [_rounded_candidate(item) for item in tables[days][:5]],
+            }
+            for days in PERIODS
+        },
+    }
+    return selected["TIME"], timing
+
+
+def analyze_period(df: pd.DataFrame, days: int, local_tz: str):
+    """Compatibility view of deterministic per-time statistics.
+
+    New integrations should call :func:`select_best_time`; this helper preserves
+    the legacy report tuple without participating in final selection.
+    """
+
+    if days not in PERIODS:
+        raise ValueError("days must be one of 3, 5, or 7")
+    period = df.copy()
+    if "local_date" not in period or "local_time" not in period:
+        period["local_ts"] = period["ts"].dt.tz_convert(local_tz)
+        period["local_date"] = period["local_ts"].dt.date
+        period["local_time"] = period["local_ts"].dt.strftime("%H:%M")
+    dates = sorted(period["local_date"].unique())[-days:]
+    stats = _time_stats(period, dates)
+    top_dca = pd.DataFrame(
+        {
+            "time": [item["TIME"] for item in stats[:5]],
+            "median_miss": [item["MEDIAN_MISS"] for item in stats[:5]],
+            "win_rate": [item["WIN_RATE"] for item in stats[:5]],
+        }
+    )
+    lows = period[period["local_date"].isin(dates)].loc[
+        lambda data: data.groupby("local_date")["low"].idxmin()
+    ]
+    common = (
+        lows["local_time"].value_counts().rename_axis("time").reset_index(name="days_won")
+    )
+    common["share"] = common["days_won"] / len(dates)
+    average = (
+        period[period["local_date"].isin(dates)]
+        .groupby("local_time")["low"]
+        .mean()
+        .sort_values()
+        .head(5)
+        .rename_axis("time")
+        .reset_index(name="avg_low")
+    )
+    selected = period[period["local_date"].isin(dates)]
+    return common.head(5), average, top_dca, selected["ts"].min(), selected["ts"].max()
+
+
+def next_execution_time(
+    selected_local_time: str,
+    *,
+    analyzed_at: datetime,
+    local_tz: str = LOCAL_TZ,
+    minimum_notice: timedelta = timedelta(minutes=30),
+) -> datetime:
+    """Return the next occurrence at least 30 minutes after analysis."""
+
+    if analyzed_at.tzinfo is None or analyzed_at.utcoffset() is None:
+        raise AnalysisError("analyzed_at must include a timezone")
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", selected_local_time):
+        raise AnalysisError("Selected local time must be HH:MM")
+    zone = ZoneInfo(local_tz)
+    local_now = analyzed_at.astimezone(zone)
+    hour, minute = (int(value) for value in selected_local_time.split(":"))
+    candidate = datetime.combine(local_now.date(), clock_time(hour, minute), tzinfo=zone)
+    if candidate < local_now + minimum_notice:
+        candidate += timedelta(days=1)
+    return candidate.astimezone(timezone.utc)
+
+
+def _fetch_asset_rows(exchange, symbol: str) -> tuple[list, list, list]:
+    daily = exchange.fetch_ohlcv(symbol, timeframe="1d", limit=260)
+    weekly = exchange.fetch_ohlcv(symbol, timeframe="1w", limit=40)
+    intraday = fetch_ohlcv_last_n_days(exchange, symbol, "15m", 7)
+    return daily, weekly, intraday
+
+
+def _decision_id(target: str, generated_at: datetime, fingerprint: str) -> str:
+    # UUID suffix ensures rerunning within the same second still invalidates an
+    # earlier failed/ready decision rather than accidentally reusing it.
+    stamp = generated_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{target.lower()}-{stamp}-{fingerprint[:8]}-{uuid4().hex[:8]}"
+
+
+def analyze_asset(
+    exchange,
+    target: str,
+    rule: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Build one complete READY decision or raise a fail-closed error."""
+
+    if target not in TARGET_KEYS:
+        raise AnalysisError(f"Unsupported target: {target}")
+    generated = now or _utc_now()
+    fingerprint = rules_hash(target, rule)
+    daily, weekly, intraday = _fetch_asset_rows(exchange, TARGET_SYMBOLS[target])
+    regime, signals = classify_trend(daily, weekly, now=generated)
+    selected_time, timing = select_best_time(intraday, now=generated, local_tz=LOCAL_TZ)
+    execute_at = next_execution_time(
+        selected_time, analyzed_at=generated, local_tz=LOCAL_TZ
+    )
+    amount_tier = "UP" if regime == "UPTREND" else "LOW"
+    return {
+        "STATUS": READY_STATUS,
+        "REGIME": regime,
+        "AMOUNT_TIER": amount_tier,
+        "EXECUTE_AT": _iso_utc(execute_at),
+        "VALID_UNTIL": _iso_utc(execute_at + timedelta(minutes=60)),
+        "DECISION_ID": _decision_id(target, generated, fingerprint),
+        "RULES_HASH": fingerprint,
+        "SIGNALS": signals,
+        "TIMING": timing,
+    }
+
+
+def error_decision(
+    target: str,
+    rule: Mapping[str, Any],
+    error: Exception | str,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Build a fresh ERROR decision that can never be executed."""
+
+    generated = now or _utc_now()
+    fingerprint = rules_hash(target, rule)
+    message = str(error).strip() or "Unknown analysis failure"
+    return {
+        "STATUS": ERROR_STATUS,
+        "REGIME": None,
+        "AMOUNT_TIER": None,
+        "EXECUTE_AT": None,
+        "VALID_UNTIL": None,
+        "DECISION_ID": _decision_id(target, generated, fingerprint),
+        "RULES_HASH": fingerprint,
+        "SIGNALS": {"ERROR": message},
+        "TIMING": {"ANALYZED_AT": _iso_utc(generated), "ERROR": message},
+    }
+
+
+def get_ai_summary(deterministic_report: str, current_symbol: str):
+    """Ask Gemini to explain, never choose, the deterministic result."""
+
+    if not GEMINI_API_KEY:
+        return "Gemini explanation unavailable; deterministic decision unchanged.", None, None
+    prompt = f"""
+Explain the deterministic Kraken analysis for {current_symbol} in no more than
+three sentences. Do not recommend or select a different regime, amount, asset,
+or execution time. Do not invent metrics. The Python decision is final.
+
+{deterministic_report}
+""".strip()
+    for model_name in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
+        try:
+            with genai.Client(api_key=GEMINI_API_KEY) as client:
+                response = client.models.generate_content(model=model_name, contents=prompt)
+            explanation = (response.text or "").strip()
+            if explanation:
+                return explanation, None, model_name
+        except Exception:  # optional narration must never fail analysis
+            continue
+    return "Gemini explanation unavailable; deterministic decision unchanged.", None, None
+
+
+def _decision_report(target: str, decision: Mapping[str, Any], rule: Mapping[str, Any]) -> str:
+    if decision["STATUS"] == ERROR_STATUS:
+        return (
+            f"❌ **{target} analysis ERROR**\n"
+            f"Purchase skipped. {decision['SIGNALS'].get('ERROR', 'Unknown error')}"
+        )
+    tier = decision["AMOUNT_TIER"]
+    amount = rule["REGIME_AMOUNTS_GBP"][tier]
+    timing = decision["TIMING"]
+    return (
+        f"📊 **{target} daily decision**\n"
+        f"Regime: `{decision['REGIME']}` → `{tier}` tier (`£{amount:g}` configured)\n"
+        f"Best time: `{timing['SELECTED_LOCAL_TIME']} {timing['TIMEZONE']}` "
+        f"via `{timing['SELECTION_RULE']}`\n"
+        f"Execution: `{decision['EXECUTE_AT']}` to `{decision['VALID_UNTIL']}`\n"
+        f"Trading: `{'enabled' if rule['BUY_ENABLED'] else 'disabled'}`"
+    )
+
+
+def send_to_discord(report_content: str, color: int = 3_447_003) -> bool:
+    """Post a bounded Discord embed without leaking serialized configuration."""
+
+    if not DISCORD_WEBHOOK_URL:
+        print("Discord webhook is not configured; analysis notification skipped.")
+        return False
+    chunks = [report_content[index : index + 3900] for index in range(0, len(report_content), 3900)]
+    try:
+        for chunk in chunks:
+            response = requests.post(
+                DISCORD_WEBHOOK_URL,
+                json={"embeds": [{"description": chunk, "color": color}]},
+                timeout=10,
+            )
+            response.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        # A requests exception can embed the webhook URL (which is a secret).
+        print(f"Discord analysis notification failed ({type(exc).__name__}).")
+        return False
+
+
+def persist_analysis_state(state: Mapping[str, Any]) -> bool:
+    """Persist state directly when GitHub credentials are explicitly provided.
+
+    GitHub Actions can alternatively consume the ``analysis_state`` output.  No
+    serialized state is printed to logs.
+    """
+
+    token = os.environ.get("GH_PAT_FOR_VARS") or os.environ.get("GH_TOKEN")
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    if not token or not repository:
+        return False
+    value = json.dumps(state, separators=(",", ":"), sort_keys=True)
+    base_url = f"https://api.github.com/repos/{repository}/actions/variables"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = requests.patch(
+        f"{base_url}/{ANALYSIS_VARIABLE}",
+        headers=headers,
+        json={"name": ANALYSIS_VARIABLE, "value": value},
+        timeout=20,
+    )
+    if response.status_code == 404:
+        response = requests.post(
+            base_url,
+            headers=headers,
+            json={"name": ANALYSIS_VARIABLE, "value": value},
+            timeout=20,
+        )
+    response.raise_for_status()
+    return True
+
+
+def _write_actions_output(state: Mapping[str, Any]) -> None:
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if not output_path:
+        return
+    compact = json.dumps(state, separators=(",", ":"), sort_keys=True)
+    with Path(output_path).open("a", encoding="utf-8") as output:
+        output.write(f"analysis_state={compact}\n")
+
+
+def _existing_or_empty_state(rules: Mapping[str, Any], now: datetime) -> dict[str, Any]:
+    if DCA_ANALYSIS_STATE_ENV.strip():
+        try:
+            state = validate_analysis_state(DCA_ANALYSIS_STATE_ENV, require_all=True)
+            for target in TARGET_KEYS:
+                if state["TARGETS"][target]["RULES_HASH"] != rules_hash(
+                    target, rules[target]
+                ):
+                    state["TARGETS"][target] = error_decision(
+                        target,
+                        rules[target],
+                        "Live budgets changed; fresh analysis required",
+                        now=now,
+                    )
+            return state
+        except ValueError as exc:
+            print(f"Existing analysis state is invalid and will be replaced safely: {exc}")
+    return empty_analysis_state(rules, now=now)
+
+
+def main() -> int:
+    """Analyze selected targets, persist four decisions, and alert per asset."""
+
+    generated = _utc_now()
+    try:
+        rules = validate_rules_map(DCA_TARGET_MAP_ENV)
+        symbols = _parse_symbols(SYMBOLS_ENV, DCA_TARGET_MAP_ENV)
+    except ValueError as exc:
+        print(f"Configuration error: {exc}")
+        send_to_discord(f"❌ **DCA analysis configuration error**\n{exc}", color=15_148_332)
+        return 1
+
+    selected_targets = [symbol.replace("/", "_") for symbol in symbols]
+    state = _existing_or_empty_state(rules, generated)
+    state["VERSION"] = ANALYSIS_STATE_VERSION
+    state["GENERATED_AT"] = _iso_utc(generated)
+    exchange = get_analysis_exchange()
+    had_error = False
+
+    for target in selected_targets:
+        try:
+            decision = analyze_asset(exchange, target, rules[target], now=generated)
+            report = _decision_report(target, decision, rules[target])
+            explanation, _, model = get_ai_summary(report, TARGET_SYMBOLS[target])
+            if model:
+                report += f"\nGemini explanation ({model}): {explanation}"
+            print(
+                f"{target}: READY regime={decision['REGIME']} "
+                f"time={decision['TIMING']['SELECTED_LOCAL_TIME']} {LOCAL_TZ}"
+            )
+        except Exception as exc:
+            had_error = True
+            decision = error_decision(target, rules[target], exc, now=generated)
+            report = _decision_report(target, decision, rules[target])
+            print(f"{target}: ERROR {exc}")
+        state["TARGETS"][target] = decision
+        send_to_discord(report, color=15_148_332 if decision["STATUS"] == ERROR_STATUS else 3_447_003)
+
+    # Structural validation happens before either persistence route.
+    validated = validate_analysis_state(state, rules)
+    persisted = persist_analysis_state(validated)
+    _write_actions_output(validated)
+    print(
+        f"Analysis complete: {len(selected_targets)} target(s), "
+        f"state persistence={'direct' if persisted else 'workflow output'}; "
+        f"errors={'yes' if had_error else 'no'}."
+    )
+    # A per-asset ERROR is successfully persisted fail-closed state, not a
+    # workflow crash. The Discord alert and STATUS=ERROR are the operational signal.
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

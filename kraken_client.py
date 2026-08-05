@@ -97,6 +97,43 @@ def validate_kraken_credentials() -> dict:
     }
 
 
+def get_market_minimum_gbp(config_symbol: str, *, exchange=None) -> dict:
+    """Return Kraken's current effective GBP minimum without creating an order.
+
+    Kraken can publish both a quote-cost minimum and a base-amount minimum.  The
+    effective cash minimum is the larger of those two values at the current ask.
+    This helper is intentionally read-only so configuration and health checks can
+    validate budgets without sharing any order-submission code.
+    """
+    client = exchange or get_kraken_exchange()
+    symbol = to_kraken_symbol(config_symbol)
+    client.load_markets()
+    if symbol not in client.markets:
+        raise ValueError(f"Kraken spot market is unavailable: {symbol}")
+
+    market = client.market(symbol)
+    limits = market.get("limits", {}) or {}
+    minimum_cost = float((limits.get("cost", {}) or {}).get("min") or 0)
+    minimum_amount = float((limits.get("amount", {}) or {}).get("min") or 0)
+    ask = 0.0
+    if minimum_amount > 0:
+        ticker = client.fetch_ticker(symbol)
+        ask = float(ticker.get("ask") or ticker.get("last") or 0)
+        if ask <= 0:
+            raise RuntimeError(f"Kraken returned no usable ask price for {symbol}")
+
+    effective_minimum = max(minimum_cost, minimum_amount * ask)
+    if not math.isfinite(effective_minimum) or effective_minimum < 0:
+        raise RuntimeError(f"Kraken returned invalid market limits for {symbol}")
+    return {
+        "pair": symbol,
+        "minimum_cost_gbp": minimum_cost,
+        "minimum_amount": minimum_amount,
+        "ask_gbp": ask,
+        "effective_minimum_gbp": effective_minimum,
+    }
+
+
 def _positive_gbp_amount(amount_gbp: float) -> float:
     try:
         amount = float(amount_gbp)
@@ -200,6 +237,41 @@ def _finite_nonnegative(value, field_name: str) -> float:
     return number
 
 
+def _terminal_timestamp_seconds(order: dict, order_id: str) -> int:
+    """Return a validated terminal-event timestamp, preferring Kraken close time."""
+    for field_name in ("lastTradeTimestamp", "lastUpdateTimestamp"):
+        value = order.get(field_name)
+        if value is None:
+            continue
+        milliseconds = _finite_nonnegative(value, field_name)
+        if milliseconds <= 0:
+            raise KrakenOrderStateUnknown(
+                f"Kraken order {order_id} returned invalid {field_name}"
+            )
+        return int(milliseconds / 1000)
+
+    info = order.get("info") or {}
+    if isinstance(info, dict) and info.get("closetm") is not None:
+        close_seconds = _finite_nonnegative(info["closetm"], "close timestamp")
+        if close_seconds <= 0:
+            raise KrakenOrderStateUnknown(
+                f"Kraken order {order_id} returned invalid close timestamp"
+            )
+        return int(close_seconds)
+
+    created_ms = order.get("timestamp")
+    if created_ms is None:
+        raise KrakenOrderStateUnknown(
+            f"Kraken order {order_id} returned no terminal timestamp"
+        )
+    created_ms = _finite_nonnegative(created_ms, "order timestamp")
+    if created_ms <= 0:
+        raise KrakenOrderStateUnknown(
+            f"Kraken order {order_id} returned invalid order timestamp"
+        )
+    return int(created_ms / 1000)
+
+
 def _normalise_terminal_fill(
     order: dict, symbol: str, client_order_id: str
 ) -> dict:
@@ -287,7 +359,9 @@ def _normalise_terminal_fill(
         )
 
     spent_gbp = cost_gbp + quote_fee_gbp
-    timestamp_ms = order.get("timestamp")
+    terminal_timestamp = _terminal_timestamp_seconds(
+        order, order_id or client_order_id
+    )
     effective_price = spent_gbp / received
     return {
         "order_id": order_id,
@@ -305,7 +379,7 @@ def _normalise_terminal_fill(
         "effective_gbp_price_per_unit": effective_price,
         # Compatibility alias: unit price excludes the separately reported fee.
         "gbp_price_per_unit": market_price,
-        "timestamp": int(timestamp_ms / 1000) if timestamp_ms else int(time.time()),
+        "timestamp": terminal_timestamp,
     }
 
 
@@ -472,17 +546,8 @@ def place_market_buy(
                 "approximate the GBP budget with a base-amount order."
             )
 
-        market = exchange.market(symbol)
-        limits = market.get("limits", {}) or {}
-        minimum_cost = float((limits.get("cost", {}) or {}).get("min") or 0)
-        minimum_amount = float((limits.get("amount", {}) or {}).get("min") or 0)
-
-        ticker = exchange.fetch_ticker(symbol)
-        ask = float(ticker.get("ask") or ticker.get("last") or 0)
-        if minimum_amount > 0 and ask <= 0:
-            raise RuntimeError(f"Kraken returned no usable ask price for {symbol}")
-
-        effective_minimum = max(minimum_cost, minimum_amount * ask)
+        minimum = get_market_minimum_gbp(config_symbol, exchange=exchange)
+        effective_minimum = minimum["effective_minimum_gbp"]
         if requested_gbp < effective_minimum:
             raise ValueError(
                 f"GBP amount {requested_gbp:.2f} is below Kraken's current minimum "
@@ -496,6 +561,11 @@ def place_market_buy(
                 f"below the current minimum of approximately "
                 f"{effective_minimum:.2f} GBP for {symbol}."
             )
+        if precise_cost > requested_gbp + 1e-9:
+            raise ValueError(
+                "Kraken cost precision would raise the GBP debit above the "
+                "configured budget"
+            )
 
         if pre_submit_check is not None:
             pre_submit_check()
@@ -504,7 +574,9 @@ def place_market_buy(
         submission_params = {
             "clientOrderId": client_order_id,
             "deadline": _submission_deadline(),
-            "oflags": "fciq",
+            # Charge the trading fee from the purchased base asset so the GBP
+            # cash debit remains bounded by the user-owned quote-cost budget.
+            "oflags": "fcib",
         }
     except Exception as preparation_error:
         raise KrakenPreSubmissionError(

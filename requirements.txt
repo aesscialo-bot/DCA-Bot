@@ -1,4 +1,4 @@
 ccxt==4.5.71
-pandas
-requests
+pandas==3.0.5
+requests==2.34.2
 google-genai==1.75.0
