@@ -291,7 +291,7 @@ def _symbols_from_dca_map() -> str:
 # ---------------------------------------------------------------------------
 
 
-AI_MODEL_CANDIDATES = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+AI_MODEL_CANDIDATES = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 VALID_ACTIONS = {"portfolio", "status", "help", "unknown"}
 CLASSIFY_PROMPT = """Classify a read-only Discord command for a DCA service.
 Allowed actions are portfolio, status, help, and unknown. Never classify a

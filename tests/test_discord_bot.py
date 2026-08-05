@@ -682,7 +682,7 @@ class DiscordBotWorkflowAndGeminiTests(unittest.TestCase):
             result = asyncio.run(discord_bot.classify_intent("show status"))
         ctor.assert_called_once_with(api_key="test-key")
         client.models.generate_content.assert_called_once_with(
-            model="gemini-2.5-flash-lite", contents=ANY
+            model="gemini-3.5-flash-lite", contents=ANY
         )
         self.assertEqual(result["action"], "status")
 

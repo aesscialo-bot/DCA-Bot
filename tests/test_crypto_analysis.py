@@ -389,12 +389,12 @@ class DecisionAndNarrationTests(unittest.TestCase):
             )
 
         self.assertIsNone(selected_time)
-        self.assertEqual(model, "gemini-2.5-flash-lite")
+        self.assertEqual(model, "gemini-3.5-flash-lite")
         self.assertIn("Python decision", summary)
         prompt = client.models.generate_content.call_args.kwargs["contents"]
         self.assertIn("Do not recommend or select", prompt)
         client.models.generate_content.assert_called_once_with(
-            model="gemini-2.5-flash-lite", contents=ANY
+            model="gemini-3.5-flash-lite", contents=ANY
         )
 
     def test_discord_failure_does_not_log_secret_webhook_url(self):
