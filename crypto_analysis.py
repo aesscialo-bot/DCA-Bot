@@ -670,7 +670,9 @@ or execution time. Do not invent metrics. The Python decision is final.
 
 {deterministic_report}
 """.strip()
-    for model_name in ("gemini-2.5-flash-lite", "gemini-2.5-flash"):
+    # Prefer Google's current GA, free-tier Flash-Lite model.  Keep a second
+    # supported GA model as a resilience fallback; narration is non-authoritative.
+    for model_name in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite"):
         try:
             with genai.Client(api_key=GEMINI_API_KEY) as client:
                 response = client.models.generate_content(model=model_name, contents=prompt)
