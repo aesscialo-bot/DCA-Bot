@@ -421,6 +421,52 @@ class KrakenClientTests(unittest.TestCase):
         self.assertGreater(result["fee_gbp"], 0)
         self.assertEqual(result["fee_details"][0]["currency"], "BTC")
 
+    def test_native_fcib_quote_fee_corrects_ccxt_base_currency_mislabel(self):
+        order = terminal_fill()
+        order["fee"] = {"cost": 0.02, "currency": "BTC"}
+        order["info"] = {"fee": "0.02", "oflags": "viqc,fcib"}
+
+        result = kraken_client._normalise_terminal_fill(
+            order, "BTC/GBP", "dca-1234567890abcd"
+        )
+
+        market_price = order["cost"] / order["filled"]
+        expected_base_fee = 0.02 / market_price
+        self.assertAlmostEqual(
+            result["received"], order["filled"] - expected_base_fee
+        )
+        self.assertAlmostEqual(result["fee_gbp"], 0.02)
+        self.assertEqual(result["fee_details"][0]["currency"], "BTC")
+        self.assertAlmostEqual(
+            result["fee_details"][0]["amount"], expected_base_fee
+        )
+        self.assertEqual(result["gbp_fee_debit"], 0)
+        self.assertEqual(result["spent_gbp"], order["cost"])
+
+    def test_native_fciq_fee_remains_a_quote_currency_debit(self):
+        order = terminal_fill()
+        order["fee"] = {"cost": 0.02, "currency": "GBP"}
+        order["info"] = {"fee": "0.02", "oflags": "viqc,fciq"}
+
+        result = kraken_client._normalise_terminal_fill(
+            order, "BTC/GBP", "dca-1234567890abcd"
+        )
+
+        self.assertEqual(result["received"], order["filled"])
+        self.assertEqual(result["gbp_fee_debit"], 0.02)
+        self.assertEqual(result["spent_gbp"], order["cost"] + 0.02)
+
+    def test_native_conflicting_fee_flags_fail_closed(self):
+        order = terminal_fill()
+        order["info"] = {"fee": "0.02", "oflags": "fcib,fciq"}
+
+        with self.assertRaisesRegex(
+            kraken_client.KrakenOrderStateUnknown, "mutually exclusive"
+        ):
+            kraken_client._normalise_terminal_fill(
+                order, "BTC/GBP", "dca-1234567890abcd"
+            )
+
     def test_terminal_timestamp_prefers_fill_close_time_over_open_time(self):
         order = terminal_fill()
         order["timestamp"] = 1_786_035_540_000

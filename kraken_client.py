@@ -208,7 +208,56 @@ def _find_matching_order(exchange, symbol: str, client_order_id: str) -> dict | 
     return next(iter(matches.values()), None)
 
 
-def _fee_entries(order: dict) -> list[dict]:
+def _kraken_native_fee_entries(
+    order: dict, symbol: str, market_price: float
+) -> list[dict] | None:
+    """Return fee entries corrected from Kraken's native closed-order fields.
+
+    Kraken reports the native ``fee`` value in quote currency even when
+    ``oflags=fcib`` requests that the fee be *deducted* from the received base
+    asset.  CCXT 4.5.71 labels that unchanged numeric value as base currency,
+    which can make a small GBP fee look larger than the entire BTC fill.  Use
+    the native flag to convert the quote-valued fee into the asset actually
+    debited, while retaining the unified structure consumed by the trader.
+    """
+
+    info = order.get("info") or {}
+    if not isinstance(info, dict) or "fee" not in info:
+        return None
+
+    flags = {
+        flag.strip().lower()
+        for flag in str(info.get("oflags") or "").split(",")
+        if flag.strip()
+    }
+    fee_in_base = "fcib" in flags
+    fee_in_quote = "fciq" in flags
+    if fee_in_base and fee_in_quote:
+        raise KrakenOrderStateUnknown(
+            "Kraken returned mutually exclusive fee-currency flags"
+        )
+    if not fee_in_base and not fee_in_quote:
+        return None
+
+    quote_fee = _finite_nonnegative(info["fee"], "native order fee")
+    base_currency = symbol.split("/", maxsplit=1)[0]
+    if fee_in_quote:
+        return [{"cost": quote_fee, "currency": QUOTE_CURRENCY}]
+    if not math.isfinite(market_price) or market_price <= 0:
+        raise KrakenOrderStateUnknown(
+            "Kraken returned no usable execution price for its base-currency fee"
+        )
+    return [{"cost": quote_fee / market_price, "currency": base_currency}]
+
+
+def _fee_entries(
+    order: dict, symbol: str | None = None, market_price: float | None = None
+) -> list[dict]:
+    if symbol is not None and market_price is not None:
+        native_entries = _kraken_native_fee_entries(order, symbol, market_price)
+        if native_entries is not None:
+            return native_entries
+
     fees = order.get("fees")
     if isinstance(fees, list) and fees:
         return [fee for fee in fees if isinstance(fee, dict)]
@@ -307,7 +356,7 @@ def _normalise_terminal_fill(
         )
 
     market_price = cost_gbp / gross_received
-    fee_entries = _fee_entries(order)
+    fee_entries = _fee_entries(order, symbol, market_price)
     if not fee_entries:
         raise KrakenOrderStateUnknown(
             f"Kraken order {order_id or client_order_id} returned no fee information"
