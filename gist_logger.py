@@ -119,10 +119,10 @@ def update_gist_log(trade_data, symbol="BTC", saved_to_ghostfolio=False):
         print(f"Gist log updated for {symbol.upper()} in {GIST_FILENAME}.")
         return True
     except (KeyError, TypeError, ValueError, requests.RequestException) as error:
-        print(f"Failed to update Gist: {error}")
+        print(f"Failed to update Gist ({type(error).__name__}).")
     except Exception as error:
         # Gist logging must remain nonblocking even for unexpected response data.
-        print(f"Failed to update Gist: {error}")
+        print(f"Failed to update Gist ({type(error).__name__}).")
 
     return False
 

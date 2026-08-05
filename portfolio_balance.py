@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from dca_config import validate_rules_map
 from kraken_client import get_kraken_exchange
 
 
@@ -373,9 +374,7 @@ def main() -> None:
     """Fetch Kraken data, build the selected report, and notify Discord."""
     print("--- Kraken GBP Portfolio Balance Check ---")
     try:
-        target_map = json.loads(DCA_TARGET_MAP_JSON)
-        if not isinstance(target_map, dict) or not target_map:
-            raise ValueError("DCA_TARGET_MAP must be a non-empty JSON object")
+        target_map = validate_rules_map(json.loads(DCA_TARGET_MAP_JSON))
         symbols = extract_gbp_symbols(target_map)
         exchange = get_kraken_exchange()
         report = build_portfolio_report(exchange, symbols, SHORT_REPORT)

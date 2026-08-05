@@ -34,10 +34,39 @@ def terminal_fill(
         "cost": 5.45,
         "fee": {"cost": 0.02, "currency": "GBP"},
         "timestamp": 1_700_000_000_000,
+        "lastUpdateTimestamp": 1_700_000_001_000,
     }
 
 
 class KrakenClientTests(unittest.TestCase):
+    def test_market_minimum_helper_is_read_only_and_uses_larger_limit(self):
+        exchange = configured_exchange()
+
+        result = kraken_client.get_market_minimum_gbp(
+            "BTC_GBP", exchange=exchange
+        )
+
+        self.assertEqual(result["pair"], "BTC/GBP")
+        self.assertEqual(result["minimum_cost_gbp"], 0.43)
+        self.assertEqual(result["effective_minimum_gbp"], 2.5)
+        exchange.load_markets.assert_called_once_with()
+        exchange.fetch_ticker.assert_called_once_with("BTC/GBP")
+        exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    def test_market_minimum_does_not_need_ticker_for_cost_only_market(self):
+        exchange = configured_exchange()
+        exchange.market.return_value = {
+            "limits": {"cost": {"min": 5.0}, "amount": {"min": None}}
+        }
+
+        result = kraken_client.get_market_minimum_gbp(
+            "BTC_GBP", exchange=exchange
+        )
+
+        self.assertEqual(result["effective_minimum_gbp"], 5.0)
+        exchange.fetch_ticker.assert_not_called()
+        exchange.create_market_buy_order_with_cost.assert_not_called()
+
     def test_symbol_accepts_only_gbp_pairs(self):
         self.assertEqual(kraken_client.to_kraken_symbol("BTC_GBP"), "BTC/GBP")
         self.assertEqual(kraken_client.to_kraken_symbol("eth/gbp"), "ETH/GBP")
@@ -76,7 +105,10 @@ class KrakenClientTests(unittest.TestCase):
                 "filled": 0.00005,
                 "cost": 2.50,
             },
-            terminal_fill(),
+            {
+                **terminal_fill(),
+                "fee": {"cost": 0.000001, "currency": "BTC"},
+            },
         ]
         get_exchange.return_value = exchange
 
@@ -101,7 +133,7 @@ class KrakenClientTests(unittest.TestCase):
             {
                 "clientOrderId": result["client_order_id"],
                 "deadline": "2026-08-04T12:00:15.000Z",
-                "oflags": "fciq",
+                "oflags": "fcib",
             },
         )
         self.assertEqual(exchange.fetch_order.call_count, 2)
@@ -111,19 +143,19 @@ class KrakenClientTests(unittest.TestCase):
         self.assertEqual(result["quote_currency"], "GBP")
         self.assertEqual(result["order_id"], "kraken-order")
         self.assertEqual(result["cost_gbp"], 5.45)
-        self.assertEqual(result["fee_gbp"], 0.02)
-        self.assertEqual(result["gbp_fee_debit"], 0.02)
-        self.assertEqual(
-            result["fee_details"],
-            [{"currency": "GBP", "amount": 0.02, "gbp_equivalent": 0.02}],
-        )
-        self.assertEqual(result["spent_gbp"], 5.47)
-        self.assertEqual(result["received"], 0.000109)
+        self.assertAlmostEqual(result["fee_gbp"], 0.05)
+        self.assertEqual(result["gbp_fee_debit"], 0)
+        self.assertEqual(result["fee_details"][0]["currency"], "BTC")
+        self.assertEqual(result["fee_details"][0]["amount"], 0.000001)
+        self.assertAlmostEqual(result["fee_details"][0]["gbp_equivalent"], 0.05)
+        self.assertEqual(result["spent_gbp"], 5.45)
+        self.assertLessEqual(result["spent_gbp"], 5.50)
+        self.assertAlmostEqual(result["received"], 0.000108)
         self.assertAlmostEqual(
             result["market_gbp_price_per_unit"], 5.45 / 0.000109
         )
         self.assertAlmostEqual(
-            result["effective_gbp_price_per_unit"], 5.47 / 0.000109
+            result["effective_gbp_price_per_unit"], 5.45 / 0.000108
         )
         self.assertEqual(
             result["gbp_price_per_unit"], result["market_gbp_price_per_unit"]
@@ -220,6 +252,20 @@ class KrakenClientTests(unittest.TestCase):
             "below Kraken's current minimum",
         ):
             kraken_client.place_market_buy("BTC_GBP", 5.00)
+
+        exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_cost_precision_cannot_round_above_the_gbp_budget(self, get_exchange):
+        exchange = configured_exchange()
+        exchange.cost_to_precision.return_value = "5.51"
+        get_exchange.return_value = exchange
+
+        with self.assertRaisesRegex(
+            kraken_client.KrakenPreSubmissionError,
+            "above the configured budget",
+        ):
+            kraken_client.place_market_buy("BTC_GBP", 5.50)
 
         exchange.create_market_buy_order_with_cost.assert_not_called()
 
@@ -374,6 +420,29 @@ class KrakenClientTests(unittest.TestCase):
         self.assertEqual(result["gbp_fee_debit"], 0)
         self.assertGreater(result["fee_gbp"], 0)
         self.assertEqual(result["fee_details"][0]["currency"], "BTC")
+
+    def test_terminal_timestamp_prefers_fill_close_time_over_open_time(self):
+        order = terminal_fill()
+        order["timestamp"] = 1_786_035_540_000
+        order["lastUpdateTimestamp"] = 1_786_035_660_000
+
+        result = kraken_client._normalise_terminal_fill(
+            order, "BTC/GBP", "dca-1234567890abcd"
+        )
+
+        self.assertEqual(result["timestamp"], 1_786_035_660)
+
+    def test_terminal_fill_without_any_timestamp_fails_closed(self):
+        order = terminal_fill()
+        order.pop("timestamp")
+        order.pop("lastUpdateTimestamp")
+
+        with self.assertRaisesRegex(
+            kraken_client.KrakenOrderStateUnknown, "no terminal timestamp"
+        ):
+            kraken_client._normalise_terminal_fill(
+                order, "BTC/GBP", "dca-1234567890abcd"
+            )
 
     def test_missing_fee_currency_fails_closed(self):
         order = terminal_fill()

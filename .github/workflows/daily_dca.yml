@@ -1,204 +1,57 @@
 name: Daily Crypto DCA
 
 on:
-  schedule:
-    - cron: '0 22 * * *'   # 05:00 Bangkok — normal early-morning fallback
-    - cron: '55 16 * * *'  # 23:55 Bangkok — same-day catch-up, including 23:59 targets
+  # Railway dispatches this workflow from the absolute per-asset decision times.
   workflow_dispatch:
+    inputs:
+      symbols_json:
+        description: Optional sanitized scheduler context; the trader still revalidates all live state
+        required: false
+        default: ""
+        type: string
 
-# Prevent race conditions: Only one instance can run at a time
+permissions:
+  contents: read
+
 concurrency:
-  group: dca-target-map-writers
+  group: dca-execution-state-writers
   queue: max
-  cancel-in-progress: false  # Wait for current run to finish, don't cancel it
+  cancel-in-progress: false
 
 jobs:
   trade:
+    name: Revalidate and execute due decisions
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    
     steps:
-    # Quick Check runs FIRST - no checkout or Python needed (pure bash + env vars)
-    - name: Quick Check
-      id: check
-      shell: bash
-      env:
-        DCA_TARGET_MAP: ${{ vars.DCA_TARGET_MAP }}
-        DCA_EXECUTION_STATE: ${{ vars.DCA_EXECUTION_STATE || '{}' }}
-        TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Bangkok' }}
-      run: |
-        set -euo pipefail
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
 
-        # Ensure jq is installed (it is on ubuntu-latest)
-        if ! command -v jq &> /dev/null; then
-            echo "jq could not be found, installing..."
-            sudo apt-get update && sudo apt-get install -y jq
-        fi
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
 
-        # Fail closed if an incomplete, obsolete, or non-GBP config reaches Kraken.
-        if ! printf '%s' "$DCA_TARGET_MAP" | jq -e --argjson state "$DCA_EXECUTION_STATE" '
-          type == "object" and length > 0 and all(to_entries[];
-            (.key | test("^[A-Z0-9]+_GBP$")) and
-            (.value | type) == "object" and
-            (.value | has("AMOUNT") | not) and
-            (.value | has("LAST_BUY_DATE") | not) and
-            (.value | has("PENDING_ORDER") | not) and
-            (.value.TIME | type) == "string" and
-            (.value.TIME | test("^([01][0-9]|2[0-3]):[0-5][0-9]$")) and
-            (.value.AMOUNT_GBP | type) == "number" and
-            (.value.AMOUNT_GBP | isfinite) and
-            (.value.BUY_ENABLED | type) == "boolean" and
-            (if .value.BUY_ENABLED then
-              (.value.AMOUNT_GBP >= 5 and .value.AMOUNT_GBP <= 1000)
-            else
-              (.value.AMOUNT_GBP >= 0 and .value.AMOUNT_GBP <= 1000)
-            end) and
-            (
-              (.value | has("DYNAMIC_DCA") | not) or
-              .value.DYNAMIC_DCA == null or
-              (
-                (.value.DYNAMIC_DCA | type) == "object" and
-                (
-                  (.value.DYNAMIC_DCA | has("ENABLED") | not) or
-                  (.value.DYNAMIC_DCA.ENABLED | type) == "boolean"
-                ) and
-                (
-                  (.value.DYNAMIC_DCA | has("THRESHOLD_PERCENT") | not) or
-                  (
-                    (.value.DYNAMIC_DCA.THRESHOLD_PERCENT | type) == "number" and
-                    (.value.DYNAMIC_DCA.THRESHOLD_PERCENT | isfinite)
-                  )
-                ) and
-                (
-                  (.value.DYNAMIC_DCA | has("REDUCED_MULTIPLIER") | not) or
-                  (
-                    (.value.DYNAMIC_DCA.REDUCED_MULTIPLIER | type) == "number" and
-                    (.value.DYNAMIC_DCA.REDUCED_MULTIPLIER | isfinite) and
-                    .value.DYNAMIC_DCA.REDUCED_MULTIPLIER > 0 and
-                    .value.DYNAMIC_DCA.REDUCED_MULTIPLIER <= 1
-                  )
-                )
-              )
-            )
-          ) and
-          ($state | type) == "object" and all($state | to_entries[];
-            (.key | test("^[A-Z0-9]+_GBP$")) and
-            (.value | type) == "object" and
-            ((if (.value | has("LAST_BUY_DATE")) then .value.LAST_BUY_DATE else "" end) as $last_buy |
-              ($last_buy | type) == "string" and
-              (
-                $last_buy == "" or
-                (try (
-                  ($last_buy | strptime("%Y-%m-%d") | strftime("%Y-%m-%d"))
-                  == $last_buy
-                ) catch false)
-              )
-            ) and
-            ((if (.value | has("PENDING_ORDER")) then .value.PENDING_ORDER else null end) as $pending |
-              $pending == null or (
-                ($pending | type) == "object" and
-                ($pending.client_order_id | type) == "string" and
-                ($pending.client_order_id | test("^dca-[0-9a-f]{14}$")) and
-                ($pending.trade_date | type) == "string" and
-                (try (
-                  ($pending.trade_date | strptime("%Y-%m-%d") | strftime("%Y-%m-%d"))
-                  == $pending.trade_date
-                ) catch false) and
-                ($pending.amount_gbp | type) == "number" and
-                ($pending.amount_gbp | isfinite) and
-                ($pending.amount_gbp >= 5 and $pending.amount_gbp <= 1000)
-              )
-            )
-          )
-        ' >/dev/null; then
-          echo "Invalid GBP rules or execution state. Refusing to load trading code." >&2
-          exit 1
-        fi
-        
-        # Get current time in target timezone
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-        CURRENT_HM=$(TZ="$TIMEZONE" date +"%H:%M")
-        CURRENT_YMD=$(TZ="$TIMEZONE" date +"%Y-%m-%d")
-        echo "Current Time ($TIMEZONE): $CURRENT_HM"
-        
-        # Convert HH:MM to minutes since midnight for comparison
-        IFS=':' read -r H M <<< "$CURRENT_HM"
-        CUR_MINS=$(( 10#$H * 60 + 10#$M ))
-        
-        # Run if any enabled target is due and has not bought today.
-        SHOULD_RUN="false"
-
-        if jq -e 'any(.[]; .PENDING_ORDER != null)' <<< "$DCA_EXECUTION_STATE" >/dev/null; then
-          echo "A durable Kraken order intent requires reconciliation." >&2
-          SHOULD_RUN="true"
-        fi
-
-        while [ "$SHOULD_RUN" != "true" ] && IFS=$'\t' read -r SYMBOL TARGET_TIME LAST_BUY ENABLED; do
-        
-            if [ "$ENABLED" != "true" ]; then
-                continue
-            fi
-            
-            if [ "$LAST_BUY" == "$CURRENT_YMD" ]; then
-                echo "Skipping $SYMBOL: Already bought today ($LAST_BUY)"
-                continue
-            fi
-            
-            # TIME was validated above, so arithmetic is safe here.
-            IFS=':' read -r TH TM <<< "$TARGET_TIME"
-            TGT_MINS=$(( 10#$TH * 60 + 10#$TM ))
-            DIFF=$(( CUR_MINS - TGT_MINS ))
-            
-            echo "Checking $SYMBOL: Target $TARGET_TIME vs Now $CURRENT_HM (Diff ${DIFF}m)" >&2
-            
-            if [ "$DIFF" -ge -5 ]; then
-                echo "✅ MATCH: $SYMBOL needs trading." >&2
-                SHOULD_RUN="true"
-                break
-            fi
-            
-        done < <(
-          printf '%s' "$DCA_TARGET_MAP" | jq -r --argjson state "$DCA_EXECUTION_STATE" '
-            to_entries[] |
-            [.key, .value.TIME, ($state[.key].LAST_BUY_DATE // ""), .value.BUY_ENABLED] |
-            @tsv
-          '
-        )
-        
-        echo "should_run=$SHOULD_RUN" >> "$GITHUB_OUTPUT"
-
-    - name: Checkout repository
-      if: steps.check.outputs.should_run == 'true'
-      uses: actions/checkout@v4
-
-    - name: Set up Python
-      if: steps.check.outputs.should_run == 'true'
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
-        cache: 'pip'
-
-    - name: Install dependencies
-      if: steps.check.outputs.should_run == 'true'
-      run: pip install --upgrade pip && pip install -r requirements.txt
-
-    - name: Run DCA Trader
-      if: steps.check.outputs.should_run == 'true'
-      env:
-        # Secrets
-        KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-        KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-        DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        GIST_ID: ${{ secrets.GIST_ID }}
-        GIST_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }} # Using PAT for gist logging
-        GHOSTFOLIO_TOKEN: ${{ secrets.GHOSTFOLIO_TOKEN }}
-        
-        # Variables configuration
-        DCA_TARGET_MAP: ${{ vars.DCA_TARGET_MAP }}
-        DCA_EXECUTION_STATE: ${{ vars.DCA_EXECUTION_STATE || '{}' }}
-        GHOSTFOLIO_URL: ${{ vars.GHOSTFOLIO_URL || 'https://ghostfol.io' }}
-        PORTFOLIO_ACCOUNT_MAP: ${{ vars.PORTFOLIO_ACCOUNT_MAP }}
-        
-        # Timezone for logging/checks
-        TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Bangkok' }}
-      run: python crypto_dca.py
-
+      - name: Run fail-closed DCA trader
+        env:
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GH_PAT_FOR_VARS: ${{ secrets.GH_PAT_FOR_VARS }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GHOSTFOLIO_TOKEN: ${{ secrets.GHOSTFOLIO_TOKEN }}
+          DCA_TARGET_MAP: ${{ vars.DCA_TARGET_MAP }}
+          DCA_ANALYSIS_STATE: ${{ vars.DCA_ANALYSIS_STATE || '{}' }}
+          DCA_EXECUTION_STATE: ${{ vars.DCA_EXECUTION_STATE || '{}' }}
+          GHOSTFOLIO_URL: ${{ vars.GHOSTFOLIO_URL || 'https://ghostfol.io' }}
+          PORTFOLIO_ACCOUNT_MAP: ${{ vars.PORTFOLIO_ACCOUNT_MAP }}
+          TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Bangkok' }}
+          DCA_SYMBOLS_JSON: ${{ inputs.symbols_json || '' }}
+        run: python -u crypto_dca.py

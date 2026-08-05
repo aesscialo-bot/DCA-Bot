@@ -1,328 +1,235 @@
 # Kraken GBP DCA Bot
 
-This application automates GBP-denominated spot purchases on Kraken. A rule such as `BTC_GBP` targets Kraken's `BTC/GBP` market, and `AMOUNT_GBP` is submitted directly as the GBP order cost. There is no budget-currency conversion in the trading path.
+This repository is the production source for a cloud-hosted Discord DCA bot. It trades only Kraken spot markets quoted in GBP: `BTC/GBP`, `ETH/GBP`, `SOL/GBP`, and `ADA/GBP`.
 
-Railway keeps the Discord controller and five-minute scheduler online. GitHub Actions performs analysis, trading, portfolio reporting, and serialized configuration writes. Real orders remain protected by `BUY_ENABLED`; keep every target disabled until its amount and Kraken's current market minimum have been checked.
+There is no THB conversion, Bitkub path, ROI-controlled spend, or direct Discord buy command. User-owned GBP budgets select the spend after a deterministic market-regime decision. Gemini may explain a result, but it cannot choose the regime, amount, or execution time.
 
-## What each file does
+## Where it runs
 
-| File | Role |
-| --- | --- |
-| `discord_bot.py` | Railway-hosted Discord interface, status reader, five-minute scheduler, and workflow dispatcher. |
-| `crypto_analysis.py` | Reads public Kraken `COIN/GBP` candles, calculates timing statistics, optionally asks Gemini for a summary, and proposes `TIME` updates. |
-| `crypto_dca.py` | Validates rules and execution state, manages durable order intent, runs or reconciles a Kraken buy, and records confirmed completion. |
-| `kraken_client.py` | Authenticated Kraken Spot client for strict GBP symbols, deterministic order IDs, duplicate reconciliation, quote-cost orders, terminal-fill polling, and fee normalization. |
-| `portfolio_balance.py` | Read-only configured-asset holdings, GBP cash, GBP valuation, and paginated monthly buy history. |
-| `gist_logger.py` | Optional GBP trade log in a dedicated Gist file. |
-| `portfolio_logger.py` | Optional Ghostfolio adapter. Any provider-specific conversion remains isolated from Kraken execution. |
-| `.github/workflows/crypto_analysis.yml` | Scheduled or manual analysis and conflict-aware `TIME` merging. |
-| `.github/workflows/daily_dca.yml` | Fail-closed due check, order execution, and pending-intent recovery. |
-| `.github/workflows/update_dca_config.yml` | Serialized, one-field rule updates requested by Discord. |
-| `.github/workflows/portfolio_check.yml` | Read-only portfolio reporting. |
-
-## Where the app runs
-
-| Component | Location | Lifetime |
-| --- | --- | --- |
-| Discord interface and five-minute scheduler | Railway | Continuous |
-| Analysis, trading, configuration writer, and portfolio jobs | GitHub Actions | Only while a workflow runs |
-| Trading rules | GitHub repository variable `DCA_TARGET_MAP` | Persistent and repository-wide |
-| Execution state | GitHub repository variable `DCA_EXECUTION_STATE` | Persistent and repository-wide |
-| GBP wallet and orders | Kraken | Persistent |
-| Source code | GitHub branch and local clone | Persistent |
-
-Leaving Discord open on a phone is not required. Railway keeps the bot online; Discord is only the interface used to send commands.
+The Discord controller and five-minute scheduler run continuously on Railway. GitHub Actions performs market analysis, configuration writes, portfolio checks, and authenticated Kraken execution. Kraken credentials stay in GitHub Actions; Railway never receives them. Discord can be closed on every phone and computer without stopping the worker.
 
 ```mermaid
 flowchart LR
-    U["Discord user"] --> R["Railway Discord controller"]
-    R -->|"queue one-field edit"| C["Update DCA Configuration workflow"]
-    C -->|"serialized merge"| RULES["DCA_TARGET_MAP rules"]
-    R -->|"read status"| RULES
-    R -->|"read status and recovery"| STATE["DCA_EXECUTION_STATE"]
-    R -->|"dispatch every five minutes when due"| TRADE["Daily DCA workflow"]
-    ANALYSIS["Crypto Analysis workflow"] -->|"conflict-aware TIME merge"| RULES
-    TRADE -->|"read rules"| RULES
-    TRADE -->|"read and write trader state"| STATE
-    TRADE -->|"GBP spot order or reconciliation"| K["Kraken Spot"]
-    PORT["Portfolio workflow"] -->|"read balances and fills"| K
-    ANALYSIS -->|"public GBP candles"| K
+    U["Allowlisted Discord user"] --> R["Railway: Discord controller and 5-minute scheduler"]
+    R --> C["Serialized configuration workflow"]
+    R --> A["Deterministic analysis workflow"]
+    R --> T["Due-decision trading workflow"]
+    C --> RULES["DCA_TARGET_MAP: user budgets and enable flags"]
+    A --> STATE["DCA_ANALYSIS_STATE: regimes and absolute times"]
+    RULES --> A
+    RULES --> R
+    STATE --> R
+    RULES --> T
+    STATE --> T
+    T --> EXEC["DCA_EXECUTION_STATE: last buys and pending intents"]
+    T --> K["Kraken GBP spot markets"]
+    T -. "optional post-fill logging" .-> L["Gist or Ghostfolio"]
 ```
 
-## Two repository variables, with separate ownership
+The production deployment follows `main`. Changes are developed on a branch, checked by CI, merged through a pull request, and then automatically deployed by Railway.
 
-### `DCA_TARGET_MAP`: user-managed rules
+## The three persistent state documents
 
-`DCA_TARGET_MAP` is a non-empty JSON object whose keys end in `_GBP`. It contains desired behavior only; it must not contain execution history or an order intent.
+### User-owned rules
+
+`DCA_TARGET_MAP` contains exactly four entries. Disabled targets may use zero while they are being configured. Enabling requires both budgets to be from £5 through £1,000 and at or above Kraken's current market minimum.
 
 ```json
 {
   "BTC_GBP": {
-    "TIME": "02:45",
-    "AMOUNT_GBP": 5,
-    "BUY_ENABLED": false,
-    "DYNAMIC_DCA": {
-      "ENABLED": false,
-      "THRESHOLD_PERCENT": -2,
-      "REDUCED_MULTIPLIER": 0.5
+    "REGIME_AMOUNTS_GBP": {
+      "LOW": 0,
+      "UP": 0
+    },
+    "BUY_ENABLED": false
+  },
+  "ETH_GBP": {
+    "REGIME_AMOUNTS_GBP": {
+      "LOW": 0,
+      "UP": 0
+    },
+    "BUY_ENABLED": false
+  },
+  "SOL_GBP": {
+    "REGIME_AMOUNTS_GBP": {
+      "LOW": 0,
+      "UP": 0
+    },
+    "BUY_ENABLED": false
+  },
+  "ADA_GBP": {
+    "REGIME_AMOUNTS_GBP": {
+      "LOW": 0,
+      "UP": 0
+    },
+    "BUY_ENABLED": false
+  }
+}
+```
+
+Budget changes are atomic: LOW and UP are changed together, and only while that target is disabled. A budget change invalidates the old analysis fingerprint, so the target must be analyzed again before it can be enabled.
+
+### Analysis decisions
+
+`DCA_ANALYSIS_STATE` is generated by analysis, not edited by users. Each asset has `STATUS`, `REGIME`, `AMOUNT_TIER`, `EXECUTE_AT`, `VALID_UNTIL`, `DECISION_ID`, `RULES_HASH`, `SIGNALS`, and `TIMING`.
+
+```json
+{
+  "VERSION": 1,
+  "GENERATED_AT": "2026-08-05T21:00:00Z",
+  "TARGETS": {
+    "BTC_GBP": {
+      "STATUS": "READY",
+      "REGIME": "SIDEWAYS",
+      "AMOUNT_TIER": "LOW",
+      "EXECUTE_AT": "2026-08-06T02:15:00Z",
+      "VALID_UNTIL": "2026-08-06T03:15:00Z",
+      "DECISION_ID": "example-decision-id",
+      "RULES_HASH": "64-character-lowercase-sha256",
+      "SIGNALS": {},
+      "TIMING": {
+        "ANALYZED_AT": "2026-08-05T21:00:00Z"
+      }
     }
   }
 }
 ```
 
-- `TIME` is `HH:MM` in the configured IANA timezone.
-- `AMOUNT_GBP` is a direct pound order cost, not an exchange-rate input.
-- `BUY_ENABLED=false` prevents new scheduled and manual buys.
-- `DYNAMIC_DCA` can reduce the configured GBP cost when the optional Ghostfolio ROI rule applies.
-- Unsupported symbols, missing fields, and invalid types fail closed.
-- Enabled targets must be between GBP 5 and GBP 1000. A disabled target may temporarily use GBP 0 during migration.
-- Kraken validates its live cost and base-amount minimum before a new order is submitted.
+The real state always contains all four targets. Missing, insufficient, stale, or failed analysis produces an `ERROR` target, sends a Discord alert, and cannot be reused for a purchase.
 
-Discord changes only `TIME`, `AMOUNT_GBP`, or `BUY_ENABLED`. It dispatches `update_dca_config.yml`, which fetches the latest rules and applies exactly one validated field. Analysis may change only `TIME`, and skips an update if that field changed after its analysis snapshot. These writers and the trader share the `dca-target-map-writers` concurrency group with `queue: max`, so writes wait instead of cancelling one another.
+### Execution state
 
-### `DCA_EXECUTION_STATE`: trader-owned state
+`DCA_EXECUTION_STATE` is trader-owned. `LAST_BUY_DATE` enforces one purchase per asset per Asia/Bangkok calendar day. A durable `PENDING_ORDER` is saved before Kraken submission and includes its originating `decision_id` so ambiguous requests can be reconciled without duplicating an order.
 
-`DCA_EXECUTION_STATE` contains completion dates and any unresolved order intent. An empty object is valid and is the recommended initial value.
+Never hand-edit or delete a pending intent to force a retry. Inspect Kraken first.
 
-```json
-{
-  "BTC_GBP": {
-    "LAST_BUY_DATE": "2026-08-04"
-  }
-}
-```
+## Deterministic analysis
 
-While an order is unresolved, the trader stores a durable intent before Kraken can receive a create request:
+Analysis runs daily at 04:00 Asia/Bangkok and ignores every incomplete candle.
 
-```json
-{
-  "BTC_GBP": {
-    "LAST_BUY_DATE": "",
-    "PENDING_ORDER": {
-      "client_order_id": "dca-0123456789abcd",
-      "trade_date": "2026-08-04",
-      "amount_gbp": 5
-    }
-  }
-}
-```
+The daily/weekly regime rules are:
 
-Only the trader writes this variable. Discord and the quick check read it for status, same-day suppression, and recovery dispatches. Do not hand-edit or remove `PENDING_ORDER` to force a retry: an unresolved create request may already have reached Kraken.
+- `UPTREND`: on two consecutive completed daily candles, close is above SMA150 and EMA20 is above EMA50; the completed weekly close is above weekly EMA20; and the SMA150 20-day slope is positive.
+- `DOWNTREND`: the exact inverse conditions.
+- `SIDEWAYS`: everything else.
 
-## End-to-end behavior
+`UPTREND` selects the UP budget. `DOWNTREND` and `SIDEWAYS` select the LOW budget.
 
-### Analysis
-
-Kraken Spot REST exposes at most 720 recent OHLC candles. At a 15-minute interval that covers about 7.5 days, so the bot evaluates 3-, 5-, and 7-day windows on the same `COIN/GBP` market it trades. See [Kraken Get OHLC Data](https://docs.kraken.com/api-reference/market-data/get-ohlc-data).
+For timing, the latest 672 contiguous completed 15-minute Kraken candles are split into rolling 24-hour blocks and scored over 3-, 5-, and 7-day windows. This remains inside Kraken's 720-row OHLC limit even when analysis is run manually later in the Bangkok day. The Python engine applies fixed median-miss, win-rate, recency-override, and tie-break rules. `EXECUTE_AT` is the next selected occurrence at least 30 minutes after analysis. The purchase window opens five minutes before it and closes 60 minutes after it.
 
 ```mermaid
 flowchart TD
-    S["Scheduled or manual analysis"] --> SNAP["Read a snapshot of DCA_TARGET_MAP"]
-    SNAP --> O["Fetch public 15-minute Kraken GBP candles"]
-    O --> Q["Compare 3, 5, and 7 day timing metrics"]
-    Q --> G{"Gemini key configured?"}
-    G -->|"yes"| AI["Request structured recommendation"]
-    G -->|"no"| REC["Use quantitative recommendation"]
-    AI --> REC
-    REC --> REPORT["Send Discord recommendation report"]
-    REC --> LIVE["Fetch the latest rules in the writer queue"]
-    LIVE --> SAME{"Live TIME still matches the snapshot?"}
-    SAME -->|"yes"| MERGE["Merge TIME only"]
-    SAME -->|"no"| SKIP["Preserve the concurrent edit"]
-    MERGE --> RESULT["Record applied result in the workflow"]
-    SKIP --> RESULT
+    S["04:00 Bangkok analysis"] --> D["Completed daily and weekly candles"]
+    S --> M["Completed 15-minute candles"]
+    D --> G["Deterministic regime and amount tier"]
+    M --> W["Deterministic 3/5/7-day timing score"]
+    G --> X["Signed decision bound to the live rules hash"]
+    W --> X
+    X --> P{"Complete and fresh?"}
+    P -- "yes" --> READY["READY with absolute execution window"]
+    P -- "no" --> ERROR["ERROR, Discord alert, skip purchase"]
 ```
 
-The merge preserves amount, enabled state, and dynamic settings. It never reads or writes execution state.
+## Discord controls
 
-### Scheduling
+Mutating commands require the configured channel, an allowlisted user, and the exact `!dca ` prefix.
 
-Railway evaluates the configured timezone on clock-aligned five-minute ticks. It selects a dispatch for enabled targets from five minutes before through sixty minutes after their target time. A temporary dispatch guard suppresses rapid duplicate workflow requests; the next state refresh confirms whether a fill completed. Any durable pending intent is dispatched for recovery even when the normal target window is not due. Once a workflow is running, the trader evaluates every symbol: pending symbols are reconciliation-only, and any other enabled, unbought target whose time has already passed may run as a same-local-day catch-up even if it is more than sixty minutes late.
+```text
+!dca set BTC amounts to 10 low and 20 up
+!dca disable BTC
+!dca enable BTC
+!dca analyze BTC
+!dca analyze all
+show status
+!dca health
+```
 
-GitHub also schedules `daily_dca.yml` at 22:00 UTC (05:00 Bangkok) and 16:55 UTC (23:55 Bangkok). The late run is a same-local-day catch-up if Railway missed an earlier target, while still covering targets through 23:59 within the five-minute early window. The workflow's quick check validates both JSON variables before it checks out code or loads credentials. A pending intent always causes the trader to run in recovery mode.
+`!dca enable BTC` returns an exact confirmation phrase. The review shows both budgets, the latest regime, effective amount, next execution time, decision age, and maximum aggregate daily exposure. The serialized writer re-fetches the rules, decision, and execution state; compares the target and global four-asset fingerprints; blocks while any pending Kraken reconciliation exists; and checks Kraken's live minimum before setting `BUY_ENABLED=true`.
 
-### Trade execution and recovery
+There is no command that places an immediate order.
+
+## Execution safety
 
 ```mermaid
 flowchart TD
-    S["Railway dispatch, manual run, or safety schedule"] --> Q["Validate rules and execution state"]
-    Q --> LOOP["For each configured or pending GBP symbol"]
-    LOOP --> P{"This symbol has a pending order intent?"}
-    P -->|"yes"| RO["Reconcile that client ID only; never create"]
-    P -->|"no"| D{"Enabled, due, and not completed today?"}
-    D -->|"no"| X["Exit without an order"]
-    D -->|"yes"| A["Apply optional Dynamic DCA multiplier"]
-    A --> R1["Re-read and compare live rules"]
-    R1 --> I["Persist deterministic client ID, date, and GBP amount"]
-    I --> R2["Re-read live rules again"]
-    R2 --> K["Find matching Kraken order or submit one GBP quote-cost order"]
-    RO --> K2["Find and poll matching Kraken order"]
-    K --> OUT{"Known terminal result?"}
-    K2 --> OUT
-    OUT -->|"confirmed fill"| DONE["Atomically set LAST_BUY_DATE and remove PENDING_ORDER"]
-    OUT -->|"known no fill"| CLEAR["Safely remove PENDING_ORDER"]
-    OUT -->|"unknown"| LOCK["Keep PENDING_ORDER locked for later reconciliation or review"]
-    DONE --> LOG["Notify Discord and run optional loggers"]
-    X --> NEXT["Continue with remaining symbols"]
-    CLEAR --> NEXT
-    LOCK --> NEXT
-    LOG --> NEXT
-    NEXT --> LOOP
+    D["Railway dispatches due asset IDs"] --> V1["Trader validates rules, decision, window, and execution state"]
+    V1 --> P{"Pending intent exists?"}
+    P -- "yes" --> R["Reconcile only; never create a second order"]
+    P -- "no" --> V2["Re-fetch live rules, analysis, and last-buy state"]
+    V2 --> I["Persist pending intent with decision ID"]
+    I --> V3["Re-fetch live rules and decision immediately before submission"]
+    V3 --> K["Kraken market buy using direct GBP quote cost; fee from purchased asset"]
+    K --> F["Wait for terminal fill and normalize fees"]
+    F --> E["Set LAST_BUY_DATE and clear pending intent"]
+    E --> N["Discord result and optional post-fill loggers"]
 ```
 
-Important safeguards:
-
-- The executor accepts Kraken Spot `COIN/GBP` targets only.
-- A deterministic 18-character client order ID identifies one market and local trade date.
-- A new intent is durable before order creation. If the process stops after submission, the next run reconciles that exact ID and cannot create a replacement.
-- If Kraken has no matching open or closed order for an existing intent, the outcome is treated as unknown and the intent remains locked for manual review.
-- A confirmed fill and `LAST_BUY_DATE` update are one trader-state transition. If that state write fails, the pending lock remains.
-- A failed or unconfirmed order is not logged as a successful purchase.
-- The trader re-reads live rules before intent creation and again before submission, so an intervening disable or amount change stops a new order safely.
-- There is no direct purchase command. Configuration writes require an allowlisted Discord user and the exact `!dca ` prefix; enabling also requires the exact second confirmation returned by the bot.
-- The enable workflow carries the confirmed amount and time snapshot into the writer queue and refuses to enable if either changed before the queued update executes.
-- Gist and Ghostfolio failures are non-blocking after a confirmed fill.
-- The Kraken API key must never have withdrawal permission.
-
-### Fee accounting
-
-Kraken may report a fee in GBP or in the purchased asset. The normalized fields keep actual cash debit separate from a reporting equivalent:
-
-| Field | Meaning |
-| --- | --- |
-| `cost_gbp` | Confirmed GBP order cost. |
-| `gbp_fee_debit` | Fee actually charged from the GBP balance. |
-| `fee_gbp` | GBP equivalent of all reported fee entries, regardless of fee currency. |
-| `spent_gbp` / `amount_gbp` | Actual GBP balance debit: `cost_gbp + gbp_fee_debit`. |
-| `received` | Gross purchased quantity minus any fee charged in the purchased asset. |
-
-If a fee is charged in the purchased asset, its `fee_gbp` equivalent is informational. It reduces `received`; it is not added again to the GBP debit.
-
-### Portfolio reporting
-
-```mermaid
-flowchart TD
-    S["Manual, monthly, or main-branch push trigger"] --> C["Read configured COIN_GBP markets"]
-    C --> B["Fetch total Kraken balances, including locked funds"]
-    B --> G["Include total GBP cash"]
-    G --> T["Fetch Kraken GBP tickers"]
-    T --> V["Value configured assets and add GBP cash"]
-    V --> R{"Full report?"}
-    R -->|"no"| N["Send holdings report"]
-    R -->|"yes"| H["Fetch Kraken buy fills for the latest completed 5th-to-5th window"]
-    H --> N
-```
-
-The portfolio workflow is read-only. It does not place, edit, or cancel orders, or move funds. Its total covers configured DCA assets plus GBP cash; other Kraken assets are identified as excluded.
+The trader fails closed on stale/error decisions, a missed window, a rules-hash change, a decision-ID change, an already-bought date, an unresolved pending order, or an unprovable Kraken minimum. Kraken is asked to charge the fee from the purchased base asset, and cost precision is rejected if it would raise the GBP cash debit above the selected budget. Gist and Ghostfolio run only after a confirmed fill and cannot change spend.
 
 ## GitHub Actions
 
-| Workflow | Trigger | Result |
-| --- | --- | --- |
-| `crypto_analysis.yml` | Daily at 21:00 UTC or manual | Analyzes Kraken GBP markets and conflict-checks `TIME` recommendations against the latest rules. |
-| `daily_dca.yml` | Railway dispatch, manual, or fallback schedules at 22:00 and 16:55 UTC | Validates both variables, reconciles pending intents, and trades only when otherwise due and enabled. |
-| `update_dca_config.yml` | Discord workflow dispatch | Applies one validated rule field against the latest map through the shared writer queue. |
-| `portfolio_check.yml` | Manual, monthly on the 5th at 00:00 UTC, or push to `main` | Sends a read-only Kraken portfolio report in GBP. |
+| Workflow | Trigger | Responsibility |
+|---|---|---|
+| `ci.yml` | Pull request and push to `main` | Compile, run unit tests, validate workflow YAML, and build the Railway image without production credentials. |
+| `crypto_analysis.yml` | Daily at 21:00 UTC or manual | Produce four deterministic decisions and Discord summaries. |
+| `daily_dca.yml` | Railway dispatch or manual | Revalidate live state, reconcile pending intents, and submit only due enabled decisions. |
+| `update_dca_config.yml` | Discord dispatch or manual | Atomically update both budgets, toggle an enable flag, or validate a dry run. |
+| `portfolio_check.yml` | Monthly or manual | Read-only Kraken portfolio reporting for the four configured GBP markets. |
 
-GitHub schedules always use the workflow from the repository's default branch. A feature branch can be dispatched manually, but its schedule does not become production until it is merged.
+Each durable document has its own `queue: max` writer group: rule changes serialize with rule changes, analysis writes with analysis writes, and execution-state changes with trader runs. The groups remain separate so a disable can be applied while a trader is running and caught by its final live-state check.
 
-## Required setup
+## Production configuration
 
-### Kraken API permissions
+GitHub Actions secrets:
 
-Use one API key with only the permissions the bot needs:
+- `KRAKEN_API_KEY` and `KRAKEN_API_SECRET`: query and order permissions only; never withdrawal permission.
+- `GH_PAT_FOR_VARS`: repository-variable reads and writes only.
+- `DISCORD_WEBHOOK_URL`: workflow reports and alerts.
+- `GEMINI_API_KEY`: optional explanation text.
+- `GIST_ID` and `GIST_TOKEN`: optional post-fill logging.
+- `GHOSTFOLIO_TOKEN`: optional post-fill logging.
 
-- Query Funds
-- Query Open Orders & Trades
-- Query Closed Orders & Trades
-- Create & Modify Orders
+GitHub repository variables:
 
-Do not grant Withdraw Funds. Without portfolio permissions, balance and history reports fail; without order permission, buys fail safely.
+- `DCA_TARGET_MAP`
+- `DCA_ANALYSIS_STATE`
+- `DCA_EXECUTION_STATE`
+- `TIMEZONE=Asia/Bangkok`
+- Optional `GHOSTFOLIO_URL` and `PORTFOLIO_ACCOUNT_MAP`
 
-### GitHub repository secrets
+Railway variables:
 
-| Secret | Use |
-| --- | --- |
-| `KRAKEN_API_KEY` | Kraken authentication. |
-| `KRAKEN_API_SECRET` | Kraken signing secret. |
-| `DISCORD_WEBHOOK_URL` | Analysis, execution, and portfolio notifications. |
-| `GEMINI_API_KEY` | Optional AI analysis and Railway command classification. |
-| `GH_PAT_FOR_VARS` | Serialized rule writes, trader-state writes, and optional Gist logging. |
-| `GIST_ID` | Optional GBP trade-log Gist. |
-| `GHOSTFOLIO_TOKEN` | Optional Ghostfolio logging and Dynamic DCA ROI. |
+- `DISCORD_BOT_TOKEN`
+- `DISCORD_CHANNEL_ID`
+- `DISCORD_ALLOWED_USERS`
+- `GH_PAT`
+- `GITHUB_REPO=aesscialo-bot/DCA-Bot`
+- `GITHUB_WORKFLOW_REF=main`
+- `TIMEZONE=Asia/Bangkok`
+- `DCA_CRON_ENABLED=true|false`
+- Optional `GEMINI_API_KEY`
 
-### GitHub repository variables
+## Safe release sequence
 
-| Variable | Owner and use |
-| --- | --- |
-| `DCA_TARGET_MAP` | User-managed GBP targets and rules; Discord and analysis use serialized writers. |
-| `DCA_EXECUTION_STATE` | Trader-owned completion dates and durable pending intents; initialize to `{}`. |
-| `TIMEZONE` | IANA timezone, default `Asia/Bangkok`. |
-| `GHOSTFOLIO_URL` | Optional Ghostfolio base URL. |
-| `PORTFOLIO_ACCOUNT_MAP` | Optional JSON map from base asset to Ghostfolio account ID. |
-
-### Railway variables
-
-| Variable | Use |
-| --- | --- |
-| `DISCORD_BOT_TOKEN` | Discord bot login. |
-| `GEMINI_API_KEY` | Natural-language command classifier. |
-| `GH_PAT` | GitHub workflow dispatch and repository-variable reads. |
-| `GITHUB_REPO` | `owner/repository`. |
-| `GITHUB_WORKFLOW_REF` | Branch dispatched by Railway, such as `codex/kraken-gbp` during review or `main` after merge. |
-| `DISCORD_CHANNEL_ID` | Optional single allowed channel. |
-| `DISCORD_ALLOWED_USERS` | Comma-separated user IDs allowed to run actions. |
-| `DCA_CRON_ENABLED` | `true` enables Railway's five-minute dispatcher. |
-| `TIMEZONE` | Same timezone as the repository workflows. |
-
-Kraken credentials are not required in Railway. Railway dispatches GitHub Actions; authenticated trading and portfolio calls happen in those jobs.
-
-## Discord interface
-
-Examples:
-
-- `show status`
-- `!dca set BTC amount to 25 pounds`
-- `!dca set BTC time to 02:45`
-- `!dca disable BTC`
-- `!dca enable BTC`, followed by the bot's exact confirmation command
-- `!dca analyze BTC`
-- `check portfolio`
-
-The Discord and execution guardrails accept GBP 5 through GBP 1000 for enabled targets; Kraken's live per-market minimum remains authoritative. A successful configuration reply means the change was queued, not yet applied. Direct purchase commands are intentionally unavailable.
-
-## Optional logging
-
-- Gist rows contain order cost, actual GBP fee debit, total fee GBP equivalent, total GBP debit, GBP unit prices, net received quantity, Kraken order ID, and Ghostfolio status.
-- Ghostfolio is optional. Its fee field uses the economic fee equivalent while the comment preserves the actual GBP cash debit. Any provider conversion occurs only inside the adapter and never changes the Kraken order, rules, Gist GBP values, Discord result, or portfolio report.
+1. Set Railway `DCA_CRON_ENABLED=false`.
+2. Confirm all four rules are disabled and inspect Kraken for bot-tagged open or same-day orders.
+3. Run CI on a pull request and merge only when it is green.
+4. Confirm Railway deployed the exact merge SHA from `main`.
+5. Install the final rules, analysis, and execution schemas while scheduling remains off.
+6. Run the portfolio workflow, four-asset analysis, disabled trader, and configuration-writer dry run.
+7. Confirm Railway reports Discord connected, four valid targets, and its scheduler state.
+8. Set `DCA_CRON_ENABLED=true` while every `BUY_ENABLED` value is still false.
+9. Set budgets through Discord, analyze that asset again, review the exposure, and use the exact enable confirmation only when ready.
 
 ## Local verification
 
-```powershell
-$env:PYTHONUTF8 = "1"
-.venv\Scripts\python.exe -m unittest discover -s tests -v
-.venv\Scripts\python.exe -m py_compile crypto_analysis.py crypto_dca.py discord_bot.py gist_logger.py kraken_client.py portfolio_balance.py portfolio_logger.py
-```
-
-Docker is only needed to reproduce the Railway Discord service locally:
+Use Python 3.12:
 
 ```powershell
-docker build -t dca-discord-bot .
+python -m pip install -r requirements.txt -r bot_requirements.txt
+python -m compileall -q .
+python -m unittest discover -s tests -v
+docker build -t dca-bot-local .
 ```
 
-Do not run a second Discord instance while Railway is connected with the same bot token.
-
-## Safe post-merge migration
-
-Repository variables are shared by every branch, while scheduled workflows run from the default branch. Migrate only after the new code is merged, and keep all trading disabled throughout:
-
-1. Set Railway `DCA_CRON_ENABLED=false` and confirm no target is enabled before the merge.
-2. Merge the reviewed branch so the default branch contains the split rules/state validation and pending-intent safeguards.
-3. Set `DCA_TARGET_MAP` to the canonical `COIN_GBP` / `AMOUNT_GBP` schema above with every `BUY_ENABLED` value `false`. Do not include `LAST_BUY_DATE` or `PENDING_ORDER` in this variable.
-4. Create `DCA_EXECUTION_STATE` if it does not exist. Migrate each existing `LAST_BUY_DATE` from the old rules into this variable, and preserve any state already present. Use `{}` only when Kraken history and the previous automation state confirm there is no unresolved order and no same-local-day fill that must remain suppressed. Never reset existing state merely to simplify migration.
-5. Point Railway `GITHUB_WORKFLOW_REF` to `main`, redeploy it, and confirm status shows the expected GBP rules and execution state.
-6. Run the read-only portfolio workflow and a manual disabled `daily_dca.yml` check. The disabled trade run should stop before Kraken authentication.
-7. Re-enable the Railway scheduler while targets remain disabled.
-8. Set the intended GBP amount, verify Kraken's live minimum, then enable one target using the exact two-step Discord confirmation.
-
-No real trade is required to validate deployment.
+Do not run a second Discord worker with the production bot token while Railway is connected.

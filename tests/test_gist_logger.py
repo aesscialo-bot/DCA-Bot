@@ -1,4 +1,6 @@
+import io
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -232,6 +234,33 @@ class GistLoggerTests(unittest.TestCase):
             saved = gist_logger.update_gist_log(self.trade)
 
         self.assertFalse(saved)
+
+    def test_request_failure_does_not_print_secret_url_or_token(self):
+        secret_url = "https://api.github.com/gists/private-gist-secret"
+        secret_token = "github_pat_private_secret"
+        output = io.StringIO()
+        with (
+            patch.multiple(
+                gist_logger,
+                GIST_ID="private-gist-secret",
+                GIST_TOKEN=secret_token,
+                SELECTED_TZ=ZoneInfo("UTC"),
+            ),
+            patch.object(
+                gist_logger.requests,
+                "get",
+                side_effect=requests.RequestException(
+                    f"request to {secret_url} with {secret_token} failed"
+                ),
+            ),
+            redirect_stdout(output),
+        ):
+            saved = gist_logger.update_gist_log(self.trade)
+
+        self.assertFalse(saved)
+        self.assertNotIn(secret_url, output.getvalue())
+        self.assertNotIn(secret_token, output.getvalue())
+        self.assertIn("RequestException", output.getvalue())
 
 
 if __name__ == "__main__":
