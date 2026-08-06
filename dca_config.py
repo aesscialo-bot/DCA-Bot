@@ -37,6 +37,26 @@ ANALYSIS_DECISION_FIELDS = frozenset(
 )
 ANALYSIS_STATE_VERSION = 2
 AMOUNT_POLICY_VERSION = 2
+GIST_DELIVERY_VERSION = 1
+MAX_PENDING_GIST_DELIVERIES = 16
+MAX_GIST_DELIVERY_ROW_BYTES = 2_048
+MAX_EXECUTION_STATE_JSON_BYTES = 40_000
+# A validated row contains no control characters and is serialized with
+# ``ensure_ascii=False``.  Quotes and backslashes are therefore its worst JSON
+# expansion (2x), with the remaining bytes covering the envelope, queue field,
+# and target entry.  Keeping this separate from the 40 KB hard budget lets the
+# executor reserve space for fill evidence before Kraken can receive AddOrder.
+GIST_DELIVERY_RESERVED_JSON_BYTES = 4_608
+GIST_DELIVERY_FIELDS = frozenset(
+    {
+        "version",
+        "delivery_id",
+        "created_at",
+        "symbol",
+        "row",
+        "row_sha256",
+    }
+)
 MIN_ENABLED_AMOUNT_GBP = 5.0
 MAX_AMOUNT_GBP = 1_000.0
 READY_STATUS = "READY"
@@ -322,6 +342,124 @@ def parse_utc_iso(value: Any) -> datetime:
     return parse_iso_datetime(value, "timestamp")
 
 
+def _split_markdown_row(line: str) -> list[str] | None:
+    """Split one Markdown row without treating escaped pipes as separators."""
+
+    if not isinstance(line, str) or not line.startswith("|"):
+        return None
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for character in line:
+        if character == "|" and not escaped:
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(character)
+        escaped = not escaped if character == "\\" else False
+    if current or not line.endswith("|") or len(cells) < 2 or cells[0]:
+        return None
+    return cells[1:]
+
+
+def _unescape_markdown_value(value: str) -> str:
+    result: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] == "\\" and index + 1 < len(value):
+            next_character = value[index + 1]
+            if next_character in {"\\", "|"}:
+                result.append(next_character)
+                index += 2
+                continue
+        result.append(value[index])
+        index += 1
+    return "".join(result)
+
+
+def validate_gist_delivery(value: Mapping[str, Any], target: str) -> dict[str, Any]:
+    """Validate one immutable Portfolio Compass Gist delivery.
+
+    The Kraken crypto order identifier is the durable delivery identity.  The
+    Markdown row is kept byte-for-byte so its digest remains stable across
+    execution-state reads and writes.
+    """
+
+    if target not in TARGET_KEYS:
+        raise ConfigError(f"Unsupported production target: {target}")
+    label = f"DCA_EXECUTION_STATE.{target}.PENDING_GIST_DELIVERIES[]"
+    if not isinstance(value, Mapping):
+        raise ConfigError(f"{label} must be an object")
+    delivery = dict(value)
+    _unexpected_fields(delivery, GIST_DELIVERY_FIELDS, label)
+
+    version = delivery["version"]
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != GIST_DELIVERY_VERSION
+    ):
+        raise ConfigError(f"{label}.version must be {GIST_DELIVERY_VERSION}")
+
+    delivery_id = delivery["delivery_id"]
+    if not isinstance(delivery_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", delivery_id
+    ):
+        raise ConfigError(
+            f"{label}.delivery_id must be a safe nonempty Kraken order identifier"
+        )
+
+    created_at = delivery["created_at"]
+    if not isinstance(created_at, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z",
+        created_at,
+    ):
+        raise ConfigError(f"{label}.created_at must be a canonical UTC ISO timestamp")
+    if parse_iso_datetime(created_at, f"{label}.created_at").utcoffset() != timedelta(0):
+        raise ConfigError(f"{label}.created_at must be a canonical UTC ISO timestamp")
+
+    expected_symbol = TARGET_SYMBOLS[target].split("/", 1)[0]
+    if not isinstance(delivery["symbol"], str) or delivery["symbol"] != expected_symbol:
+        raise ConfigError(f"{label}.symbol must be {expected_symbol}")
+
+    row = delivery["row"]
+    if (
+        not isinstance(row, str)
+        or not row.endswith("\n")
+        or row.count("\n") != 1
+        or "\r" in row
+        or not row.startswith("|")
+        or not row.endswith("|\n")
+    ):
+        raise ConfigError(
+            f"{label}.row must be one Markdown data line ending with a newline"
+        )
+    try:
+        row_bytes = row.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ConfigError(f"{label}.row must be valid UTF-8 text") from exc
+    if len(row_bytes) > MAX_GIST_DELIVERY_ROW_BYTES:
+        raise ConfigError(
+            f"{label}.row must be at most {MAX_GIST_DELIVERY_ROW_BYTES} UTF-8 bytes"
+        )
+    if any(ord(character) < 32 for character in row[:-1]):
+        raise ConfigError(f"{label}.row must not contain control characters")
+    cells = _split_markdown_row(row.removesuffix("\n"))
+    if not cells or len(cells) != 11:
+        raise ConfigError(f"{label}.row must contain exactly 11 Markdown columns")
+    if _unescape_markdown_value(cells[9]) != delivery_id:
+        raise ConfigError(f"{label}.delivery_id must match the crypto order column")
+
+    row_sha256 = delivery["row_sha256"]
+    if not isinstance(row_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", row_sha256
+    ):
+        raise ConfigError(f"{label}.row_sha256 must be a lowercase SHA-256 digest")
+    if row_sha256 != sha256(row_bytes).hexdigest():
+        raise ConfigError(f"{label}.row_sha256 does not match row")
+    return delivery
+
+
 def validate_analysis_decision(target: str, value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate one deterministic per-target analysis result."""
 
@@ -535,11 +673,18 @@ def is_execution_window(
     return execution - timedelta(minutes=5) <= current <= expiry
 
 
+def _execution_state_json_bytes(value: Mapping[str, Any]) -> int:
+    return len(
+        json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+
+
 def validate_execution_state(value: str | Mapping[str, Any]) -> dict[str, Any]:
-    """Validate durable buy dates and pending order intents.
+    """Validate durable buy dates, order intents, and Gist deliveries.
 
     Pending intents must carry the analysis ``DECISION_ID`` that originated the
     order, allowing recovery to reject an intent from an obsolete decision.
+    Pending Gist deliveries retain list order as their FIFO delivery order.
     """
 
     state = _json_object(value, "DCA_EXECUTION_STATE")
@@ -554,7 +699,11 @@ def validate_execution_state(value: str | Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(raw_entry, Mapping):
             raise ConfigError(f"DCA_EXECUTION_STATE.{target} must be an object")
         entry = dict(raw_entry)
-        extra = set(entry) - {"LAST_BUY_DATE", "PENDING_ORDER"}
+        extra = set(entry) - {
+            "LAST_BUY_DATE",
+            "PENDING_ORDER",
+            "PENDING_GIST_DELIVERIES",
+        }
         if extra:
             raise ConfigError(
                 f"DCA_EXECUTION_STATE.{target} contains unsupported fields: "
@@ -645,11 +794,78 @@ def validate_execution_state(value: str | Mapping[str, Any]) -> dict[str, Any]:
                 f"DCA_EXECUTION_STATE.{target}.PENDING_ORDER.created_at",
             )
             pending["amount_gbp"] = pending_amount
+        raw_deliveries = entry.get("PENDING_GIST_DELIVERIES", [])
+        if not isinstance(raw_deliveries, list):
+            raise ConfigError(
+                f"DCA_EXECUTION_STATE.{target}.PENDING_GIST_DELIVERIES must be an array"
+            )
+        if len(raw_deliveries) > MAX_PENDING_GIST_DELIVERIES:
+            raise ConfigError(
+                f"DCA_EXECUTION_STATE.{target}.PENDING_GIST_DELIVERIES must contain at most "
+                f"{MAX_PENDING_GIST_DELIVERIES} deliveries"
+            )
+        deliveries: list[dict[str, Any]] = []
+        delivery_ids: set[str] = set()
+        for raw_delivery in raw_deliveries:
+            delivery = validate_gist_delivery(raw_delivery, target)
+            delivery_id = delivery["delivery_id"]
+            if delivery_id in delivery_ids:
+                raise ConfigError(
+                    f"DCA_EXECUTION_STATE.{target}.PENDING_GIST_DELIVERIES contains "
+                    f"duplicate delivery_id: {delivery_id}"
+                )
+            delivery_ids.add(delivery_id)
+            deliveries.append(delivery)
         result_entry: dict[str, Any] = {"LAST_BUY_DATE": last_buy}
         if pending is not None:
             result_entry["PENDING_ORDER"] = pending
+        if deliveries:
+            result_entry["PENDING_GIST_DELIVERIES"] = deliveries
         normalized[target] = result_entry
+    if _execution_state_json_bytes(normalized) > MAX_EXECUTION_STATE_JSON_BYTES:
+        raise ConfigError(
+            "DCA_EXECUTION_STATE exceeds the protected GitHub variable size budget"
+        )
     return normalized
+
+
+def ensure_gist_delivery_capacity(
+    value: str | Mapping[str, Any], target: str
+) -> dict[str, Any]:
+    """Reserve worst-case durable fill evidence before a new Kraken order.
+
+    Every already-persisted pending order also retains a reservation.  Callers
+    reconciling an old intent do not need to invoke this gate: reconciliation
+    must remain possible even if unrelated state later consumes the headroom.
+    """
+
+    if target not in TARGET_KEYS:
+        raise ConfigError(f"Unsupported production target: {target}")
+    state = validate_execution_state(value)
+    reservation_targets = {
+        key
+        for key, entry in state.items()
+        if entry.get("PENDING_ORDER") is not None
+    }
+    reservation_targets.add(target)
+    for reserved_target in reservation_targets:
+        deliveries = state.get(reserved_target, {}).get(
+            "PENDING_GIST_DELIVERIES", []
+        )
+        if len(deliveries) >= MAX_PENDING_GIST_DELIVERIES:
+            raise ConfigError(
+                "No durable Portfolio Compass delivery slot is available for "
+                f"{reserved_target}"
+            )
+    projected_bytes = _execution_state_json_bytes(state) + (
+        len(reservation_targets) * GIST_DELIVERY_RESERVED_JSON_BYTES
+    )
+    if projected_bytes > MAX_EXECUTION_STATE_JSON_BYTES:
+        raise ConfigError(
+            "DCA_EXECUTION_STATE lacks reserved space for durable Portfolio "
+            "Compass delivery evidence"
+        )
+    return state
 
 
 def validate_enabled_market_minimums(
@@ -714,7 +930,13 @@ __all__ = [
     "ANALYSIS_STATE_VERSION",
     "ConfigError",
     "ERROR_STATUS",
+    "GIST_DELIVERY_FIELDS",
+    "GIST_DELIVERY_RESERVED_JSON_BYTES",
+    "GIST_DELIVERY_VERSION",
     "MAX_AMOUNT_GBP",
+    "MAX_EXECUTION_STATE_JSON_BYTES",
+    "MAX_GIST_DELIVERY_ROW_BYTES",
+    "MAX_PENDING_GIST_DELIVERIES",
     "MIN_ENABLED_AMOUNT_GBP",
     "READY_STATUS",
     "REGIMES",
@@ -728,6 +950,7 @@ __all__ = [
     "default_rules_map",
     "effective_amount",
     "effective_amount_gbp",
+    "ensure_gist_delivery_capacity",
     "empty_analysis_state",
     "global_rules_hash",
     "is_execution_window",
@@ -739,6 +962,7 @@ __all__ = [
     "validate_analysis_decision",
     "validate_analysis_state",
     "validate_execution_state",
+    "validate_gist_delivery",
     "validate_enabled_market_minimums",
     "validate_rules_map",
     "validate_target_map",

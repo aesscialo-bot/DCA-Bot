@@ -1,6 +1,7 @@
 import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 import json
 import unittest
 from types import SimpleNamespace
@@ -92,6 +93,28 @@ def variable_reader(live_rules, analysis, execution=None):
     return lambda name: values.get(name)
 
 
+def gist_delivery(
+    delivery_id="OUF4EM-FRGI2-MQMWZD",
+    *,
+    symbol="BTC",
+    created_at="2026-08-06T01:05:00Z",
+):
+    row = (
+        "| 2026-08-06 08:05 +07 | GBP 10.00 | 1.300000 | USD 13.0000 | "
+        "USD 12.9000 | GBP equivalent 0.08 | USD 64,500.0000 | "
+        f"0.00020000 {symbol} | FUNDING-1 | {delivery_id} | "
+        "optional/not saved |\n"
+    )
+    return {
+        "version": 1,
+        "delivery_id": delivery_id,
+        "created_at": created_at,
+        "symbol": symbol,
+        "row": row,
+        "row_sha256": sha256(row.encode("utf-8")).hexdigest(),
+    }
+
+
 class DiscordBotControlTests(unittest.TestCase):
     def setUp(self):
         self.allowlist = patch.object(discord_bot, "ALLOWED_USERS", "123")
@@ -101,6 +124,7 @@ class DiscordBotControlTests(unittest.TestCase):
         discord_bot._dca_dispatch_guard.clear()
         discord_bot._dca_schedule.clear()
         discord_bot._pending_recovery_symbols.clear()
+        discord_bot._pending_gist_delivery_symbols.clear()
         discord_bot._awaiting_start_day_symbols.clear()
         discord_bot._schedule_error = None
         discord_bot._schedule_warning = None
@@ -342,6 +366,26 @@ class DiscordBotControlTests(unittest.TestCase):
         dispatch.assert_not_called()
         self.assertIn("reconciliation is pending for SOL_USD", message.replies[-1])
 
+    def test_enable_review_allows_pending_portfolio_ledger_delivery(self):
+        execution = {
+            "SOL_USD": {
+                "LAST_BUY_DATE": "2026-08-05",
+                "PENDING_GIST_DELIVERIES": [
+                    gist_delivery("ORDER-SOL-1", symbol="SOL")
+                ],
+            }
+        }
+
+        review = discord_bot._enable_review(
+            "BTC_USD",
+            self.rules,
+            self.analysis,
+            execution,
+            now=NOW,
+        )
+
+        self.assertEqual(review["symbol"], "BTC_USD")
+
     def test_confirmation_fails_if_live_decision_changes(self):
         message = MessageStub()
         first_reader = variable_reader(self.rules, self.analysis)
@@ -459,6 +503,54 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("fresh READY 3/3", health_message.replies[-1])
         self.assertIn("Buy-enabled targets: 0/3", health_message.replies[-1])
 
+    def test_status_and_health_separate_portfolio_delivery_from_kraken_recovery(self):
+        execution = {
+            "BTC_USD": {
+                "LAST_BUY_DATE": "2026-08-05",
+                "PENDING_GIST_DELIVERIES": [
+                    gist_delivery(),
+                    gist_delivery(
+                        "OUF4EM-FRGI2-MQMWZE",
+                        created_at="2026-08-06T01:06:00Z",
+                    ),
+                ],
+            }
+        }
+        status_message = MessageStub()
+        health_message = MessageStub()
+        with (
+            patch.object(
+                discord_bot,
+                "get_repo_variable",
+                side_effect=variable_reader(self.rules, self.analysis, execution),
+            ),
+            patch.object(discord_bot, "datetime", FrozenDateTime),
+            patch.object(discord_bot, "DCA_CRON_ENABLED", True),
+        ):
+            asyncio.run(discord_bot.handle_status({}, status_message))
+        self.assertIn(
+            "PORTFOLIO LEDGER DELIVERY WARNING (2 pending)",
+            status_message.replies[-1],
+        )
+        self.assertIn("2 pending record(s)", status_message.replies[-1])
+
+        with (
+            patch.object(
+                discord_bot,
+                "get_repo_variable",
+                side_effect=variable_reader(self.rules, self.analysis, execution),
+            ),
+            patch.object(discord_bot, "datetime", FrozenDateTime),
+            patch.object(discord_bot, "DCA_CRON_ENABLED", True),
+        ):
+            asyncio.run(discord_bot.handle_health({}, health_message))
+        self.assertIn("DCA health: ATTENTION REQUIRED", health_message.replies[-1])
+        self.assertIn("pending Kraken recoveries 0", health_message.replies[-1])
+        self.assertIn(
+            "Portfolio ledger delivery: WARNING; 2 pending record(s)",
+            health_message.replies[-1],
+        )
+
     def test_health_reports_armed_while_waiting_for_start_day_analysis(self):
         live_rules = rules(enabled=set(ALLOWED_TARGETS))
         decisions = analysis_state(
@@ -537,6 +629,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
     def setUp(self):
         discord_bot._dca_schedule.clear()
         discord_bot._pending_recovery_symbols.clear()
+        discord_bot._pending_gist_delivery_symbols.clear()
         discord_bot._awaiting_start_day_symbols.clear()
         discord_bot._dca_dispatch_guard.clear()
         discord_bot._schedule_error = None
@@ -808,6 +901,121 @@ class DiscordBotSchedulerTests(unittest.TestCase):
             now=NOW,
         )
         self.assertEqual(discord_bot._due_symbols_for_dispatch(NOW), ["SOL_USD"])
+
+    def test_pending_gist_delivery_dispatches_without_kraken_recovery(self):
+        live_rules = rules()
+        decisions = analysis_state(live_rules)
+        execution = {
+            "SOL_USD": {
+                "LAST_BUY_DATE": "2026-08-05",
+                "PENDING_GIST_DELIVERIES": [
+                    gist_delivery("ORDER-SOL-1", symbol="SOL")
+                ],
+            }
+        }
+
+        self.assertTrue(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules),
+                json.dumps(decisions),
+                json.dumps(execution),
+                now=NOW,
+            )
+        )
+
+        self.assertEqual(discord_bot._pending_recovery_symbols, set())
+        self.assertEqual(discord_bot._pending_gist_delivery_symbols, {"SOL_USD"})
+        self.assertEqual(discord_bot._due_symbols_for_dispatch(NOW), ["SOL_USD"])
+
+    def test_pending_gist_delivery_does_not_block_new_order_schedule(self):
+        live_rules = rules(enabled={"BTC_USD"})
+        decisions = analysis_state(live_rules)
+        execution = {
+            "SOL_USD": {
+                "LAST_BUY_DATE": "2026-08-05",
+                "PENDING_GIST_DELIVERIES": [
+                    gist_delivery("ORDER-SOL-1", symbol="SOL")
+                ],
+            }
+        }
+
+        self.assertTrue(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules),
+                json.dumps(decisions),
+                json.dumps(execution),
+                now=NOW,
+            )
+        )
+
+        self.assertEqual(set(discord_bot._dca_schedule), {"BTC_USD"})
+        self.assertIsNone(discord_bot._schedule_warning)
+
+    def test_pending_gist_delivery_survives_invalid_analysis_and_dispatches(self):
+        live_rules = rules()
+        execution = {
+            "BTC_USD": {
+                "LAST_BUY_DATE": "2026-08-05",
+                "PENDING_GIST_DELIVERIES": [gist_delivery()],
+            }
+        }
+        self.assertFalse(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules), "{}", json.dumps(execution), now=NOW
+            )
+        )
+        self.assertEqual(discord_bot._pending_recovery_symbols, set())
+        self.assertEqual(discord_bot._pending_gist_delivery_symbols, {"BTC_USD"})
+        with patch.object(discord_bot, "DCA_CRON_ENABLED", True):
+            self.assertIn(
+                "portfolio ledger delivery", discord_bot._format_cron_status()
+            )
+
+        FrozenDateTime.current = NOW
+        with (
+            patch.object(discord_bot, "DCA_CRON_ENABLED", True),
+            patch.object(discord_bot, "datetime", FrozenDateTime),
+            patch.object(discord_bot, "trigger_workflow", return_value=True) as dispatch,
+        ):
+            asyncio.run(discord_bot.dca_scheduler_tick.coro())
+        dispatch.assert_called_once_with(
+            "daily_dca.yml", {"symbols_json": '["BTC_USD"]'}
+        )
+
+    def test_pending_gist_delivery_uses_thirty_minute_dispatch_guard(self):
+        live_rules = rules()
+        decisions = analysis_state(live_rules)
+        execution = {
+            "BTC_USD": {
+                "LAST_BUY_DATE": "2026-08-05",
+                "PENDING_GIST_DELIVERIES": [gist_delivery()],
+            }
+        }
+        discord_bot.refresh_dca_schedule(
+            json.dumps(live_rules),
+            json.dumps(decisions),
+            json.dumps(execution),
+            now=NOW,
+        )
+        FrozenDateTime.current = NOW
+        with (
+            patch.object(discord_bot, "DCA_CRON_ENABLED", True),
+            patch.object(discord_bot, "datetime", FrozenDateTime),
+            patch.object(
+                discord_bot,
+                "monotonic",
+                side_effect=[0, 0, 1_799, 1_800, 1_800],
+            ),
+            patch.object(discord_bot, "trigger_workflow", return_value=True) as dispatch,
+        ):
+            asyncio.run(discord_bot.dca_scheduler_tick.coro())
+            asyncio.run(discord_bot.dca_scheduler_tick.coro())
+            asyncio.run(discord_bot.dca_scheduler_tick.coro())
+
+        self.assertEqual(dispatch.call_count, 2)
+        dispatch.assert_called_with(
+            "daily_dca.yml", {"symbols_json": '["BTC_USD"]'}
+        )
 
     def test_pending_recovery_survives_invalid_analysis_state(self):
         live_rules = rules()

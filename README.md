@@ -16,9 +16,11 @@ Budgets remain denominated in GBP. At execution time the bot first sells the
 selected GBP budget on Kraken's `GBP/USD` market, then spends the confirmed net
 USD proceeds on the selected crypto/USD market. There is no THB or Bitkub path.
 
-Kraken is the authoritative record of cash, holdings, fees, and orders. Gist and
-Ghostfolio are optional post-fill mirrors; an unavailable optional logger never
-means the Kraken portfolio was not saved.
+Kraken is the authoritative record of cash, holdings, fees, and orders. Every
+confirmed purchase is also placed in a durable, retry-safe outbox for Portfolio
+Compass's read-only private-Gist adapter. A Gist outage cannot repeat a Kraken
+order; the exact ledger row remains queued until it is delivered. Ghostfolio is
+an optional post-fill mirror.
 
 ## Production configuration
 
@@ -73,9 +75,11 @@ flowchart TD
     J --> K["Kraken leg 1: sell exact GBP budget on GBP/USD; fciq"]
     K --> L["Read confirmed net USD proceeds"]
     L --> M["Kraken leg 2: spend net USD on crypto/USD; fcib"]
-    M --> N["Reconcile both orders and mark the asset bought today"]
-    N --> O["Discord: Saved on Kraken"]
-    O -. "optional" .-> P["Gist and Ghostfolio mirrors"]
+    M --> N["Atomically save buy date and Portfolio Compass outbox row"]
+    N --> O["Deliver exact row to private Gist with idempotent retry"]
+    O --> P["Portfolio Compass imports purchase and recalculates holdings"]
+    N --> Q["Discord: Saved on Kraken"]
+    Q -. "optional" .-> R["Ghostfolio mirror"]
 ```
 
 `fciq` requests the GBP/USD fee in quote currency; `fcib` requests the crypto
@@ -122,7 +126,9 @@ flowchart LR
     K --> T
     T --> V
     T --> D["Discord receipt"]
-    T -. "optional" .-> L["Gist / Ghostfolio"]
+    T --> L["Durable private-Gist ledger outbox"]
+    L --> P["Portfolio Compass read-only importer"]
+    T -. "optional" .-> G["Ghostfolio"]
 ```
 
 Railway runs `python3 -u discord_bot.py` continuously. It owns the five-minute
@@ -143,8 +149,11 @@ derived analysis tiers, not extra fields in this user-owned JSON.
 `EXECUTE_AT`, `VALID_UNTIL`, `DECISION_ID`, `RULES_HASH`, signal metrics, and
 timing metrics.
 
-`DCA_EXECUTION_STATE` stores `LAST_BUY_DATE` and durable `PENDING_ORDER` state,
-including the originating decision and both legs of the GBP-funded USD purchase.
+`DCA_EXECUTION_STATE` stores `LAST_BUY_DATE`, durable `PENDING_ORDER` state, and
+FIFO `PENDING_GIST_DELIVERIES`. Completion atomically moves confirmed fill
+evidence into that delivery queue before the pending Kraken intent is cleared.
+The state is size-bounded and new orders reserve delivery capacity before
+submission.
 
 Required repository variables:
 

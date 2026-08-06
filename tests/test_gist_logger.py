@@ -1,3 +1,4 @@
+import hashlib
 import io
 import unittest
 from contextlib import redirect_stdout
@@ -152,6 +153,273 @@ class GistLoggerTests(unittest.TestCase):
         ]["content"]
         self.assertIn(r"fx\|id next", content)
         self.assertIn(r"abc\|def next", content)
+
+    def test_build_delivery_is_deterministic_and_compact(self):
+        with patch.object(gist_logger, "SELECTED_TZ", ZoneInfo("UTC")):
+            first = gist_logger.build_gist_delivery(
+                self.trade, "btc", saved_to_ghostfolio=True
+            )
+            second = gist_logger.build_gist_delivery(
+                dict(self.trade), "BTC", saved_to_ghostfolio=True
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            list(first),
+            [
+                "version",
+                "delivery_id",
+                "created_at",
+                "symbol",
+                "row",
+                "row_sha256",
+            ],
+        )
+        self.assertEqual(first["version"], 1)
+        self.assertEqual(first["delivery_id"], "KRAKEN-123")
+        self.assertEqual(first["created_at"], "2026-07-12T04:34:42Z")
+        self.assertEqual(first["symbol"], "BTC")
+        self.assertEqual(
+            first["row_sha256"],
+            hashlib.sha256(first["row"].encode("utf-8")).hexdigest(),
+        )
+
+    def test_build_delivery_rejects_missing_or_invalid_order_ids(self):
+        invalid_trades = [
+            {
+                key: value
+                for key, value in self.trade.items()
+                if key != "order_id"
+            },
+            {**self.trade, "order_id": "  "},
+            {**self.trade, "order_id": "unknown"},
+            {**self.trade, "order_id": 123},
+            {
+                key: value
+                for key, value in self.trade.items()
+                if key != "funding_order_id"
+            },
+        ]
+        for invalid_trade in invalid_trades:
+            with self.subTest(order_id=invalid_trade.get("order_id")):
+                with self.assertRaises(ValueError):
+                    gist_logger.build_gist_delivery(invalid_trade, "BTC")
+
+    def test_identical_existing_delivery_is_success_without_patch(self):
+        with patch.object(gist_logger, "SELECTED_TZ", ZoneInfo("UTC")):
+            delivery = gist_logger.build_gist_delivery(self.trade, "BTC")
+        existing = gist_logger.TABLE_HEADER + delivery["row"]
+
+        with (
+            self._credentials(),
+            patch.object(
+                gist_logger.requests,
+                "get",
+                return_value=MockResponse(
+                    body={
+                        "files": {
+                            gist_logger.GIST_FILENAME: {"content": existing}
+                        }
+                    }
+                ),
+            ),
+            patch.object(gist_logger.requests, "patch") as patch_request,
+        ):
+            saved = gist_logger.update_gist_log(delivery)
+
+        self.assertTrue(saved)
+        patch_request.assert_not_called()
+
+    def test_same_order_id_with_different_row_is_rejected(self):
+        with patch.object(gist_logger, "SELECTED_TZ", ZoneInfo("UTC")):
+            delivery = gist_logger.build_gist_delivery(self.trade, "BTC")
+            conflicting_delivery = gist_logger.build_gist_delivery(
+                {**self.trade, "amount_crypto": 0.0003}, "BTC"
+            )
+        existing = gist_logger.TABLE_HEADER + conflicting_delivery["row"]
+
+        with (
+            self._credentials(),
+            patch.object(
+                gist_logger.requests,
+                "get",
+                return_value=MockResponse(
+                    body={
+                        "files": {
+                            gist_logger.GIST_FILENAME: {"content": existing}
+                        }
+                    }
+                ),
+            ),
+            patch.object(gist_logger.requests, "patch") as patch_request,
+        ):
+            saved = gist_logger.update_gist_log(delivery)
+
+        self.assertFalse(saved)
+        patch_request.assert_not_called()
+
+    def test_lost_patch_response_can_be_retried_without_duplicate(self):
+        with patch.object(gist_logger, "SELECTED_TZ", ZoneInfo("UTC")):
+            delivery = gist_logger.build_gist_delivery(self.trade, "BTC")
+        remote_content = {"value": ""}
+
+        def get_remote(*args, **kwargs):
+            return MockResponse(
+                body={
+                    "files": {
+                        gist_logger.GIST_FILENAME: {
+                            "content": remote_content["value"]
+                        }
+                    }
+                }
+            )
+
+        def patch_then_lose_response(*args, **kwargs):
+            remote_content["value"] = kwargs["json"]["files"][
+                gist_logger.GIST_FILENAME
+            ]["content"]
+            raise requests.ConnectionError("response was lost")
+
+        with (
+            self._credentials(),
+            patch.object(gist_logger.requests, "get", side_effect=get_remote),
+            patch.object(
+                gist_logger.requests,
+                "patch",
+                side_effect=patch_then_lose_response,
+            ) as patch_request,
+        ):
+            first_result = gist_logger.update_gist_log(delivery)
+            second_result = gist_logger.update_gist_log(delivery)
+
+        self.assertFalse(first_result)
+        self.assertTrue(second_result)
+        self.assertEqual(patch_request.call_count, 1)
+        self.assertEqual(remote_content["value"].count(delivery["row"]), 1)
+
+    def test_truncated_api_content_fetches_complete_raw_file_before_patch(self):
+        with patch.object(gist_logger, "SELECTED_TZ", ZoneInfo("UTC")):
+            delivery = gist_logger.build_gist_delivery(self.trade, "BTC")
+        historical_row = delivery["row"].replace("KRAKEN-123", "KRAKEN-OLD")
+        complete_content = gist_logger.TABLE_HEADER + historical_row
+        api_response = MockResponse(
+            body={
+                "files": {
+                    gist_logger.GIST_FILENAME: {
+                        "content": gist_logger.TABLE_HEADER,
+                        "truncated": True,
+                        "raw_url": (
+                            "https://gist.githubusercontent.com/user/gist/raw/sha/"
+                            + gist_logger.GIST_FILENAME
+                        ),
+                    }
+                }
+            }
+        )
+        raw_response = MockResponse(body=complete_content)
+
+        with (
+            self._credentials(),
+            patch.object(
+                gist_logger.requests, "get", side_effect=[api_response, raw_response]
+            ) as get_request,
+            patch.object(
+                gist_logger.requests, "patch", return_value=MockResponse()
+            ) as patch_request,
+        ):
+            self.assertTrue(gist_logger.update_gist_log(delivery))
+
+        self.assertEqual(get_request.call_count, 2)
+        patched_content = patch_request.call_args.kwargs["json"]["files"][
+            gist_logger.GIST_FILENAME
+        ]["content"]
+        self.assertTrue(patched_content.startswith(complete_content))
+        self.assertIn(historical_row, patched_content)
+        self.assertTrue(patched_content.endswith(delivery["row"]))
+
+    def test_truncated_file_refuses_unsafe_raw_url_without_sending_token(self):
+        with patch.object(gist_logger, "SELECTED_TZ", ZoneInfo("UTC")):
+            delivery = gist_logger.build_gist_delivery(self.trade, "BTC")
+        api_response = MockResponse(
+            body={
+                "files": {
+                    gist_logger.GIST_FILENAME: {
+                        "content": gist_logger.TABLE_HEADER,
+                        "truncated": True,
+                        "raw_url": "https://example.invalid/stolen-ledger",
+                    }
+                }
+            }
+        )
+
+        with (
+            self._credentials(),
+            patch.object(
+                gist_logger.requests, "get", return_value=api_response
+            ) as get_request,
+            patch.object(gist_logger.requests, "patch") as patch_request,
+        ):
+            self.assertFalse(gist_logger.update_gist_log(delivery))
+
+        self.assertEqual(get_request.call_count, 1)
+        patch_request.assert_not_called()
+
+    def test_append_refuses_to_cross_supported_gist_file_size(self):
+        with patch.object(gist_logger, "SELECTED_TZ", ZoneInfo("UTC")):
+            delivery = gist_logger.build_gist_delivery(self.trade, "BTC")
+        existing = gist_logger.TABLE_HEADER
+        with (
+            self._credentials(),
+            patch.object(
+                gist_logger, "MAX_GIST_FILE_BYTES", len(existing.encode("utf-8"))
+            ),
+            patch.object(
+                gist_logger.requests,
+                "get",
+                return_value=MockResponse(
+                    body={
+                        "files": {
+                            gist_logger.GIST_FILENAME: {"content": existing}
+                        }
+                    }
+                ),
+            ),
+            patch.object(gist_logger.requests, "patch") as patch_request,
+        ):
+            self.assertFalse(gist_logger.update_gist_log(delivery))
+
+        patch_request.assert_not_called()
+
+    def test_escaped_pipe_ids_are_matched_in_exact_order_column(self):
+        pipe_trade = {
+            **self.trade,
+            "funding_order_id": "FX|123",
+            "order_id": "KRAKEN|123",
+        }
+        with patch.object(gist_logger, "SELECTED_TZ", ZoneInfo("UTC")):
+            delivery = gist_logger.build_gist_delivery(pipe_trade, "BTC")
+        existing = gist_logger.TABLE_HEADER + delivery["row"]
+
+        with (
+            self._credentials(),
+            patch.object(
+                gist_logger.requests,
+                "get",
+                return_value=MockResponse(
+                    body={
+                        "files": {
+                            gist_logger.GIST_FILENAME: {"content": existing}
+                        }
+                    }
+                ),
+            ),
+            patch.object(gist_logger.requests, "patch") as patch_request,
+        ):
+            saved = gist_logger.update_gist_log(delivery)
+
+        self.assertTrue(saved)
+        self.assertIn(r"KRAKEN\|123", delivery["row"])
+        patch_request.assert_not_called()
 
     def test_rejects_non_usd_trade_before_network_request(self):
         invalid_trade = {**self.trade, "quote_currency": "GBP"}

@@ -1,5 +1,7 @@
 import copy
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
+import json
 import unittest
 from unittest.mock import patch
 
@@ -7,6 +9,44 @@ import dca_config
 
 
 NOW = datetime(2026, 8, 5, 21, 0, tzinfo=timezone.utc)
+
+
+def gist_delivery(
+    delivery_id="OUF4EM-FRGI2-MQMWZD",
+    *,
+    symbol="BTC",
+    created_at="2026-08-06T01:05:00Z",
+    row=None,
+):
+    if row is None:
+        row = (
+            "| 2026-08-06 08:05 +07 | GBP 10.00 | 1.300000 | USD 13.0000 | "
+            "USD 12.9000 | GBP equivalent 0.08 | USD 64,500.0000 | "
+            f"0.00020000 {symbol} | FUNDING-1 | {delivery_id} | "
+            "optional/not saved |\n"
+        )
+    return {
+        "version": 1,
+        "delivery_id": delivery_id,
+        "created_at": created_at,
+        "symbol": symbol,
+        "row": row,
+        "row_sha256": sha256(row.encode("utf-8")).hexdigest(),
+    }
+
+
+def sized_gist_row(delivery_id, size):
+    suffix = (
+        " | two | three | four | five | six | seven | eight | nine | "
+        f"{delivery_id} | eleven |\n"
+    )
+    prefix = "| "
+    padding_bytes = size - len((prefix + suffix).encode("utf-8"))
+    if padding_bytes < 0:
+        raise ValueError("requested row size is too small")
+    row = prefix + ("x" * padding_bytes) + suffix
+    assert len(row.encode("utf-8")) == size
+    return row
 
 
 def ready_state(rules=None):
@@ -396,6 +436,254 @@ class StateSchemaTests(unittest.TestCase):
             dca_config.validate_execution_state(
                 {"BTC_USD": {"PENDING_ORDER": extra}}
             )
+
+    def test_pending_gist_deliveries_are_optional_fifo_and_empty_is_omitted(self):
+        legacy = dca_config.validate_execution_state(
+            {"BTC_USD": {"LAST_BUY_DATE": "2026-08-05"}}
+        )
+        self.assertEqual(legacy, {"BTC_USD": {"LAST_BUY_DATE": "2026-08-05"}})
+
+        explicit_empty = dca_config.validate_execution_state(
+            {"BTC_USD": {"PENDING_GIST_DELIVERIES": []}}
+        )
+        self.assertEqual(explicit_empty, {"BTC_USD": {"LAST_BUY_DATE": ""}})
+
+        first = gist_delivery()
+        second = gist_delivery(
+            "OTWO22-SECOND-ORDER2", created_at="2026-08-06T01:06:00Z"
+        )
+        validated = dca_config.validate_execution_state(
+            {"BTC_USD": {"PENDING_GIST_DELIVERIES": [first, second]}}
+        )
+        self.assertEqual(
+            validated["BTC_USD"]["PENDING_GIST_DELIVERIES"],
+            [first, second],
+        )
+
+    def test_gist_delivery_helper_enforces_exact_integrity_bound_schema(self):
+        valid = gist_delivery()
+        self.assertEqual(
+            dca_config.validate_gist_delivery(valid, "BTC_USD"),
+            valid,
+        )
+
+        mutations = {
+            "version": 2,
+            "delivery_id": "unsafe order id",
+            "created_at": "2026-08-06T01:05:00",
+            "symbol": "SOL",
+            "row": "not a markdown row\n",
+            "row_sha256": "A" * 64,
+        }
+        for field, invalid in mutations.items():
+            with self.subTest(field=field):
+                candidate = copy.deepcopy(valid)
+                candidate[field] = invalid
+                with self.assertRaises(ValueError):
+                    dca_config.validate_gist_delivery(candidate, "BTC_USD")
+
+        bool_version = copy.deepcopy(valid)
+        bool_version["version"] = True
+        with self.assertRaisesRegex(ValueError, "version must be 1"):
+            dca_config.validate_gist_delivery(bool_version, "BTC_USD")
+
+        missing = copy.deepcopy(valid)
+        del missing["created_at"]
+        with self.assertRaisesRegex(ValueError, "missing: created_at"):
+            dca_config.validate_gist_delivery(missing, "BTC_USD")
+
+        extra = {**valid, "attempts": 1}
+        with self.assertRaisesRegex(ValueError, "unsupported fields: attempts"):
+            dca_config.validate_gist_delivery(extra, "BTC_USD")
+
+        noncanonical_utc = gist_delivery(created_at="2026-08-06T01:05:00+00:00")
+        with self.assertRaisesRegex(ValueError, "canonical UTC"):
+            dca_config.validate_gist_delivery(noncanonical_utc, "BTC_USD")
+
+    def test_gist_delivery_row_is_one_bounded_utf8_line_with_matching_hash(self):
+        for row in (
+            "| first line |\n| second line |\n",
+            "| carriage return |\r\n",
+            "| missing newline |",
+        ):
+            with self.subTest(row=repr(row)):
+                with self.assertRaisesRegex(ValueError, "one Markdown data line"):
+                    dca_config.validate_gist_delivery(
+                        gist_delivery(row=row), "BTC_USD"
+                    )
+
+        delivery_id = "OUF4EM-FRGI2-MQMWZD"
+        boundary_row = sized_gist_row(
+            delivery_id, dca_config.MAX_GIST_DELIVERY_ROW_BYTES
+        )
+        dca_config.validate_gist_delivery(
+            gist_delivery(delivery_id, row=boundary_row), "BTC_USD"
+        )
+        oversized_row = sized_gist_row(
+            delivery_id, dca_config.MAX_GIST_DELIVERY_ROW_BYTES + 1
+        )
+        with self.assertRaisesRegex(
+            ValueError, f"at most {dca_config.MAX_GIST_DELIVERY_ROW_BYTES} UTF-8 bytes"
+        ):
+            dca_config.validate_gist_delivery(
+                gist_delivery(delivery_id, row=oversized_row), "BTC_USD"
+            )
+
+        mismatched = gist_delivery()
+        mismatched["row_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "does not match row"):
+            dca_config.validate_gist_delivery(mismatched, "BTC_USD")
+
+        wrong_order_column = gist_delivery()
+        wrong_order_column["row"] = wrong_order_column["row"].replace(
+            wrong_order_column["delivery_id"], "DIFFERENT-ORDER"
+        )
+        wrong_order_column["row_sha256"] = sha256(
+            wrong_order_column["row"].encode("utf-8")
+        ).hexdigest()
+        with self.assertRaisesRegex(ValueError, "crypto order column"):
+            dca_config.validate_gist_delivery(wrong_order_column, "BTC_USD")
+
+        control_character = gist_delivery()
+        control_character["row"] = control_character["row"].replace(
+            "GBP 10.00", "GBP\t10.00"
+        )
+        control_character["row_sha256"] = sha256(
+            control_character["row"].encode("utf-8")
+        ).hexdigest()
+        with self.assertRaisesRegex(ValueError, "control characters"):
+            dca_config.validate_gist_delivery(control_character, "BTC_USD")
+
+    def test_pending_gist_queue_has_bounded_unique_delivery_ids(self):
+        full_queue = [
+            gist_delivery(f"ORDER-{index:02d}")
+            for index in range(dca_config.MAX_PENDING_GIST_DELIVERIES)
+        ]
+        validated = dca_config.validate_execution_state(
+            {"BTC_USD": {"PENDING_GIST_DELIVERIES": full_queue}}
+        )
+        self.assertEqual(
+            len(validated["BTC_USD"]["PENDING_GIST_DELIVERIES"]),
+            dca_config.MAX_PENDING_GIST_DELIVERIES,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            f"at most {dca_config.MAX_PENDING_GIST_DELIVERIES} deliveries",
+        ):
+            dca_config.validate_execution_state(
+                {
+                    "BTC_USD": {
+                        "PENDING_GIST_DELIVERIES": full_queue
+                        + [gist_delivery("ORDER-OVERFLOW")]
+                    }
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "duplicate delivery_id"):
+            dca_config.validate_execution_state(
+                {
+                    "BTC_USD": {
+                        "PENDING_GIST_DELIVERIES": [
+                            gist_delivery("ORDER-DUPLICATE"),
+                            gist_delivery("ORDER-DUPLICATE"),
+                        ]
+                    }
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "must be an array"):
+            dca_config.validate_execution_state(
+                {"BTC_USD": {"PENDING_GIST_DELIVERIES": ()}}
+            )
+
+    def test_execution_state_global_json_budget_has_an_exact_boundary(self):
+        state = {
+            "BTC_USD": {"PENDING_GIST_DELIVERIES": [gist_delivery()]}
+        }
+        normalized = dca_config.validate_execution_state(state)
+        size = len(
+            json.dumps(
+                normalized, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        )
+
+        with patch.object(dca_config, "MAX_EXECUTION_STATE_JSON_BYTES", size):
+            self.assertEqual(dca_config.validate_execution_state(state), normalized)
+        with (
+            patch.object(dca_config, "MAX_EXECUTION_STATE_JSON_BYTES", size - 1),
+            self.assertRaisesRegex(ValueError, "size budget"),
+        ):
+            dca_config.validate_execution_state(state)
+
+    def test_capacity_reserves_worst_case_delivery_for_every_pending_order(self):
+        state = {
+            "HYPE_USD": {
+                "PENDING_ORDER": {
+                    "client_order_id": "dca-1234567890abcd",
+                    "funding_client_order_id": "dca-fedcba09876543",
+                    "trade_date": "2026-08-06",
+                    "amount_gbp": 20.0,
+                    "decision_id": "decision-hype",
+                    "created_at": "2026-08-06T01:00:00Z",
+                }
+            }
+        }
+        normalized = dca_config.validate_execution_state(state)
+        current_size = len(
+            json.dumps(
+                normalized, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        )
+        required = current_size + (2 * dca_config.GIST_DELIVERY_RESERVED_JSON_BYTES)
+        with patch.object(dca_config, "MAX_EXECUTION_STATE_JSON_BYTES", required):
+            dca_config.ensure_gist_delivery_capacity(state, "BTC_USD")
+        with (
+            patch.object(dca_config, "MAX_EXECUTION_STATE_JSON_BYTES", required - 1),
+            self.assertRaisesRegex(ValueError, "lacks reserved space"),
+        ):
+            dca_config.ensure_gist_delivery_capacity(state, "BTC_USD")
+
+    def test_capacity_rejects_a_full_target_delivery_queue(self):
+        state = {
+            "BTC_USD": {
+                "PENDING_GIST_DELIVERIES": [
+                    gist_delivery(f"ORDER-{index:02d}")
+                    for index in range(dca_config.MAX_PENDING_GIST_DELIVERIES)
+                ]
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "No durable .* slot"):
+            dca_config.ensure_gist_delivery_capacity(state, "BTC_USD")
+
+    def test_reserved_bytes_cover_maximum_valid_json_escaped_delivery(self):
+        delivery_id = "O" * 128
+        row = sized_gist_row(
+            delivery_id, dca_config.MAX_GIST_DELIVERY_ROW_BYTES
+        ).replace("x", '"')
+        delivery = gist_delivery(delivery_id, row=row)
+        dca_config.validate_gist_delivery(delivery, "BTC_USD")
+        baseline = {"BTC_USD": {"LAST_BUY_DATE": ""}}
+        with_delivery = {
+            "BTC_USD": {
+                "LAST_BUY_DATE": "",
+                "PENDING_GIST_DELIVERIES": [delivery],
+            }
+        }
+        baseline_size = len(
+            json.dumps(
+                baseline, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        )
+        delivery_size = len(
+            json.dumps(
+                with_delivery, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        )
+        self.assertLessEqual(
+            delivery_size - baseline_size,
+            dca_config.GIST_DELIVERY_RESERVED_JSON_BYTES,
+        )
 
 
 if __name__ == "__main__":
