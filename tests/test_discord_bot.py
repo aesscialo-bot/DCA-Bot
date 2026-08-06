@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import discord_bot
 from dca_config import ANALYSIS_STATE_VERSION, ALLOWED_TARGETS, rules_hash
@@ -23,13 +23,34 @@ class FrozenDateTime(datetime):
         return cls.current.astimezone(tz)
 
 
-class MessageStub:
-    def __init__(self, user_id="123"):
-        self.replies = []
-        self.author = SimpleNamespace(id=user_id)
+class TypingStub:
+    async def __aenter__(self):
+        return self
 
-    async def reply(self, content):
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class ChannelStub:
+    def __init__(self, channel_id="456"):
+        self.id = channel_id
+
+    def typing(self):
+        return TypingStub()
+
+
+class MessageStub:
+    def __init__(self, user_id="123", *, content="", channel_id="456"):
+        self.replies = []
+        self.reply_kwargs = []
+        self.author = SimpleNamespace(id=user_id)
+        self.content = content
+        self.channel = ChannelStub(channel_id)
+        self.mentions = []
+
+    async def reply(self, content, **kwargs):
         self.replies.append(content)
+        self.reply_kwargs.append(kwargs)
 
 
 def rules(*, enabled=(), low=10, up=20):
@@ -110,6 +131,8 @@ class DiscordBotControlTests(unittest.TestCase):
 
     def test_only_three_production_usd_assets_are_accepted(self):
         self.assertEqual(discord_bot._normalise_usd_key("bitcoin"), "BTC_USD")
+        self.assertEqual(discord_bot._normalise_usd_key("hyperliquid"), "HYPE_USD")
+        self.assertEqual(discord_bot._normalise_usd_key("solana"), "SOL_USD")
         self.assertEqual(discord_bot._normalise_usd_key("HYPE/USD"), "HYPE_USD")
         with self.assertRaisesRegex(ValueError, "Only BTC/USD"):
             discord_bot._normalise_usd_key("BTC/GBP")
@@ -145,7 +168,8 @@ class DiscordBotControlTests(unittest.TestCase):
                 "up_amount_gbp_json": "20.0",
             },
         )
-        self.assertIn("atomic budgets", message.replies[-1])
+        self.assertIn("Budget update queued", message.replies[-1])
+        self.assertIn("not applied yet", message.replies[-1])
         self.assertIn("sideways midpoint £15", message.replies[-1])
 
         enabled_rules = rules(enabled={"BTC_USD"})
@@ -210,7 +234,8 @@ class DiscordBotControlTests(unittest.TestCase):
             )
         self.assertTrue(handled)
         handler.assert_not_called()
-        self.assertIn("Unrecognized exact", message.replies[-1])
+        self.assertIn("Command not accepted", message.replies[-1])
+        self.assertIn("no changes were made", message.replies[-1])
 
     def test_budget_command_accepts_clear_high_word_and_legacy_up_alias(self):
         self.assertIsNotNone(
@@ -444,6 +469,8 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("SIDEWAYS/midpoint £15", status_message.replies[-1])
         self.assertIn("DOWNTREND/higher £20", status_message.replies[-1])
         self.assertIn("ready-but-disabled", status_message.replies[-1])
+        self.assertNotIn("✅ ENABLED", status_message.replies[-1])
+        self.assertLessEqual(len(status_message.replies[-1]), 1_990)
 
         with (
             patch.object(
@@ -458,6 +485,8 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("READY-BUT-DISABLED", health_message.replies[-1])
         self.assertIn("fresh READY 3/3", health_message.replies[-1])
         self.assertIn("Buy-enabled targets: 0/3", health_message.replies[-1])
+        self.assertIn("Gemini chat:", health_message.replies[-1])
+        self.assertNotIn("✅ Buy-enabled targets", health_message.replies[-1])
 
     def test_health_reports_armed_while_waiting_for_start_day_analysis(self):
         live_rules = rules(enabled=set(ALLOWED_TARGETS))
@@ -531,6 +560,360 @@ class DiscordBotControlTests(unittest.TestCase):
             asyncio.run(discord_bot.handle_health({}, message))
         self.assertIn("NOT READY", message.replies[-1])
         self.assertNotIn("do-not-echo", message.replies[-1])
+
+
+class DiscordBotHelpAndChatTests(unittest.TestCase):
+    def setUp(self):
+        discord_bot._chat_histories.clear()
+        discord_bot._chat_history_updated_at.clear()
+
+    def test_help_documents_every_supported_command_and_safety_boundary(self):
+        required = (
+            "show status",
+            "!dca status",
+            "!dca health",
+            "show portfolio",
+            "!dca portfolio",
+            "!dca help",
+            "!dca analyze BTC",
+            "!dca analyze all",
+            "!dca set BTC amounts to 10 low and 20 high",
+            "!dca disable BTC",
+            "!dca enable BTC",
+            "!dca confirm enable BTC_USD",
+            "bitcoin",
+            "hyperliquid",
+            "solana",
+            "Legacy `up`",
+            "Queued does not mean applied",
+            "Natural language never",
+            "same user",
+            "requires Gemini",
+            "configured channel and allowlist gate all replies",
+            "use a DM or mention the bot",
+            "Every `!dca` form requires exact lowercase words and internal spacing",
+        )
+        for item in required:
+            with self.subTest(item=item):
+                self.assertIn(item, discord_bot.HELP_TEXT)
+        self.assertLessEqual(len(discord_bot.HELP_TEXT), 1_990)
+
+    def test_exact_read_only_command_aliases_route_without_gemini(self):
+        cases = (
+            ("!dca help", "handle_help"),
+            ("!dca status", "handle_status"),
+            ("!dca health", "handle_health"),
+            ("!dca portfolio", "handle_portfolio"),
+        )
+        for command, handler_name in cases:
+            with self.subTest(command=command):
+                message = MessageStub(content=command)
+                with patch.object(
+                    discord_bot, handler_name, new_callable=AsyncMock
+                ) as handler:
+                    handled = asyncio.run(
+                        discord_bot._handle_exact_dca_command(command, message)
+                    )
+                self.assertTrue(handled)
+                handler.assert_awaited_once_with({}, message)
+
+    def test_every_exact_write_and_analysis_form_routes_deterministically(self):
+        cases = (
+            (
+                "!dca set Bitcoin amounts to 10 low and 20 high",
+                "handle_set_amounts",
+                ("Bitcoin", "10", "20"),
+            ),
+            (
+                "!dca set HYPE amounts to 5 low and 15 up",
+                "handle_set_amounts",
+                ("HYPE", "5", "15"),
+            ),
+            ("!dca disable bitcoin", "handle_disable", ("bitcoin",)),
+            ("!dca enable Hyperliquid", "handle_enable", ("Hyperliquid",)),
+            ("!dca analyze Solana", "handle_analyze", ({"symbol": "Solana"},)),
+            ("!dca analyze all", "handle_analyze", ({"symbol": "all"},)),
+        )
+        for command, handler_name, expected_args in cases:
+            with self.subTest(command=command):
+                message = MessageStub(content=command)
+                with patch.object(
+                    discord_bot, handler_name, new_callable=AsyncMock
+                ) as handler:
+                    handled = asyncio.run(
+                        discord_bot._handle_exact_dca_command(command, message)
+                    )
+                self.assertTrue(handled)
+                handler.assert_awaited_once_with(*expected_args, message)
+
+    def test_top_level_read_only_aliases_route_without_gemini(self):
+        cases = (
+            ("show status", "handle_status"),
+            ("SHOW STATUS", "handle_status"),
+            ("show portfolio", "handle_portfolio"),
+            ("help", "handle_help"),
+            ("!help", "handle_help"),
+        )
+        for command, handler_name in cases:
+            with self.subTest(command=command):
+                message = MessageStub(content=command)
+                with (
+                    patch.object(discord_bot, "CHANNEL_ID", "456"),
+                    patch.object(discord_bot, "ALLOWED_USERS", "123"),
+                    patch.object(
+                        discord_bot, handler_name, new_callable=AsyncMock
+                    ) as handler,
+                    patch.object(
+                        discord_bot, "classify_intent", new_callable=AsyncMock
+                    ) as classify,
+                ):
+                    asyncio.run(discord_bot.on_message(message))
+                handler.assert_awaited_once_with({}, message)
+                classify.assert_not_awaited()
+
+    def test_only_canonical_confirmation_form_reaches_confirmation_handler(self):
+        valid = "!dca confirm enable BTC_USD"
+        message = MessageStub(content=valid)
+        with patch.object(
+            discord_bot, "_handle_enable_confirmation", new_callable=AsyncMock
+        ) as confirmation:
+            self.assertTrue(
+                asyncio.run(discord_bot._handle_exact_dca_command(valid, message))
+            )
+        confirmation.assert_awaited_once_with(message, valid)
+
+        for invalid in (
+            "!dca confirmation",
+            "!dca confirm enable btc_usd",
+            "!dca confirm enable BTC_USD now",
+        ):
+            with self.subTest(invalid=invalid):
+                rejected = MessageStub(content=invalid)
+                with patch.object(
+                    discord_bot,
+                    "_handle_enable_confirmation",
+                    new_callable=AsyncMock,
+                ) as confirmation:
+                    self.assertTrue(
+                        asyncio.run(
+                            discord_bot._handle_exact_dca_command(invalid, rejected)
+                        )
+                    )
+                confirmation.assert_not_awaited()
+                self.assertIn("Command not accepted", rejected.replies[-1])
+
+    def test_intent_allowlist_cannot_authorize_writes_or_analysis(self):
+        for action in ("portfolio", "status", "health", "help", "chat", "unknown"):
+            with self.subTest(accepted=action):
+                self.assertEqual(
+                    discord_bot._validate_intent(
+                        {"action": action, "params": {}, "reply": "hello"}
+                    )["action"],
+                    action,
+                )
+        self.assertEqual(
+            discord_bot._validate_intent(
+                {
+                    "action": "portfolio",
+                    "params": {"short_report": False, "workflow": "daily_dca.yml"},
+                }
+            )["params"],
+            {},
+        )
+        for action in (
+            "analyze",
+            "set_amounts",
+            "set_enabled",
+            "enable",
+            "disable",
+            "confirm",
+            "buy",
+            "purchase",
+            "update_dca",
+        ):
+            with self.subTest(rejected=action):
+                self.assertEqual(
+                    discord_bot._validate_intent(
+                        {"action": action, "params": {"symbol": "BTC"}}
+                    )["action"],
+                    "unknown",
+                )
+
+    def test_model_prose_is_ignored_and_code_owns_every_chat_reply(self):
+        model_replies = (
+            "Guaranteed profit — you should buy BTC now 🚀",
+            "BTC is certain to double, so enable it before you miss out.",
+            "For your goals, increasing the BTC budget is the right move.",
+            "Great choice—keep stacking BTC! 🚀",
+            "Keep buying BTC; it is going to explode.",
+            "BTC will double. Turn it on before the price jumps.",
+            "You'll make money if you turn BTC on.",
+            "Don't wait—BTC is about to take off.",
+            "BTC looks strong 🔥💎.",
+            "You can disable a target before changing its budget.",
+        )
+        expected = discord_bot.CHAT_TOPIC_REPLIES["controls"]
+        for model_reply in model_replies:
+            with self.subTest(model_reply=model_reply):
+                intent = discord_bot._validate_intent(
+                    {
+                        "action": "chat",
+                        "topic": "controls",
+                        "reply": model_reply,
+                        "params": {"workflow": "daily_dca.yml"},
+                    }
+                )
+                self.assertEqual(intent["reply"], expected)
+                self.assertEqual(intent["params"], {})
+                self.assertNotIn(model_reply, intent["reply"])
+
+        self.assertIn("do not write a reply", discord_bot.CLASSIFY_PROMPT)
+        self.assertIn("Never return reply text", discord_bot.CLASSIFY_PROMPT)
+        self.assertFalse(
+            any(
+                mention in reply
+                for reply in discord_bot.CHAT_TOPIC_REPLIES.values()
+                for mention in ("@everyone", "@here", "<@")
+            )
+        )
+
+    def test_chat_history_is_bounded_and_isolated_by_channel_and_user(self):
+        first = MessageStub(user_id="123", channel_id="456")
+        for index in range(5):
+            discord_bot._remember_chat_turn(first, f"user {index}", f"bot {index}")
+        first_key = discord_bot._conversation_key(first)
+        self.assertEqual(len(discord_bot._chat_histories[first_key]), 3)
+        self.assertEqual(discord_bot._chat_histories[first_key][0][0], "user 2")
+
+        second = MessageStub(user_id="999", channel_id="456")
+        discord_bot._remember_chat_turn(second, "hello", "hi")
+        self.assertNotEqual(
+            discord_bot._conversation_key(first),
+            discord_bot._conversation_key(second),
+        )
+
+        expiring = MessageStub(user_id="555", channel_id="789")
+        with patch.object(discord_bot, "monotonic", return_value=100.0):
+            discord_bot._remember_chat_turn(expiring, "old", "turn")
+        with patch.object(
+            discord_bot,
+            "monotonic",
+            return_value=100.0 + discord_bot.CHAT_HISTORY_TTL_SECONDS + 1,
+        ):
+            self.assertEqual(discord_bot._recent_chat_history(expiring), [])
+
+    def test_unrelated_activity_globally_prunes_expired_history(self):
+        expired = MessageStub(user_id="111", channel_id="456")
+        fresh = MessageStub(user_id="222", channel_id="789")
+        expired_key = discord_bot._conversation_key(expired)
+        with patch.object(discord_bot, "monotonic", return_value=100.0):
+            discord_bot._remember_chat_turn(expired, "old", "turn")
+        with patch.object(
+            discord_bot,
+            "monotonic",
+            return_value=100.0 + discord_bot.CHAT_HISTORY_TTL_SECONDS + 1,
+        ):
+            discord_bot._remember_chat_turn(fresh, "new", "turn")
+        self.assertNotIn(expired_key, discord_bot._chat_histories)
+        self.assertNotIn(expired_key, discord_bot._chat_history_updated_at)
+
+    def test_chat_history_has_a_hard_session_cap(self):
+        for index in range(discord_bot.MAX_CHAT_SESSIONS + 5):
+            message = MessageStub(user_id=str(index), channel_id="456")
+            with patch.object(discord_bot, "monotonic", return_value=100.0 + index):
+                discord_bot._remember_chat_turn(message, "hello", "hi")
+        self.assertEqual(
+            len(discord_bot._chat_histories), discord_bot.MAX_CHAT_SESSIONS
+        )
+        self.assertEqual(
+            len(discord_bot._chat_history_updated_at),
+            discord_bot.MAX_CHAT_SESSIONS,
+        )
+        self.assertNotIn(("456", "0"), discord_bot._chat_histories)
+
+    def test_command_like_near_misses_never_reach_gemini(self):
+        commands = (
+            " !dca disable BTC",
+            "!dca disable BTC ",
+            "!DCA disable BTC",
+            "!dca  disable BTC",
+            "`!dca disable BTC`",
+            "```!dca disable BTC```",
+            '"!dca disable BTC"',
+            "- !dca disable BTC",
+            "* !dca enable BTC",
+            "please !dca analyze all",
+            "```text\n!dca disable BTC\n```",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                message = MessageStub(content=command)
+                with (
+                    patch.object(discord_bot, "CHANNEL_ID", "456"),
+                    patch.object(discord_bot, "ALLOWED_USERS", "123"),
+                    patch.object(
+                        discord_bot, "classify_intent", new_callable=AsyncMock
+                    ) as classify,
+                    patch.object(discord_bot, "trigger_workflow") as dispatch,
+                ):
+                    asyncio.run(discord_bot.on_message(message))
+                classify.assert_not_awaited()
+                dispatch.assert_not_called()
+                self.assertIn("Command not accepted", message.replies[-1])
+
+    def test_natural_chat_is_reply_only_with_mentions_disabled(self):
+        message = MessageStub(content="Tell me what DCA means")
+        intent = {
+            "action": "chat",
+            "params": {},
+            "reply": "Patient DCA spreads purchases over time.",
+        }
+        with (
+            patch.object(discord_bot, "CHANNEL_ID", "456"),
+            patch.object(discord_bot, "ALLOWED_USERS", "123"),
+            patch.object(
+                discord_bot,
+                "classify_intent",
+                new_callable=AsyncMock,
+                return_value=intent,
+            ),
+            patch.object(discord_bot, "trigger_workflow") as dispatch,
+        ):
+            asyncio.run(discord_bot.on_message(message))
+        dispatch.assert_not_called()
+        self.assertTrue(message.replies[-1].startswith("🐙 "))
+        self.assertIn("allowed_mentions", message.reply_kwargs[-1])
+
+    def test_even_malicious_model_action_has_no_write_handler(self):
+        message = MessageStub(content="Please enable BTC")
+        intent = {"action": "set_enabled", "params": {"symbol": "BTC"}, "reply": ""}
+        with (
+            patch.object(discord_bot, "CHANNEL_ID", "456"),
+            patch.object(discord_bot, "ALLOWED_USERS", "123"),
+            patch.object(
+                discord_bot,
+                "classify_intent",
+                new_callable=AsyncMock,
+                return_value=intent,
+            ),
+            patch.object(discord_bot, "handle_enable", new_callable=AsyncMock) as enable,
+            patch.object(discord_bot, "trigger_workflow") as dispatch,
+        ):
+            asyncio.run(discord_bot.on_message(message))
+        enable.assert_not_awaited()
+        dispatch.assert_not_called()
+        self.assertIn("help", message.replies[-1])
+
+    def test_read_only_keyword_fallback_works_without_gemini_key(self):
+        with (
+            patch.object(discord_bot, "GEMINI_API_KEY", ""),
+            patch.object(discord_bot.genai, "Client") as client,
+        ):
+            result = asyncio.run(
+                discord_bot.classify_intent("Is the scheduler healthy?")
+            )
+        self.assertEqual(result["action"], "health")
+        client.assert_not_called()
 
 
 class DiscordBotSchedulerTests(unittest.TestCase):
@@ -902,21 +1285,94 @@ class DiscordBotWorkflowAndGeminiTests(unittest.TestCase):
         )
         response = MagicMock()
         response.text = json.dumps(
-            {"action": "status", "params": {}, "reply": "Show status"}
+            {"action": "status", "topic": "capabilities"}
         )
         client = MagicMock()
-        client.__enter__.return_value = client
-        client.models.generate_content.return_value = response
+        client.aio.models.generate_content = AsyncMock(return_value=response)
+        client.aio.aclose = AsyncMock()
         with (
             patch.object(discord_bot, "GEMINI_API_KEY", "test-key"),
             patch.object(discord_bot.genai, "Client", return_value=client) as ctor,
         ):
             result = asyncio.run(discord_bot.classify_intent("show status"))
-        ctor.assert_called_once_with(api_key="test-key")
-        client.models.generate_content.assert_called_once_with(
-            model="gemini-3.5-flash-lite", contents=ANY
+        ctor.assert_called_once()
+        self.assertEqual(ctor.call_args.kwargs["api_key"], "test-key")
+        http_options = ctor.call_args.kwargs["http_options"]
+        self.assertEqual(
+            http_options.timeout, discord_bot.GEMINI_TIMEOUT_SECONDS * 1_000
         )
+        self.assertEqual(http_options.retry_options.attempts, 1)
+        self.assertIsInstance(
+            http_options.async_client_args["transport"],
+            discord_bot.httpx.AsyncHTTPTransport,
+        )
+        client.aio.models.generate_content.assert_awaited_once_with(
+            model="gemini-3.5-flash-lite", contents=ANY, config=ANY
+        )
+        client.aio.aclose.assert_awaited_once()
         self.assertEqual(result["action"], "status")
+
+    def test_gemini_chat_topic_uses_code_owned_reply(self):
+        response = MagicMock()
+        response.text = json.dumps(
+            {
+                "action": "chat",
+                "topic": "risk",
+                "reply": "Guaranteed profit — you should buy BTC now 🚀 @everyone",
+            }
+        )
+        client = MagicMock()
+        client.aio.models.generate_content = AsyncMock(return_value=response)
+        client.aio.aclose = AsyncMock()
+        with (
+            patch.object(discord_bot, "GEMINI_API_KEY", "test-key"),
+            patch.object(discord_bot.genai, "Client", return_value=client),
+        ):
+            result = asyncio.run(discord_bot.classify_intent("Should I buy BTC?"))
+        self.assertEqual(result["action"], "chat")
+        self.assertEqual(result["reply"], discord_bot.CHAT_TOPIC_REPLIES["risk"])
+        self.assertNotIn("Guaranteed profit", result["reply"])
+        self.assertNotIn("@everyone", result["reply"])
+        client.aio.aclose.assert_awaited_once()
+
+    def test_gemini_timeout_cancels_primary_before_safe_fallback(self):
+        cancelled = {"value": False}
+
+        async def slow_request(*args, **kwargs):
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled["value"] = True
+                raise
+
+        response = MagicMock()
+        response.text = json.dumps(
+            {"action": "chat", "topic": "dca"}
+        )
+        primary = MagicMock()
+        primary.aio.models.generate_content = AsyncMock(side_effect=slow_request)
+        primary.aio.aclose = AsyncMock()
+        fallback = MagicMock()
+        fallback.aio.models.generate_content = AsyncMock(return_value=response)
+        fallback.aio.aclose = AsyncMock()
+
+        with (
+            patch.object(discord_bot, "GEMINI_API_KEY", "test-key"),
+            patch.object(discord_bot, "GEMINI_TIMEOUT_SECONDS", 0.01),
+            patch.object(
+                discord_bot.genai,
+                "Client",
+                side_effect=(primary, fallback),
+            ) as ctor,
+        ):
+            result = asyncio.run(discord_bot.classify_intent("Explain DCA calmly"))
+
+        self.assertTrue(cancelled["value"])
+        self.assertEqual(result["action"], "chat")
+        self.assertEqual(ctor.call_count, 2)
+        primary.aio.aclose.assert_awaited_once()
+        fallback.aio.models.generate_content.assert_awaited_once()
+        fallback.aio.aclose.assert_awaited_once()
 
 
 if __name__ == "__main__":

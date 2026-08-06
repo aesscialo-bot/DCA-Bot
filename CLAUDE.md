@@ -23,6 +23,11 @@ workflows, or release configuration.
 - Stale, missing, insufficient, or inconsistent state always skips trading.
 - A pending funding or crypto order must be reconciled before any new order.
 - Kraken is the portfolio and execution source of truth.
+- Gemini Flash-Lite chat is optional and read-only. It may classify only an
+  approved chat topic or read-only handler; code-owned templates render every
+  chat reply and free-form model prose is never posted. It must never reach
+  analysis, configuration, enable/disable, confirmation, scheduler, or order
+  handlers.
 - Gist and Ghostfolio are optional post-fill mirrors and never influence spend,
   success, scheduling, trend classification, or recovery.
 

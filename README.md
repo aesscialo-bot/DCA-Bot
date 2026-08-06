@@ -170,8 +170,11 @@ Required Railway runtime variables:
 - `DCA_CRON_ENABLED` (`true` for normal operation)
 - `TIMEZONE` (`Asia/Bangkok`, matching the GitHub repository variable)
 
-Railway may also contain `GEMINI_API_KEY` for optional read-only conversational
-intent classification. Exact DCA control commands never depend on AI.
+Railway may also contain `GEMINI_API_KEY` for Krakie's optional natural-language
+chat and read-only conversational routing. Stable `gemini-3.5-flash-lite`, with
+a stable Flash-Lite fallback, classifies an approved educational topic or
+read-only action; reviewed Krakie templates supply the Discord wording. Exact
+DCA controls, scheduling, analysis, and trading never depend on AI.
 
 Optional repository variables:
 
@@ -209,13 +212,25 @@ Examples use canonical USD targets:
 !dca analyze BTC
 !dca analyze all
 show status
+!dca status
 !dca health
+show portfolio
+!dca portfolio
+!dca help
 ```
 
 Budget changes require the target to be disabled. Enabling requires exact
 confirmation and displays the lower, midpoint, and higher amounts, the latest
 regime, effective amount, next execution time, decision age, and aggregate
 maximum daily exposure.
+
+Messages that are not exact commands can be answered conversationally by
+Krakie through Gemini Flash-Lite. Natural language is read-only: it cannot
+change budgets, start analysis, enable or disable a target, confirm an action,
+or place an order. Gemini selects only an approved topic or read-only handler;
+free-form model prose is never posted to Discord. Reviewed templates keep the
+answers friendly, neutral, and mention-free. Type `help` in Discord for the
+complete command deck and asset aliases.
 
 ## Workflows
 
