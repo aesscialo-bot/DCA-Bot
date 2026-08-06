@@ -1,9 +1,11 @@
+import hashlib
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import crypto_dca
+import dca_config
 from dca_config import (
     amount_tier_for_regime,
     default_rules_map,
@@ -60,6 +62,26 @@ def pending_intent(target="BTC_USD", *, amount=20, trade_date="2026-08-05"):
         "amount_gbp": float(amount),
         "decision_id": f"decision-{target.lower()}",
         "created_at": "2026-08-05T04:59:00Z",
+    }
+
+
+def pending_gist_delivery(
+    target="BTC_USD", *, delivery_id="kraken-order-id", quantity="0.00040000"
+):
+    symbol = target.split("_", maxsplit=1)[0]
+    row = (
+        f"| 2026-08-05 12:00 +07 | GBP 20.00 | 1.275000 | USD 25.5000 | "
+        f"USD 25.4300 | GBP equivalent 0.04 | USD 63,431.2500 | "
+        f"{quantity} {symbol} | kraken-funding-order-id | {delivery_id} | "
+        "optional/not saved |\n"
+    )
+    return {
+        "version": 1,
+        "delivery_id": delivery_id,
+        "created_at": "2026-08-05T05:00:00Z",
+        "symbol": symbol,
+        "row": row,
+        "row_sha256": hashlib.sha256(row.encode("utf-8")).hexdigest(),
     }
 
 
@@ -258,6 +280,7 @@ class DurableIntentTests(unittest.TestCase):
 
     def test_completion_preserves_other_asset_state(self):
         intent = pending_intent()
+        delivery = pending_gist_delivery()
         state = {
             "BTC_USD": {"LAST_BUY_DATE": "", "PENDING_ORDER": intent},
             "HYPE_USD": {"LAST_BUY_DATE": "2026-08-04"},
@@ -273,11 +296,180 @@ class DurableIntentTests(unittest.TestCase):
                 intent["client_order_id"],
                 intent["trade_date"],
                 intent["decision_id"],
+                gist_delivery=delivery,
             )
 
         written = write.call_args.args[1]
-        self.assertEqual(written["BTC_USD"], {"LAST_BUY_DATE": "2026-08-05"})
+        self.assertEqual(written["BTC_USD"]["LAST_BUY_DATE"], "2026-08-05")
+        self.assertEqual(
+            written["BTC_USD"]["PENDING_GIST_DELIVERIES"], [delivery]
+        )
+        self.assertNotIn("PENDING_ORDER", written["BTC_USD"])
         self.assertEqual(written["HYPE_USD"], {"LAST_BUY_DATE": "2026-08-04"})
+
+    def test_completion_atomically_enqueues_confirmed_fill_delivery(self):
+        intent = pending_intent()
+        delivery = pending_gist_delivery()
+        state = {
+            "BTC_USD": {"LAST_BUY_DATE": "", "PENDING_ORDER": intent},
+        }
+        with (
+            patch.object(
+                crypto_dca, "_fetch_repo_json_variable", return_value=(state, True)
+            ),
+            patch.object(crypto_dca, "_write_repo_json_variable") as write,
+        ):
+            crypto_dca.complete_order_intent(
+                "BTC_USD",
+                intent["client_order_id"],
+                intent["trade_date"],
+                intent["decision_id"],
+                gist_delivery=delivery,
+            )
+
+        written = write.call_args.args[1]
+        self.assertEqual(written["BTC_USD"]["LAST_BUY_DATE"], "2026-08-05")
+        self.assertNotIn("PENDING_ORDER", written["BTC_USD"])
+        self.assertEqual(
+            written["BTC_USD"]["PENDING_GIST_DELIVERIES"], [delivery]
+        )
+
+    def test_completion_requires_durable_delivery_evidence(self):
+        intent = pending_intent()
+        with self.assertRaisesRegex(TypeError, "gist_delivery"):
+            crypto_dca.complete_order_intent(
+                "BTC_USD",
+                intent["client_order_id"],
+                intent["trade_date"],
+                intent["decision_id"],
+            )
+
+    def test_acknowledgement_removes_only_the_exact_delivery(self):
+        first = pending_gist_delivery(delivery_id="kraken-order-one")
+        second = pending_gist_delivery(delivery_id="kraken-order-two")
+        state = {
+            "BTC_USD": {
+                "LAST_BUY_DATE": "2026-08-05",
+                "PENDING_GIST_DELIVERIES": [first, second],
+            },
+            "SOL_USD": {"LAST_BUY_DATE": "2026-08-04"},
+        }
+        with (
+            patch.object(
+                crypto_dca, "_fetch_repo_json_variable", return_value=(state, True)
+            ),
+            patch.object(crypto_dca, "_write_repo_json_variable") as write,
+        ):
+            self.assertTrue(
+                crypto_dca.acknowledge_gist_delivery(
+                    "BTC_USD", first["delivery_id"], first["row_sha256"]
+                )
+            )
+
+        written = write.call_args.args[1]
+        self.assertEqual(
+            written["BTC_USD"]["PENDING_GIST_DELIVERIES"], [second]
+        )
+        self.assertEqual(written["SOL_USD"]["LAST_BUY_DATE"], "2026-08-04")
+
+    def test_failed_delivery_stays_queued_and_never_calls_kraken(self):
+        delivery = pending_gist_delivery()
+        state = {
+            "BTC_USD": {
+                "LAST_BUY_DATE": "2026-08-05",
+                "PENDING_GIST_DELIVERIES": [delivery],
+            }
+        }
+        with (
+            patch.object(crypto_dca, "update_gist_log", return_value=False),
+            patch.object(crypto_dca, "acknowledge_gist_delivery") as acknowledge,
+            patch.object(crypto_dca, "place_gbp_funded_market_buy") as place,
+        ):
+            self.assertFalse(crypto_dca.retry_pending_gist_deliveries(state))
+
+        acknowledge.assert_not_called()
+        place.assert_not_called()
+
+    def test_full_delivery_queue_keeps_exact_order_intent_locked(self):
+        intent = pending_intent()
+        deliveries = [
+            pending_gist_delivery(delivery_id=f"kraken-order-{index:02d}")
+            for index in range(crypto_dca.MAX_PENDING_GIST_DELIVERIES)
+        ]
+        state = {
+            "BTC_USD": {
+                "LAST_BUY_DATE": "",
+                "PENDING_ORDER": intent,
+                "PENDING_GIST_DELIVERIES": deliveries,
+            }
+        }
+        with (
+            patch.object(
+                crypto_dca, "_fetch_repo_json_variable", return_value=(state, True)
+            ),
+            patch.object(crypto_dca, "_write_repo_json_variable") as write,
+            self.assertRaisesRegex(RuntimeError, "queue is full"),
+        ):
+            crypto_dca.complete_order_intent(
+                "BTC_USD",
+                intent["client_order_id"],
+                intent["trade_date"],
+                intent["decision_id"],
+                gist_delivery=pending_gist_delivery(
+                    delivery_id="kraken-order-overflow"
+                ),
+            )
+
+        write.assert_not_called()
+
+    def test_prepare_reserves_delivery_capacity_before_persisting_new_intent(self):
+        with (
+            patch.object(
+                crypto_dca, "_fetch_repo_json_variable", return_value=({}, False)
+            ),
+            patch.object(
+                crypto_dca,
+                "ensure_gist_delivery_capacity",
+                side_effect=dca_config.ConfigError("no delivery capacity"),
+            ) as reserve,
+            patch.object(crypto_dca, "_write_repo_json_variable") as write,
+            self.assertRaisesRegex(ValueError, "no delivery capacity"),
+        ):
+            crypto_dca.prepare_order_intent(
+                "BTC_USD",
+                "dca-1234567890abcd",
+                "dca-fedcba09876543",
+                "2026-08-05",
+                20,
+                "decision-btc",
+            )
+
+        reserve.assert_called_once_with(
+            {"BTC_USD": {"LAST_BUY_DATE": ""}}, "BTC_USD"
+        )
+        write.assert_not_called()
+
+    def test_retry_acknowledges_delivery_without_calling_kraken(self):
+        delivery = pending_gist_delivery()
+        state = {
+            "BTC_USD": {
+                "LAST_BUY_DATE": "2026-08-05",
+                "PENDING_GIST_DELIVERIES": [delivery],
+            }
+        }
+        with (
+            patch.object(crypto_dca, "update_gist_log", return_value=True),
+            patch.object(
+                crypto_dca, "acknowledge_gist_delivery", return_value=True
+            ) as acknowledge,
+            patch.object(crypto_dca, "place_gbp_funded_market_buy") as place,
+        ):
+            self.assertTrue(crypto_dca.retry_pending_gist_deliveries(state))
+
+        acknowledge.assert_called_once_with(
+            "BTC_USD", delivery["delivery_id"], delivery["row_sha256"]
+        )
+        place.assert_not_called()
 
 
 class LiveRevalidationTests(unittest.TestCase):
@@ -464,7 +656,12 @@ class TradeExecutionTests(unittest.TestCase):
             "fee_gbp": 0.04,
             "gbp_fee_debit": 0.0,
             "fee_details": [
-                {"currency": "USD", "amount": 0.05, "usd_equivalent": 0.05}
+                {
+                    "currency": "USD",
+                    "amount": 0.05,
+                    "usd_equivalent": 0.05,
+                    "gbp_equivalent": 0.04,
+                }
             ],
             "spent_gbp": 20.0,
             "funded_usd": 25.5,
@@ -539,6 +736,12 @@ class TradeExecutionTests(unittest.TestCase):
 
         self.assertTrue(succeeded)
         self.assertEqual(revalidate.call_count, 3)
+        self.assertTrue(
+            all(
+                call.kwargs.get("reserve_gist_delivery") is True
+                for call in revalidate.call_args_list
+            )
+        )
         self.assertEqual(events, ["place-entered", "after-check"])
         self.assertEqual(build_id.call_count, 2)
         self.assertEqual(build_id.call_args_list[0].kwargs, {"purpose": "buy"})
@@ -547,11 +750,19 @@ class TradeExecutionTests(unittest.TestCase):
             place_order.call_args.kwargs["funding_client_order_id"],
             self.intent["funding_client_order_id"],
         )
-        complete.assert_called_once_with(
-            "BTC_USD",
-            self.intent["client_order_id"],
-            self.intent["trade_date"],
-            self.intent["decision_id"],
+        complete.assert_called_once()
+        self.assertEqual(
+            complete.call_args.args,
+            (
+                "BTC_USD",
+                self.intent["client_order_id"],
+                self.intent["trade_date"],
+                self.intent["decision_id"],
+            ),
+        )
+        self.assertEqual(
+            complete.call_args.kwargs["gist_delivery"]["delivery_id"],
+            self.order_data["order_id"],
         )
 
     def test_requested_amount_must_equal_the_decision_tier(self):
@@ -570,6 +781,46 @@ class TradeExecutionTests(unittest.TestCase):
             succeeded = crypto_dca.execute_trade(
                 "BTC_USD",
                 10,
+                expected_rule=self.rules["BTC_USD"],
+                expected_decision=self.decision,
+            )
+
+        self.assertFalse(succeeded)
+        prepare.assert_not_called()
+        place.assert_not_called()
+
+    def test_full_delivery_queue_blocks_new_order_before_kraken(self):
+        deliveries = [
+            pending_gist_delivery(delivery_id=f"kraken-order-{index:02d}")
+            for index in range(dca_config.MAX_PENDING_GIST_DELIVERIES)
+        ]
+        state = {
+            "BTC_USD": {
+                "LAST_BUY_DATE": "",
+                "PENDING_GIST_DELIVERIES": deliveries,
+            }
+        }
+        analysis = analysis_for(
+            self.rules, {"BTC_USD": self.decision}
+        )
+        with (
+            patch.object(crypto_dca, "_utc_now", return_value=NOW),
+            patch.object(
+                crypto_dca, "fetch_live_execution_state", return_value=state
+            ),
+            patch.object(
+                crypto_dca, "fetch_live_target_map", return_value=self.rules
+            ),
+            patch.object(
+                crypto_dca, "fetch_live_analysis_state", return_value=analysis
+            ),
+            patch.object(crypto_dca, "prepare_order_intent") as prepare,
+            patch.object(crypto_dca, "place_gbp_funded_market_buy") as place,
+            patch.object(crypto_dca, "send_discord_alert"),
+        ):
+            succeeded = crypto_dca.execute_trade(
+                "BTC_USD",
+                20,
                 expected_rule=self.rules["BTC_USD"],
                 expected_decision=self.decision,
             )
@@ -652,6 +903,11 @@ class TradeExecutionTests(unittest.TestCase):
             patch.object(crypto_dca, "prepare_order_intent") as prepare,
             patch.object(
                 crypto_dca,
+                "ensure_gist_delivery_capacity",
+                side_effect=AssertionError("recovery must not run capacity gate"),
+            ) as reserve,
+            patch.object(
+                crypto_dca,
                 "place_gbp_funded_market_buy",
                 side_effect=crypto_dca.KrakenOrderStateUnknown("not visible"),
             ) as place,
@@ -662,6 +918,7 @@ class TradeExecutionTests(unittest.TestCase):
 
         self.assertFalse(succeeded)
         prepare.assert_not_called()
+        reserve.assert_not_called()
         clear.assert_not_called()
         self.assertEqual(place.call_args.args, ("BTC_USD", 10.0))
         self.assertEqual(
@@ -685,11 +942,19 @@ class TradeExecutionTests(unittest.TestCase):
         ):
             self.assertTrue(crypto_dca.execute_trade("BTC_USD", 20))
 
-        complete.assert_called_once_with(
-            "BTC_USD",
-            old["client_order_id"],
-            "2026-08-05",
-            old["decision_id"],
+        complete.assert_called_once()
+        self.assertEqual(
+            complete.call_args.args,
+            (
+                "BTC_USD",
+                old["client_order_id"],
+                "2026-08-05",
+                old["decision_id"],
+            ),
+        )
+        self.assertEqual(
+            complete.call_args.kwargs["gist_delivery"]["delivery_id"],
+            recovered["order_id"],
         )
 
 

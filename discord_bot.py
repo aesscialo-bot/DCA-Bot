@@ -82,6 +82,7 @@ _pending_enable_confirmations: dict[str, dict[str, Any]] = {}
 # symbol -> absolute decision and execution-state metadata.
 _dca_schedule: dict[str, dict[str, Any]] = {}
 _pending_recovery_symbols: set[str] = set()
+_pending_gist_delivery_symbols: set[str] = set()
 _awaiting_start_day_symbols: set[str] = set()
 _dca_dispatch_guard: dict[tuple[str, str], float] = {}
 _schedule_error: str | None = None
@@ -705,7 +706,13 @@ def _decision_summary(
     status = "ENABLED" if enabled else "disabled"
     state_entry = execution.get(symbol, {})
     pending = isinstance(state_entry.get("PENDING_ORDER"), Mapping)
-    pending_text = " | PENDING ORDER RECOVERY" if pending else ""
+    pending_text = " | PENDING KRAKEN ORDER RECOVERY" if pending else ""
+    delivery_count = len(state_entry.get("PENDING_GIST_DELIVERIES", []))
+    delivery_text = (
+        f" | PORTFOLIO LEDGER DELIVERY WARNING ({delivery_count} pending)"
+        if delivery_count
+        else ""
+    )
     if decision["STATUS"] == "READY":
         regime = decision["REGIME"]
         amount = _display_amount(effective_amount(rule, decision))
@@ -726,7 +733,17 @@ def _decision_summary(
         f"{_display_amount(amounts['UP'])}\n"
         f"  Analysis: {decision_status} | Regime: `{regime}` | Effective: {amount} | "
         f"Next: `{next_time}` | Age: `{age}`\n"
-        f"  Last buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}`{pending_text}"
+        f"  Last buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}`"
+        f"{pending_text}{delivery_text}"
+    )
+
+
+def _pending_gist_delivery_count(execution: Mapping[str, Any]) -> int:
+    """Return queued Portfolio Compass ledger records, not Kraken intents."""
+
+    return sum(
+        len(entry.get("PENDING_GIST_DELIVERIES", []))
+        for entry in execution.values()
     )
 
 
@@ -780,6 +797,19 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         isinstance(entry.get("PENDING_ORDER"), Mapping)
         for entry in execution.values()
     )
+    delivery_count = _pending_gist_delivery_count(execution)
+    if delivery_count:
+        retry_status = (
+            "automatic 30-minute retry active"
+            if DCA_CRON_ENABLED
+            else "automatic retry paused with scheduler"
+        )
+        lines.append(
+            "Portfolio ledger delivery: **WARNING — "
+            f"{delivery_count} pending record(s); {retry_status}**"
+        )
+    else:
+        lines.append("Portfolio ledger delivery: **clear (0 pending records)**")
     if (
         all_disabled
         and analysis_ready
@@ -826,6 +856,15 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     pending_count = sum(
         isinstance(entry.get("PENDING_ORDER"), Mapping) for entry in execution.values()
     )
+    delivery_count = _pending_gist_delivery_count(execution)
+    delivery_symbols = sum(
+        bool(entry.get("PENDING_GIST_DELIVERIES")) for entry in execution.values()
+    )
+    delivery_retry_status = (
+        "automatic 30-minute retry active"
+        if DCA_CRON_ENABLED
+        else "automatic retry paused with scheduler"
+    )
     enabled_count = sum(rule["BUY_ENABLED"] for rule in rules.values())
     analysis_ok = (
         not errors and not stale and not mismatched and not awaiting_symbols
@@ -846,9 +885,15 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
         if awaiting_start_analysis
         else
         "READY-BUT-DISABLED"
-        if analysis_ok and enabled_count == 0 and scheduler_ok and pending_count == 0
+        if (
+            analysis_ok
+            and enabled_count == 0
+            and scheduler_ok
+            and pending_count == 0
+            and delivery_count == 0
+        )
         else "ATTENTION REQUIRED"
-        if not analysis_ok or not scheduler_ok or pending_count
+        if not analysis_ok or not scheduler_ok or pending_count or delivery_count
         else "ACTIVE"
     )
     lines = [
@@ -859,7 +904,14 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
             if awaiting_start_analysis
             else f"- Analysis: fresh READY {len(ready)}/3"
         ),
-        f"- Execution state: valid; pending intents {pending_count}",
+        f"- Execution state: valid; pending Kraken recoveries {pending_count}",
+        (
+            "- Portfolio ledger delivery: WARNING; "
+            f"{delivery_count} pending record(s) across {delivery_symbols} target(s); "
+            f"{delivery_retry_status}"
+            if delivery_count
+            else "- Portfolio ledger delivery: clear; 0 pending records"
+        ),
         f"- Scheduler: {'running' if DCA_CRON_ENABLED else 'paused'}; "
         f"active targets {len(_dca_schedule)}",
         f"- Buy-enabled targets: {enabled_count}/3",
@@ -909,6 +961,7 @@ def _clear_schedule(error: str | None = None) -> None:
     global _schedule_error, _schedule_warning, _schedule_start_date
     _dca_schedule.clear()
     _pending_recovery_symbols.clear()
+    _pending_gist_delivery_symbols.clear()
     _awaiting_start_day_symbols.clear()
     _schedule_error = error
     _schedule_warning = None
@@ -942,6 +995,12 @@ def refresh_dca_schedule(
         symbol
         for symbol, entry in execution.items()
         if isinstance(entry.get("PENDING_ORDER"), Mapping)
+    )
+    _pending_gist_delivery_symbols.clear()
+    _pending_gist_delivery_symbols.update(
+        symbol
+        for symbol, entry in execution.items()
+        if entry.get("PENDING_GIST_DELIVERIES")
     )
     try:
         if rules_json is None or analysis_json is None:
@@ -1018,7 +1077,7 @@ def _guard_key(symbol: str, schedule: Mapping[str, Any] | None, now: datetime) -
 
 
 def _due_symbols_for_dispatch(now: datetime) -> list[str]:
-    """Return assets inside their absolute -5/+60 windows or needing recovery."""
+    """Return assets due for buys, Kraken recovery, or ledger delivery."""
 
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("scheduler time must include a timezone")
@@ -1028,7 +1087,8 @@ def _due_symbols_for_dispatch(now: datetime) -> list[str]:
             _dca_dispatch_guard.pop(guard, None)
 
     due: list[str] = []
-    for symbol in sorted(_pending_recovery_symbols):
+    retry_symbols = _pending_recovery_symbols | _pending_gist_delivery_symbols
+    for symbol in sorted(retry_symbols):
         key = _guard_key(symbol, _dca_schedule.get(symbol), now)
         if (symbol, key) not in _dca_dispatch_guard:
             due.append(symbol)
@@ -1058,8 +1118,21 @@ def _format_cron_status() -> str:
     if not DCA_CRON_ENABLED:
         return "Scheduler paused"
     if _schedule_error:
+        retry_activity: list[str] = []
         if _pending_recovery_symbols:
-            return f"New-order scheduler invalid; pending recovery active: {_schedule_error}"
+            retry_activity.append(
+                f"Kraken recovery for {len(_pending_recovery_symbols)} target(s)"
+            )
+        if _pending_gist_delivery_symbols:
+            retry_activity.append(
+                "portfolio ledger delivery for "
+                f"{len(_pending_gist_delivery_symbols)} target(s)"
+            )
+        if retry_activity:
+            return (
+                "New-order scheduler invalid; retry active for "
+                f"{'; '.join(retry_activity)}: {_schedule_error}"
+            )
         return f"Scheduler invalid: {_schedule_error}"
     if _schedule_warning:
         return f"Scheduler running with skipped target(s): {_schedule_warning}"
@@ -1089,7 +1162,8 @@ _FIVE_MINUTE_TICKS = [
 
 @tasks.loop(time=_FIVE_MINUTE_TICKS)
 async def dca_scheduler_tick() -> None:
-    if not DCA_CRON_ENABLED or (_schedule_error and not _pending_recovery_symbols):
+    retry_pending = _pending_recovery_symbols or _pending_gist_delivery_symbols
+    if not DCA_CRON_ENABLED or (_schedule_error and not retry_pending):
         return
     now = datetime.now(timezone.utc)
     due = _due_symbols_for_dispatch(now)
@@ -1165,6 +1239,7 @@ async def dca_schedule_refresh() -> None:
     _log(
         f"INFO scheduler ready active_targets={len(_dca_schedule)} "
         f"pending_recovery={len(_pending_recovery_symbols)} decision_ages={','.join(ages)} "
+        f"pending_portfolio_delivery={len(_pending_gist_delivery_symbols)} "
         f"posture={_format_cron_status()}"
     )
 

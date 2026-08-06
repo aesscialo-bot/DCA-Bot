@@ -14,17 +14,20 @@ import requests
 from dca_config import (
     ALLOWED_TARGETS,
     ConfigError,
+    MAX_PENDING_GIST_DELIVERIES,
     decision_analyzed_on_or_after,
     decision_age_minutes,
+    ensure_gist_delivery_capacity,
     effective_amount,
     is_execution_window,
     parse_utc_iso,
     rules_hash,
     validate_analysis_state,
     validate_execution_state,
+    validate_gist_delivery,
     validate_rules_map,
 )
-from gist_logger import update_gist_log
+from gist_logger import build_gist_delivery, update_gist_log
 from kraken_client import (
     KrakenOrderNoFill,
     KrakenPreSubmissionError,
@@ -49,6 +52,7 @@ RULES_VARIABLE = "DCA_TARGET_MAP"
 ANALYSIS_STATE_VARIABLE = "DCA_ANALYSIS_STATE"
 EXECUTION_STATE_VARIABLE = "DCA_EXECUTION_STATE"
 PENDING_ORDER_FIELD = "PENDING_ORDER"
+PENDING_GIST_DELIVERIES_FIELD = "PENDING_GIST_DELIVERIES"
 _CLIENT_ORDER_ID_PATTERN = re.compile(r"^dca-[0-9a-f]{14}$")
 
 
@@ -219,6 +223,11 @@ def _pending_order_for_symbol(execution_state, symbol_key):
     return _normalise_pending_order(pending, symbol_key) if pending else None
 
 
+def _pending_gist_deliveries_for_symbol(execution_state, symbol_key):
+    entry = _execution_state_for_symbol(symbol_key, execution_state)
+    return list(entry.get(PENDING_GIST_DELIVERIES_FIELD, []))
+
+
 def get_config_for_symbol(symbol_key, target_map, execution_state=None):
     """Return one normalized final-schema rule plus its trader-owned state."""
     rules = validate_rules_map(target_map, require_all=False)
@@ -231,6 +240,9 @@ def get_config_for_symbol(symbol_key, target_map, execution_state=None):
         **rules[symbol_key],
         "LAST_BUY_DATE": state_entry.get("LAST_BUY_DATE", ""),
         "PENDING_ORDER": state_entry.get(PENDING_ORDER_FIELD),
+        "PENDING_GIST_DELIVERIES": list(
+            state_entry.get(PENDING_GIST_DELIVERIES_FIELD, [])
+        ),
     }
 
 
@@ -274,10 +286,12 @@ def _fetch_repo_json_variable(variable_name, *, required):
 
 
 def _write_repo_json_variable(variable_name, value, *, exists):
+    if variable_name == EXECUTION_STATE_VARIABLE:
+        value = validate_execution_state(value)
     url, collection_url, headers = _github_variable_context(variable_name)
     data = {
         "name": variable_name,
-        "value": json.dumps(value, separators=(",", ":")),
+        "value": json.dumps(value, separators=(",", ":"), ensure_ascii=False),
     }
     if exists:
         response = requests.patch(url, headers=headers, json=data, timeout=15)
@@ -365,6 +379,11 @@ def prepare_order_intent(
     if pending is not None:
         return _normalise_pending_order(pending, symbol_key), True
 
+    # A confirmed fill must be able to transition atomically from PENDING_ORDER
+    # to a durable Portfolio Compass delivery.  Reserve that storage before the
+    # Kraken client can ever receive AddOrder.
+    ensure_gist_delivery_capacity(state, symbol_key)
+
     pending = {
         "client_order_id": client_order_id,
         "funding_client_order_id": funding_client_order_id,
@@ -403,9 +422,19 @@ def clear_order_intent(symbol_key, client_order_id, decision_id=None):
 
 
 def complete_order_intent(
-    symbol_key, client_order_id, completed_date, decision_id=None
+    symbol_key,
+    client_order_id,
+    completed_date,
+    decision_id=None,
+    *,
+    gist_delivery,
 ):
-    """Atomically record one local-day completion and remove its exact intent."""
+    """Atomically complete an order and retain its immutable Gist delivery.
+
+    The confirmed fill is never marked complete without first retaining the
+    delivery evidence in the same protected execution-state write.  Gist
+    availability therefore cannot cause the Kraken order to be repeated.
+    """
     _parse_trade_date(completed_date, symbol_key)
     raw_state, exists = _fetch_repo_json_variable(
         EXECUTION_STATE_VARIABLE, required=True
@@ -418,13 +447,110 @@ def complete_order_intent(
         )
     if decision_id is not None and pending["decision_id"] != decision_id:
         raise RuntimeError(f"Durable decision changed for {symbol_key}")
-    state[symbol_key]["LAST_BUY_DATE"] = completed_date
-    state[symbol_key].pop(PENDING_ORDER_FIELD, None)
+    entry = state[symbol_key]
+    normalized_delivery = validate_gist_delivery(gist_delivery, symbol_key)
+    deliveries = list(entry.get(PENDING_GIST_DELIVERIES_FIELD, []))
+    existing = next(
+        (
+            queued
+            for queued in deliveries
+            if queued["delivery_id"] == normalized_delivery["delivery_id"]
+        ),
+        None,
+    )
+    if existing is not None and existing != normalized_delivery:
+        raise RuntimeError(
+            f"A different Gist delivery already uses the Kraken order ID for {symbol_key}"
+        )
+    if existing is None:
+        if len(deliveries) >= MAX_PENDING_GIST_DELIVERIES:
+            raise RuntimeError(
+                f"The durable Gist delivery queue is full for {symbol_key}"
+            )
+        deliveries.append(normalized_delivery)
+    entry[PENDING_GIST_DELIVERIES_FIELD] = deliveries
+
+    entry["LAST_BUY_DATE"] = completed_date
+    entry.pop(PENDING_ORDER_FIELD, None)
     _write_repo_json_variable(EXECUTION_STATE_VARIABLE, state, exists=exists)
     print(
         f"Completed order intent for {symbol_key}; LAST_BUY_DATE={completed_date}.",
         flush=True,
     )
+
+
+def acknowledge_gist_delivery(symbol_key, delivery_id, row_sha256):
+    """Remove only one exact, already-delivered outbox event."""
+    raw_state, exists = _fetch_repo_json_variable(
+        EXECUTION_STATE_VARIABLE, required=True
+    )
+    state = validate_execution_state(raw_state)
+    entry = state.get(symbol_key)
+    if entry is None:
+        return True
+    deliveries = list(entry.get(PENDING_GIST_DELIVERIES_FIELD, []))
+    match = next(
+        (
+            queued
+            for queued in deliveries
+            if queued["delivery_id"] == delivery_id
+        ),
+        None,
+    )
+    if match is None:
+        return True
+    if match["row_sha256"] != row_sha256:
+        raise RuntimeError(
+            f"Refusing to acknowledge changed Gist delivery evidence for {symbol_key}"
+        )
+    remaining = [
+        queued
+        for queued in deliveries
+        if queued["delivery_id"] != delivery_id
+    ]
+    if remaining:
+        entry[PENDING_GIST_DELIVERIES_FIELD] = remaining
+    else:
+        entry.pop(PENDING_GIST_DELIVERIES_FIELD, None)
+    _write_repo_json_variable(EXECUTION_STATE_VARIABLE, state, exists=exists)
+    print(f"Acknowledged Portfolio Compass ledger delivery for {symbol_key}.", flush=True)
+    return True
+
+
+def _attempt_gist_delivery(symbol_key, delivery):
+    """Deliver and acknowledge one immutable outbox event, if possible."""
+    normalized = validate_gist_delivery(delivery, symbol_key)
+    _gha_mask(normalized["delivery_id"])
+    if not update_gist_log(normalized):
+        return False
+    try:
+        return acknowledge_gist_delivery(
+            symbol_key,
+            normalized["delivery_id"],
+            normalized["row_sha256"],
+        )
+    except Exception as error:
+        # The remote row may already exist.  Retaining the outbox item is safe
+        # because the next idempotent attempt cannot append a duplicate.
+        print(
+            "Portfolio Compass ledger delivery was saved but its local "
+            f"acknowledgement failed ({type(error).__name__}).",
+            flush=True,
+        )
+        return False
+
+
+def retry_pending_gist_deliveries(execution_state=None):
+    """Drain confirmed-purchase deliveries without touching Kraken orders."""
+    state = validate_execution_state(
+        execution_state if execution_state is not None else fetch_live_execution_state()
+    )
+    all_delivered = True
+    for symbol_key in ALLOWED_TARGETS:
+        for delivery in _pending_gist_deliveries_for_symbol(state, symbol_key):
+            if not _attempt_gist_delivery(symbol_key, delivery):
+                all_delivered = False
+    return all_delivered
 
 
 def _decision_snapshot(decision):
@@ -473,6 +599,7 @@ def _revalidate_trade_intent(
     today,
     *,
     expected_pending=None,
+    reserve_gist_delivery=False,
     now=None,
 ):
     """Re-fetch every live state and fail if any spend-affecting value changed."""
@@ -515,11 +642,20 @@ def _revalidate_trade_intent(
             live_pending["amount_gbp"], amount_gbp, rel_tol=0, abs_tol=0.001
         ):
             raise RuntimeError(f"{symbol} durable intent amount changed during this run")
+    if reserve_gist_delivery:
+        ensure_gist_delivery_capacity(live_execution, symbol)
     return live_rules, live_analysis, live_execution, amount_gbp
 
 
-def _post_trade_logs(trade_data, base_symbol, exchange_pair):
-    """Best-effort post-trade logging that never influences the GBP spend."""
+def _post_trade_logs(
+    trade_data,
+    base_symbol,
+    exchange_pair,
+    *,
+    symbol_key=None,
+    gist_delivery=None,
+):
+    """Attempt optional mirrors after the confirmed fill is already durable."""
     ghostfolio_saved = False
     try:
         from portfolio_logger import get_account_id, log_to_ghostfolio
@@ -537,14 +673,32 @@ def _post_trade_logs(trade_data, base_symbol, exchange_pair):
             )
     except Exception as error:
         print(f"Optional Ghostfolio logging failed: {type(error).__name__}", flush=True)
-    try:
-        update_gist_log(
-            trade_data,
-            symbol=base_symbol,
-            saved_to_ghostfolio=ghostfolio_saved,
-        )
-    except Exception as error:
-        print(f"Optional Gist logging failed: {type(error).__name__}", flush=True)
+    if gist_delivery is not None and symbol_key is not None:
+        try:
+            delivered = _attempt_gist_delivery(symbol_key, gist_delivery)
+        except Exception as error:
+            print(
+                f"Portfolio Compass ledger delivery failed: {type(error).__name__}",
+                flush=True,
+            )
+            delivered = False
+        if not delivered:
+            warning = (
+                f"Kraken purchase for {symbol_key} is confirmed, but its Portfolio "
+                "Compass ledger delivery remains safely queued for retry."
+            )
+            print(warning, flush=True)
+            send_discord_alert(warning, is_error=True)
+    else:
+        # Backward-compatible helper behavior for callers outside execute_trade.
+        try:
+            update_gist_log(
+                trade_data,
+                symbol=base_symbol,
+                saved_to_ghostfolio=ghostfolio_saved,
+            )
+        except Exception as error:
+            print(f"Optional Gist logging failed: {type(error).__name__}", flush=True)
     return ghostfolio_saved
 
 
@@ -586,7 +740,12 @@ def execute_trade(
                     f"No current analysis-bound configuration was supplied for {key}"
                 )
             validated = _revalidate_trade_intent(
-                key, expected_rule, expected_decision, today, now=now
+                key,
+                expected_rule,
+                expected_decision,
+                today,
+                reserve_gist_delivery=True,
+                now=now,
             )
             validated_amount = validated[-1]
             if not math.isclose(
@@ -616,6 +775,7 @@ def execute_trade(
                         expected_decision,
                         today,
                         expected_pending=intent,
+                        reserve_gist_delivery=True,
                     )
                 except Exception as validation_error:
                     raise KrakenPreSubmissionError(
@@ -640,6 +800,7 @@ def execute_trade(
                     expected_decision,
                     today,
                     expected_pending=intent,
+                    reserve_gist_delivery=True,
                 )
 
         order_data = place_gbp_funded_market_buy(
@@ -721,25 +882,6 @@ def execute_trade(
     _gha_mask(f"{spent_gbp:.2f}")
     _gha_mask(f"{received_amount:.8f}")
 
-    completed_date = datetime.fromtimestamp(
-        execution_timestamp, tz=SELECTED_TZ
-    ).date().isoformat()
-    try:
-        complete_order_intent(
-            key,
-            intent["client_order_id"],
-            completed_date,
-            intent["decision_id"],
-        )
-    except Exception as error:
-        message = (
-            f"CRITICAL: Kraken filled {order_id}, but execution state could not be "
-            f"completed for {key}. The durable intent remains locked: {error}"
-        )
-        print(message, flush=True)
-        send_discord_alert(message, is_error=True)
-        return False
-
     base_symbol = exchange_pair.split("/", maxsplit=1)[0]
     trade_data = {
         "ts": execution_timestamp,
@@ -765,7 +907,40 @@ def execute_trade(
         "effective_usd_price_per_unit": effective_usd_price,
         "funding_order_id": funding_order_id,
     }
-    _post_trade_logs(trade_data, base_symbol, exchange_pair)
+    completed_date = datetime.fromtimestamp(
+        execution_timestamp, tz=SELECTED_TZ
+    ).date().isoformat()
+    try:
+        gist_delivery = build_gist_delivery(
+            trade_data,
+            base_symbol,
+            # The immutable evidence is persisted before optional Ghostfolio
+            # work.  "not saved" is therefore the conservative durable status.
+            saved_to_ghostfolio=False,
+        )
+        complete_order_intent(
+            key,
+            intent["client_order_id"],
+            completed_date,
+            intent["decision_id"],
+            gist_delivery=gist_delivery,
+        )
+    except Exception as error:
+        message = (
+            f"CRITICAL: Kraken filled {order_id}, but execution state could not be "
+            f"completed for {key}. The durable intent remains locked: {error}"
+        )
+        print(message, flush=True)
+        send_discord_alert(message, is_error=True)
+        return False
+
+    _post_trade_logs(
+        trade_data,
+        base_symbol,
+        exchange_pair,
+        symbol_key=key,
+        gist_delivery=gist_delivery,
+    )
     execution_time = datetime.fromtimestamp(
         execution_timestamp, tz=SELECTED_TZ
     ).strftime("%Y-%m-%d %H:%M:%S")
@@ -802,6 +977,22 @@ def main():
         print(message, flush=True)
         send_discord_alert(message, is_error=True)
         return False
+
+    try:
+        ledger_deliveries_complete = retry_pending_gist_deliveries(execution_state)
+    except Exception as error:
+        print(
+            f"Portfolio Compass ledger retry failed: {type(error).__name__}",
+            flush=True,
+        )
+        ledger_deliveries_complete = False
+    if not ledger_deliveries_complete:
+        warning = (
+            "One or more confirmed purchases remain in the durable Portfolio "
+            "Compass delivery queue. Kraken order processing remains independent."
+        )
+        print(warning, flush=True)
+        send_discord_alert(warning, is_error=True)
 
     all_succeeded = True
     # Durable intents are reconciled first and are never abandoned merely because

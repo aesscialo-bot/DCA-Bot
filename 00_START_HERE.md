@@ -208,7 +208,8 @@ and rules fingerprints that Discord supplies during exact confirmation.
 Do not manually edit:
 
 - `DCA_ANALYSIS_STATE`: owned by the analysis workflow.
-- `DCA_EXECUTION_STATE`: owned by the trader and pending-order recovery.
+- `DCA_EXECUTION_STATE`: owned by the trader; contains pending-order recovery
+  and the durable Portfolio Compass ledger-delivery queue.
 - API keys or tokens in JSON, Discord, source files, or public logs.
 
 Changing either endpoint changes its mapped regime amount and can change the
@@ -312,11 +313,14 @@ start-day analysis. Check the start date and the Crypto Analysis workflow.
 Disable the pair first, wait for the workflow to finish, and retry the exact
 command. Do not edit around the validation.
 
-### Discord reports no optional portfolio mirror
+### Discord reports pending Portfolio ledger deliveries
 
-Kraken remains the authoritative portfolio. Gist and Ghostfolio are optional
-mirrors; an unavailable mirror does not mean the Kraken order or portfolio was
-not saved.
+Kraken remains the authoritative portfolio. A confirmed purchase remains in
+`PENDING_GIST_DELIVERIES` until its exact private-Gist ledger row is present and
+acknowledged. The Railway controller retries it on the guarded schedule without
+calling Kraken or blocking recovery of an existing order. Do not delete the
+queue manually; Portfolio Compass will import the row idempotently. Ghostfolio
+remains an optional mirror.
 
 ## Safety rules
 
