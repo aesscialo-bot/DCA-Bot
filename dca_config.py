@@ -1,4 +1,4 @@
-"""Shared schemas and safety checks for the Kraken GBP DCA service.
+"""Shared schemas and safety checks for the Kraken USD-market DCA service.
 
 The module deliberately contains no network calls.  GitHub Actions, Railway,
 Discord, analysis, and order execution can therefore validate exactly the same
@@ -15,7 +15,7 @@ import re
 from typing import Any, Callable, Mapping
 
 
-TARGET_KEYS = ("BTC_GBP", "ETH_GBP", "SOL_GBP", "ADA_GBP")
+TARGET_KEYS = ("BTC_USD", "HYPE_USD", "SOL_USD")
 ALLOWED_TARGETS = TARGET_KEYS
 TARGET_SYMBOLS = {key: key.replace("_", "/") for key in TARGET_KEYS}
 RULE_FIELDS = frozenset({"REGIME_AMOUNTS_GBP", "BUY_ENABLED"})
@@ -105,8 +105,9 @@ def validate_target_map(
 
     Disabled targets may use zero as an explicit unconfigured placeholder.
     Enabled targets require both tiers to be within £5–£1,000 and not below a
-    supplied live Kraken market minimum.  Only the four production GBP keys and
-    the final two-field rule schema are accepted.
+    supplied live Kraken market minimum. Only the three production USD market
+    keys and the final two-field rule schema are accepted. Budget policy values
+    remain GBP-denominated even though Kraken executes the target pairs in USD.
     """
 
     raw_map = _json_object(value, "DCA_TARGET_MAP")
@@ -440,6 +441,27 @@ def decision_age_minutes(
     return (reference.astimezone(timezone.utc) - parse_utc_iso(analyzed_at)).total_seconds() / 60
 
 
+def decision_analyzed_on_or_after(
+    decision: Mapping[str, Any], start_date: date | None, selected_tz
+) -> bool:
+    """Return whether a decision was produced on/after the local start date.
+
+    The scheduled 04:00 Bangkok analysis occurs on the previous UTC calendar
+    date.  Comparing in the configured local timezone prevents a pre-rollout
+    decision from becoming executable just after local midnight.
+    """
+
+    if start_date is None:
+        return True
+    if not isinstance(start_date, date) or isinstance(start_date, datetime):
+        raise ConfigError("start_date must be a calendar date")
+    timing = decision.get("TIMING") if isinstance(decision, Mapping) else None
+    analyzed_at = timing.get("ANALYZED_AT") if isinstance(timing, Mapping) else None
+    if analyzed_at is None:
+        raise ConfigError("Decision TIMING.ANALYZED_AT is required for the start-date gate")
+    return parse_utc_iso(analyzed_at).astimezone(selected_tz).date() >= start_date
+
+
 def is_execution_window(
     now: datetime,
     execute_at: str | datetime,
@@ -513,6 +535,7 @@ def validate_execution_state(value: str | Mapping[str, Any]) -> dict[str, Any]:
             expected_pending = frozenset(
                 {
                     "client_order_id",
+                    "funding_client_order_id",
                     "trade_date",
                     "amount_gbp",
                     "decision_id",
@@ -531,6 +554,19 @@ def validate_execution_state(value: str | Mapping[str, Any]) -> dict[str, Any]:
                 raise ConfigError(
                     f"DCA_EXECUTION_STATE.{target}.PENDING_ORDER.client_order_id "
                     "must match dca-[0-9a-f]{14}"
+                )
+            funding_client_order_id = pending["funding_client_order_id"]
+            if not isinstance(funding_client_order_id, str) or not re.fullmatch(
+                r"dca-[0-9a-f]{14}", funding_client_order_id
+            ):
+                raise ConfigError(
+                    f"DCA_EXECUTION_STATE.{target}.PENDING_ORDER.funding_client_order_id "
+                    "must match dca-[0-9a-f]{14}"
+                )
+            if funding_client_order_id == client_order_id:
+                raise ConfigError(
+                    f"DCA_EXECUTION_STATE.{target}.PENDING_ORDER.funding_client_order_id "
+                    "must differ from client_order_id"
                 )
             trade_date = pending["trade_date"]
             if not isinstance(trade_date, str):
@@ -580,7 +616,7 @@ def validate_enabled_market_minimums(
 
 
 def default_rules_map() -> dict[str, dict[str, Any]]:
-    """Return the safe four-target bootstrap configuration."""
+    """Return the safe three-target bootstrap configuration."""
 
     return {
         target: {
@@ -597,7 +633,7 @@ def empty_analysis_state(
     now: datetime | None = None,
     reason: str = "Analysis has not run",
 ) -> dict[str, Any]:
-    """Return a complete fail-closed state with four fresh ERROR decisions."""
+    """Return a complete fail-closed state with three fresh ERROR decisions."""
 
     rules = validate_rules_map(rules_map or default_rules_map())
     generated = now or datetime.now(timezone.utc)
@@ -639,6 +675,7 @@ __all__ = [
     "TARGET_SYMBOLS",
     "decision_is_usable",
     "decision_age_minutes",
+    "decision_analyzed_on_or_after",
     "default_rules_map",
     "effective_amount",
     "effective_amount_gbp",

@@ -1,4 +1,4 @@
-"""GBP-native Kraken spot client used by the DCA trade executor."""
+"""GBP-budgeted Kraken spot client used by the DCA trade executor."""
 
 import hashlib
 import math
@@ -12,14 +12,20 @@ import ccxt
 
 
 QUOTE_CURRENCY = "GBP"
+USD_QUOTE_CURRENCY = "USD"
+FUNDING_SYMBOL = "GBP/USD"
 MIN_DCA_GBP = 5.0
 MAX_DCA_GBP = 1000.0
-_CONFIG_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]+(?:_GBP|/GBP)$")
+_CONFIG_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]+(?:_(?:GBP|USD)|/(?:GBP|USD))$")
 _CLIENT_ORDER_ID_PATTERN = re.compile(r"^dca-[0-9a-f]{14}$")
 _TERMINAL_ORDER_STATUSES = frozenset({"closed", "canceled", "expired", "rejected"})
 ORDER_POLL_DELAYS_SECONDS = (1, 2, 4, 8, 10)
 SUBMISSION_RECONCILE_DELAYS_SECONDS = (1, 2, 4)
 ORDER_SUBMISSION_DEADLINE_SECONDS = 15
+# Preflight cannot know the account's exact taker fee or market slippage.  Hold
+# back 1% when converting a USD target minimum to GBP; the confirmed fill is
+# still validated again before the crypto AddOrder.
+FUNDING_PREFLIGHT_PROCEEDS_FACTOR = 0.99
 
 
 class KrakenOrderStateUnknown(RuntimeError):
@@ -52,23 +58,27 @@ def get_kraken_exchange():
 
 
 def to_kraken_symbol(config_symbol: str) -> str:
-    """Convert a strict COIN_GBP or COIN/GBP key to CCXT's COIN/GBP form."""
+    """Convert a strict COIN_QUOTE key to a supported CCXT Kraken symbol."""
     if not isinstance(config_symbol, str):
-        raise ValueError("Kraken trading symbols must be strings ending in _GBP")
+        raise ValueError("Kraken trading symbols must be strings ending in _GBP or _USD")
 
     normalized = config_symbol.strip().upper()
     if not _CONFIG_SYMBOL_PATTERN.fullmatch(normalized):
         raise ValueError(
-            "Only GBP Kraken pairs are supported; use COIN_GBP or COIN/GBP"
+            "Only GBP or USD Kraken pairs are supported; use COIN_GBP or COIN_USD"
         )
 
-    base = normalized.replace("_", "/").split("/", maxsplit=1)[0]
-    return f"{base}/{QUOTE_CURRENCY}"
+    return normalized.replace("_", "/")
 
 
-def build_client_order_id(config_symbol: str, trade_date=None) -> str:
-    """Build a deterministic Kraken client ID for one market and local trade day."""
+def build_client_order_id(
+    config_symbol: str, trade_date=None, purpose: str = "buy"
+) -> str:
+    """Build a deterministic Kraken ID for one target, day, and order leg."""
     symbol = to_kraken_symbol(config_symbol)
+    purpose = str(purpose).strip().lower()
+    if purpose not in {"buy", "funding"}:
+        raise ValueError("purpose must be 'buy' or 'funding'")
     if trade_date is None:
         timezone_name = os.environ.get("TIMEZONE", "Asia/Bangkok")
         date_key = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
@@ -82,7 +92,10 @@ def build_client_order_id(config_symbol: str, trade_date=None) -> str:
         except ValueError as error:
             raise ValueError("trade_date must be an ISO date such as 2026-08-04") from error
 
-    digest = hashlib.sha256(f"{symbol}|{date_key}".encode("utf-8")).hexdigest()[:14]
+    id_material = f"{symbol}|{date_key}"
+    if purpose != "buy":
+        id_material += f"|{purpose}"
+    digest = hashlib.sha256(id_material.encode("utf-8")).hexdigest()[:14]
     return f"dca-{digest}"
 
 
@@ -98,12 +111,11 @@ def validate_kraken_credentials() -> dict:
 
 
 def get_market_minimum_gbp(config_symbol: str, *, exchange=None) -> dict:
-    """Return Kraken's current effective GBP minimum without creating an order.
+    """Return the current end-to-end market minimum expressed in GBP.
 
-    Kraken can publish both a quote-cost minimum and a base-amount minimum.  The
-    effective cash minimum is the larger of those two values at the current ask.
-    This helper is intentionally read-only so configuration and health checks can
-    validate budgets without sharing any order-submission code.
+    USD targets include both the target's quote/base limits and the GBP/USD
+    funding market's limits.  The conversion uses live prices and remains
+    read-only so configuration checks cannot accidentally submit an order.
     """
     client = exchange or get_kraken_exchange()
     symbol = to_kraken_symbol(config_symbol)
@@ -113,24 +125,82 @@ def get_market_minimum_gbp(config_symbol: str, *, exchange=None) -> dict:
 
     market = client.market(symbol)
     limits = market.get("limits", {}) or {}
-    minimum_cost = float((limits.get("cost", {}) or {}).get("min") or 0)
+    minimum_cost_quote = float((limits.get("cost", {}) or {}).get("min") or 0)
     minimum_amount = float((limits.get("amount", {}) or {}).get("min") or 0)
-    ask = 0.0
+    quote_currency = symbol.split("/", maxsplit=1)[1]
+    ask_quote = 0.0
     if minimum_amount > 0:
         ticker = client.fetch_ticker(symbol)
-        ask = float(ticker.get("ask") or ticker.get("last") or 0)
-        if ask <= 0:
+        ask_quote = float(ticker.get("ask") or ticker.get("last") or 0)
+        if not math.isfinite(ask_quote) or ask_quote <= 0:
             raise RuntimeError(f"Kraken returned no usable ask price for {symbol}")
 
-    effective_minimum = max(minimum_cost, minimum_amount * ask)
+    effective_minimum_quote = max(
+        minimum_cost_quote, minimum_amount * ask_quote
+    )
+    gbp_usd_rate = None
+    funding_minimum_gbp = 0.0
+    if quote_currency == QUOTE_CURRENCY:
+        minimum_cost_gbp = minimum_cost_quote
+        ask_gbp = ask_quote
+        effective_minimum = effective_minimum_quote
+    else:
+        if quote_currency != USD_QUOTE_CURRENCY:
+            raise ValueError(f"Unsupported Kraken quote currency: {quote_currency}")
+        if FUNDING_SYMBOL not in client.markets:
+            raise ValueError(f"Kraken spot market is unavailable: {FUNDING_SYMBOL}")
+
+        funding_ticker = client.fetch_ticker(FUNDING_SYMBOL)
+        rate_candidates = []
+        for field_name in ("bid", "last", "ask"):
+            raw_rate = funding_ticker.get(field_name)
+            if raw_rate is None:
+                continue
+            rate = float(raw_rate)
+            if math.isfinite(rate) and rate > 0:
+                rate_candidates.append(rate)
+        if not rate_candidates:
+            raise RuntimeError(
+                f"Kraken returned no usable GBP/USD price for {FUNDING_SYMBOL}"
+            )
+        # The lowest live side is conservative for a GBP sale while still
+        # supporting ticker payloads that expose only an ask or last price.
+        gbp_usd_rate = min(rate_candidates)
+
+        funding_market = client.market(FUNDING_SYMBOL)
+        funding_limits = funding_market.get("limits", {}) or {}
+        funding_minimum_usd = float(
+            (funding_limits.get("cost", {}) or {}).get("min") or 0
+        )
+        funding_minimum_amount_gbp = float(
+            (funding_limits.get("amount", {}) or {}).get("min") or 0
+        )
+        funding_minimum_gbp = max(
+            funding_minimum_amount_gbp,
+            funding_minimum_usd / gbp_usd_rate,
+        )
+        minimum_cost_gbp = minimum_cost_quote / gbp_usd_rate
+        ask_gbp = ask_quote / gbp_usd_rate
+        effective_minimum = max(
+            effective_minimum_quote
+            / (gbp_usd_rate * FUNDING_PREFLIGHT_PROCEEDS_FACTOR),
+            funding_minimum_gbp,
+        )
+
     if not math.isfinite(effective_minimum) or effective_minimum < 0:
         raise RuntimeError(f"Kraken returned invalid market limits for {symbol}")
     return {
         "pair": symbol,
-        "minimum_cost_gbp": minimum_cost,
+        "quote_currency": quote_currency,
+        "minimum_cost_gbp": minimum_cost_gbp,
         "minimum_amount": minimum_amount,
-        "ask_gbp": ask,
+        "ask_gbp": ask_gbp,
         "effective_minimum_gbp": effective_minimum,
+        "minimum_cost_quote": minimum_cost_quote,
+        "ask_quote": ask_quote,
+        "effective_minimum_quote": effective_minimum_quote,
+        "gbp_usd_rate": gbp_usd_rate,
+        "funding_minimum_gbp": funding_minimum_gbp,
     }
 
 
@@ -162,7 +232,13 @@ def _order_client_id(order: dict) -> str | None:
     return None
 
 
-def _find_matching_order(exchange, symbol: str, client_order_id: str) -> dict | None:
+def _find_matching_order(
+    exchange,
+    symbol: str,
+    client_order_id: str,
+    *,
+    expected_side: str = "buy",
+) -> dict | None:
     """Return the one matching Kraken order, querying both open and closed state."""
     # Kraken's read endpoints expose the native cl_ord_id filter. Using the raw
     # name avoids relying on a CCXT translation that is not present on every
@@ -187,10 +263,10 @@ def _find_matching_order(exchange, symbol: str, client_order_id: str) -> dict | 
             raise RuntimeError(
                 f"Kraken client order ID collision: expected {symbol}, got {order_symbol}"
             )
-        side = str(order.get("side") or "buy").lower()
-        if side != "buy":
+        side = str(order.get("side") or expected_side).lower()
+        if side != expected_side:
             raise RuntimeError(
-                f"Kraken client order ID collision: expected buy, got {side}"
+                f"Kraken client order ID collision: expected {expected_side}, got {side}"
             )
 
         order_id = order.get("id")
@@ -240,9 +316,9 @@ def _kraken_native_fee_entries(
         return None
 
     quote_fee = _finite_nonnegative(info["fee"], "native order fee")
-    base_currency = symbol.split("/", maxsplit=1)[0]
+    base_currency, quote_currency = symbol.split("/", maxsplit=1)
     if fee_in_quote:
-        return [{"cost": quote_fee, "currency": QUOTE_CURRENCY}]
+        return [{"cost": quote_fee, "currency": quote_currency}]
     if not math.isfinite(market_price) or market_price <= 0:
         raise KrakenOrderStateUnknown(
             "Kraken returned no usable execution price for its base-currency fee"
@@ -269,7 +345,8 @@ def _fee_entries(
     info = order.get("info") or {}
     if isinstance(info, dict) and "fee" in info:
         flags = str(info.get("oflags") or "")
-        currency = QUOTE_CURRENCY if "fciq" in flags else None
+        quote_currency = symbol.split("/", maxsplit=1)[1] if symbol else None
+        currency = quote_currency if "fciq" in flags else None
         return [{"cost": info.get("fee"), "currency": currency}]
     return []
 
@@ -322,7 +399,11 @@ def _terminal_timestamp_seconds(order: dict, order_id: str) -> int:
 
 
 def _normalise_terminal_fill(
-    order: dict, symbol: str, client_order_id: str
+    order: dict,
+    symbol: str,
+    client_order_id: str,
+    *,
+    expected_side: str = "buy",
 ) -> dict:
     """Normalize one terminal Kraken order, including its actual fee treatment."""
     order_id = str(order.get("id") or "")
@@ -337,9 +418,15 @@ def _normalise_terminal_fill(
             f"Kraken order {order_id or client_order_id} returned incomplete "
             "terminal fill data"
         )
-    gross_received = _finite_nonnegative(order["filled"], "filled amount")
-    cost_gbp = _finite_nonnegative(order["cost"], "GBP cost")
-    if gross_received <= 0 and cost_gbp <= 0:
+    filled_base = _finite_nonnegative(order["filled"], "filled amount")
+    cost_quote = _finite_nonnegative(order["cost"], "quote cost")
+    order_side = str(order.get("side") or expected_side).lower()
+    if order_side != expected_side:
+        raise KrakenOrderStateUnknown(
+            f"Kraken order {order_id or client_order_id} has side={order_side}; "
+            f"expected {expected_side}"
+        )
+    if filled_base <= 0 and cost_quote <= 0:
         if status in {"canceled", "expired", "rejected"}:
             raise KrakenOrderNoFill(
                 f"Kraken order {order_id or client_order_id} reached "
@@ -349,23 +436,23 @@ def _normalise_terminal_fill(
             f"Kraken order {order_id or client_order_id} reported status={status} "
             "with zero fill; manual review is required"
         )
-    if gross_received <= 0 or cost_gbp <= 0:
+    if filled_base <= 0 or cost_quote <= 0:
         raise KrakenOrderStateUnknown(
             f"Kraken order {order_id or client_order_id} returned inconsistent "
             "terminal fill and cost values"
         )
 
-    market_price = cost_gbp / gross_received
+    market_price = cost_quote / filled_base
     fee_entries = _fee_entries(order, symbol, market_price)
     if not fee_entries:
         raise KrakenOrderStateUnknown(
             f"Kraken order {order_id or client_order_id} returned no fee information"
         )
 
-    base_currency = symbol.split("/", maxsplit=1)[0]
-    quote_fee_gbp = 0.0
+    base_currency, quote_currency = symbol.split("/", maxsplit=1)
+    quote_fee = 0.0
     base_fee = 0.0
-    fee_gbp = 0.0
+    fee_quote = 0.0
     fee_details = []
     for fee in fee_entries:
         if fee.get("cost") is None:
@@ -381,55 +468,82 @@ def _normalise_terminal_fill(
                 "without its currency"
             )
         currency = str(raw_currency).upper()
-        if currency == QUOTE_CURRENCY:
-            quote_fee_gbp += fee_cost
-            fee_equivalent_gbp = fee_cost
+        if currency == quote_currency:
+            quote_fee += fee_cost
+            fee_equivalent_quote = fee_cost
         elif currency == base_currency:
             base_fee += fee_cost
-            fee_equivalent_gbp = fee_cost * market_price
+            fee_equivalent_quote = fee_cost * market_price
         else:
             raise KrakenOrderStateUnknown(
                 f"Kraken order {order_id or client_order_id} charged an unsupported "
                 f"fee currency: {currency}"
             )
-        fee_gbp += fee_equivalent_gbp
-        fee_details.append(
-            {
-                "currency": currency,
-                "amount": fee_cost,
-                "gbp_equivalent": fee_equivalent_gbp,
-            }
-        )
+        fee_quote += fee_equivalent_quote
+        detail = {
+            "currency": currency,
+            "amount": fee_cost,
+            "quote_equivalent": fee_equivalent_quote,
+        }
+        if quote_currency == QUOTE_CURRENCY:
+            detail["gbp_equivalent"] = fee_equivalent_quote
+        if quote_currency == USD_QUOTE_CURRENCY:
+            detail["usd_equivalent"] = fee_equivalent_quote
+        fee_details.append(detail)
 
-    received = gross_received - base_fee
+    if expected_side == "buy":
+        gross_received = filled_base
+        received = filled_base - base_fee
+        spent = cost_quote + quote_fee
+    else:
+        gross_received = cost_quote
+        received = cost_quote - quote_fee
+        spent = filled_base + base_fee
     if received <= 0:
         raise KrakenOrderStateUnknown(
             f"Kraken order {order_id or client_order_id} has no net received amount"
         )
 
-    spent_gbp = cost_gbp + quote_fee_gbp
     terminal_timestamp = _terminal_timestamp_seconds(
         order, order_id or client_order_id
     )
-    effective_price = spent_gbp / received
-    return {
+    effective_price = (
+        spent / received if expected_side == "buy" else received / spent
+    )
+    result = {
         "order_id": order_id,
         "client_order_id": client_order_id,
         "pair": symbol,
-        "quote_currency": QUOTE_CURRENCY,
-        "cost_gbp": cost_gbp,
-        "fee_gbp": fee_gbp,
-        "gbp_fee_debit": quote_fee_gbp,
+        "side": expected_side,
+        "base_currency": base_currency,
+        "quote_currency": quote_currency,
+        "filled_base": filled_base,
+        "cost_quote": cost_quote,
+        "fee_quote": fee_quote,
+        "quote_fee_debit": quote_fee,
+        "base_fee_debit": base_fee,
         "fee_details": fee_details,
-        "spent_gbp": spent_gbp,
+        "spent": spent,
         "gross_received": gross_received,
         "received": received,
-        "market_gbp_price_per_unit": market_price,
-        "effective_gbp_price_per_unit": effective_price,
-        # Compatibility alias: unit price excludes the separately reported fee.
-        "gbp_price_per_unit": market_price,
+        "market_quote_price_per_unit": market_price,
+        "effective_quote_price_per_unit": effective_price,
         "timestamp": terminal_timestamp,
     }
+    if quote_currency == QUOTE_CURRENCY and expected_side == "buy":
+        result.update(
+            {
+                "cost_gbp": cost_quote,
+                "fee_gbp": fee_quote,
+                "gbp_fee_debit": quote_fee,
+                "spent_gbp": spent,
+                "market_gbp_price_per_unit": market_price,
+                "effective_gbp_price_per_unit": effective_price,
+                # Compatibility alias excludes the separately reported fee.
+                "gbp_price_per_unit": market_price,
+            }
+        )
+    return result
 
 
 def _poll_order_to_terminal(
@@ -438,6 +552,8 @@ def _poll_order_to_terminal(
     order_id: str,
     client_order_id: str,
     initial_order: dict | None = None,
+    *,
+    expected_side: str = "buy",
 ) -> dict:
     """Poll a Kraken order until it is terminal; open partial fills never qualify."""
     current_order = initial_order
@@ -448,7 +564,10 @@ def _poll_order_to_terminal(
             status = str(current_order.get("status") or "").lower()
             if status in _TERMINAL_ORDER_STATUSES:
                 return _normalise_terminal_fill(
-                    current_order, symbol, client_order_id
+                    current_order,
+                    symbol,
+                    client_order_id,
+                    expected_side=expected_side,
                 )
 
         try:
@@ -460,7 +579,10 @@ def _poll_order_to_terminal(
             status = str(current_order.get("status") or "").lower()
             if status in _TERMINAL_ORDER_STATUSES:
                 return _normalise_terminal_fill(
-                    current_order, symbol, client_order_id
+                    current_order,
+                    symbol,
+                    client_order_id,
+                    expected_side=expected_side,
                 )
 
         if attempt < len(ORDER_POLL_DELAYS_SECONDS):
@@ -474,14 +596,21 @@ def _poll_order_to_terminal(
 
 
 def _reconcile_after_submission_error(
-    exchange, symbol: str, client_order_id: str
+    exchange,
+    symbol: str,
+    client_order_id: str,
+    *,
+    expected_side: str = "buy",
 ) -> dict | None:
     """Retry order lookup after an ambiguous submission response."""
     last_error = None
     for attempt in range(len(SUBMISSION_RECONCILE_DELAYS_SECONDS) + 1):
         try:
             matching_order = _find_matching_order(
-                exchange, symbol, client_order_id
+                exchange,
+                symbol,
+                client_order_id,
+                expected_side=expected_side,
             )
             last_error = None
         except Exception as error:
@@ -514,6 +643,8 @@ def _poll_known_order(
     order_id: str,
     client_order_id: str,
     initial_order: dict | None = None,
+    *,
+    expected_side: str = "buy",
 ) -> dict:
     """Poll an order that may already exist, retaining the lock on surprises."""
     try:
@@ -523,6 +654,7 @@ def _poll_known_order(
             order_id,
             client_order_id,
             initial_order=initial_order,
+            expected_side=expected_side,
         )
     except (KrakenOrderStateUnknown, KrakenOrderNoFill):
         raise
@@ -546,6 +678,11 @@ def place_market_buy(
         requested_gbp = _positive_gbp_amount(amount_gbp)
         exchange = get_kraken_exchange()
         symbol = to_kraken_symbol(config_symbol)
+        if symbol.split("/", maxsplit=1)[1] != QUOTE_CURRENCY:
+            raise ValueError(
+                "USD targets require place_gbp_funded_market_buy so the GBP "
+                "budget is converted explicitly"
+            )
         exchange.load_markets()
         if symbol not in exchange.markets:
             raise ValueError(f"Kraken spot market is unavailable: {symbol}")
@@ -675,3 +812,492 @@ def place_market_buy(
         client_order_id,
         initial_order=order,
     )
+
+
+def _validated_client_order_id(value: str, field_name: str) -> str:
+    value = str(value or "")
+    if not _CLIENT_ORDER_ID_PATTERN.fullmatch(value):
+        raise ValueError(
+            f"{field_name} must be a deterministic 18-character DCA ID"
+        )
+    return value
+
+
+def _funding_fill_for_budget(funding_fill: dict, requested_gbp: float) -> dict:
+    """Validate that a GBP/USD sell respected the exact user-owned GBP cap."""
+    if funding_fill.get("pair") != FUNDING_SYMBOL or funding_fill.get("side") != "sell":
+        raise KrakenOrderStateUnknown("Kraken returned an invalid funding order")
+    if funding_fill.get("base_currency") != QUOTE_CURRENCY:
+        raise KrakenOrderStateUnknown("Kraken funding order did not sell GBP")
+    if funding_fill.get("quote_currency") != USD_QUOTE_CURRENCY:
+        raise KrakenOrderStateUnknown("Kraken funding order did not receive USD")
+    if funding_fill.get("base_fee_debit", 0) > 0:
+        raise KrakenOrderStateUnknown(
+            "Kraken charged the funding fee in GBP despite fciq; the GBP cap "
+            "cannot be confirmed"
+        )
+
+    spent_gbp = _finite_nonnegative(funding_fill.get("spent"), "funding GBP debit")
+    if not math.isclose(spent_gbp, requested_gbp, rel_tol=0, abs_tol=1e-9):
+        raise KrakenOrderStateUnknown(
+            "Kraken funding fill did not match the exact configured GBP budget"
+        )
+    funded_usd = _finite_nonnegative(
+        funding_fill.get("received"), "net funding USD"
+    )
+    if funded_usd <= 0:
+        raise KrakenOrderStateUnknown("Kraken funding order produced no net USD")
+    return {"spent_gbp": spent_gbp, "funded_usd": funded_usd}
+
+
+def _combine_gbp_funded_fills(
+    funding_fill: dict,
+    buy_fill: dict,
+    requested_gbp: float,
+    target_symbol: str,
+) -> dict:
+    """Return the legacy GBP receipt plus explicit funding and USD metrics."""
+    funding = _funding_fill_for_budget(funding_fill, requested_gbp)
+    if buy_fill.get("pair") != target_symbol or buy_fill.get("side") != "buy":
+        raise KrakenOrderStateUnknown("Kraken returned an invalid USD target order")
+    if buy_fill.get("quote_currency") != USD_QUOTE_CURRENCY:
+        raise KrakenOrderStateUnknown("Kraken target order was not quoted in USD")
+
+    funded_usd = funding["funded_usd"]
+    spent_usd = _finite_nonnegative(buy_fill.get("spent"), "target USD debit")
+    if spent_usd > funded_usd + 1e-9:
+        raise KrakenOrderStateUnknown(
+            "Kraken target order spent more USD than the confirmed funding proceeds"
+        )
+    received = _finite_nonnegative(buy_fill.get("received"), "crypto received")
+    if received <= 0:
+        raise KrakenOrderStateUnknown("Kraken target order produced no crypto")
+
+    sold_gbp = funding["spent_gbp"]
+    gross_funding_usd = _finite_nonnegative(
+        funding_fill.get("cost_quote"), "gross funding USD"
+    )
+    gbp_usd_rate = gross_funding_usd / sold_gbp
+    if not math.isfinite(gbp_usd_rate) or gbp_usd_rate <= 0:
+        raise KrakenOrderStateUnknown("Kraken returned an invalid GBP/USD fill rate")
+
+    funding_fee_usd = _finite_nonnegative(
+        funding_fill.get("fee_quote"), "funding fee USD"
+    )
+    buy_fee_usd = _finite_nonnegative(
+        buy_fill.get("fee_quote"), "target fee USD"
+    )
+    fee_usd = funding_fee_usd + buy_fee_usd
+    fee_gbp = fee_usd / gbp_usd_rate
+    market_usd_price = _finite_nonnegative(
+        buy_fill.get("market_quote_price_per_unit"), "market USD price"
+    )
+    effective_usd_price = _finite_nonnegative(
+        buy_fill.get("effective_quote_price_per_unit"), "effective USD price"
+    )
+
+    fee_details = []
+    for leg_name, fill in (("funding", funding_fill), ("buy", buy_fill)):
+        for detail in fill.get("fee_details", []):
+            item = dict(detail)
+            item["leg"] = leg_name
+            usd_equivalent = _finite_nonnegative(
+                item.get("quote_equivalent"), f"{leg_name} fee equivalent"
+            )
+            item["usd_equivalent"] = usd_equivalent
+            item["gbp_equivalent"] = usd_equivalent / gbp_usd_rate
+            fee_details.append(item)
+
+    return {
+        "order_id": buy_fill["order_id"],
+        "client_order_id": buy_fill["client_order_id"],
+        "funding_order_id": funding_fill["order_id"],
+        "funding_client_order_id": funding_fill["client_order_id"],
+        "pair": target_symbol,
+        "quote_currency": USD_QUOTE_CURRENCY,
+        "cost_gbp": buy_fill["cost_quote"] / gbp_usd_rate,
+        "fee_gbp": fee_gbp,
+        "gbp_fee_debit": 0.0,
+        "spent_gbp": sold_gbp,
+        "gross_received": buy_fill["gross_received"],
+        "received": received,
+        "market_gbp_price_per_unit": market_usd_price / gbp_usd_rate,
+        "effective_gbp_price_per_unit": sold_gbp / received,
+        "gbp_price_per_unit": market_usd_price / gbp_usd_rate,
+        "funded_usd": funded_usd,
+        "usd_received": funded_usd,
+        "gross_funding_usd": gross_funding_usd,
+        "funding_fee_usd": funding_fee_usd,
+        "crypto_fee_usd": buy_fee_usd,
+        "cost_usd": buy_fill["cost_quote"],
+        "spent_usd": spent_usd,
+        "fee_usd": buy_fee_usd,
+        "combined_fee_usd": fee_usd,
+        "total_quote_fee_usd": (
+            funding_fill.get("quote_fee_debit", 0)
+            + buy_fill.get("quote_fee_debit", 0)
+        ),
+        "usd_fee_debit": buy_fill.get("quote_fee_debit", 0),
+        "unused_usd": funded_usd - spent_usd,
+        "market_usd_price_per_unit": market_usd_price,
+        "effective_usd_price_per_unit": effective_usd_price,
+        "gbp_usd_rate": gbp_usd_rate,
+        "fee_details": fee_details,
+        "timestamp": buy_fill["timestamp"],
+    }
+
+
+def place_gbp_funded_market_buy(
+    config_symbol: str,
+    amount_gbp: float,
+    client_order_id: str | None = None,
+    funding_client_order_id: str | None = None,
+    *,
+    reconcile_only: bool = False,
+    pre_submit_check=None,
+) -> dict:
+    """Sell an exact GBP budget for USD, then buy a USD-quoted crypto target.
+
+    Both legs use deterministic Kraken client IDs.  A reconciliation-only call
+    never submits a missing leg.  Once the funding AddOrder may have reached
+    Kraken, every later failure is state-unknown so the durable intent remains.
+    """
+    try:
+        requested_gbp = _positive_gbp_amount(amount_gbp)
+        target_symbol = to_kraken_symbol(config_symbol)
+        if target_symbol.split("/", maxsplit=1)[1] != USD_QUOTE_CURRENCY:
+            raise ValueError("GBP-funded execution requires a USD Kraken target")
+        exchange = get_kraken_exchange()
+        exchange.load_markets()
+        for required_symbol in (FUNDING_SYMBOL, target_symbol):
+            if required_symbol not in exchange.markets:
+                raise ValueError(
+                    f"Kraken spot market is unavailable: {required_symbol}"
+                )
+
+        client_order_id = _validated_client_order_id(
+            client_order_id
+            or build_client_order_id(config_symbol, purpose="buy"),
+            "client_order_id",
+        )
+        funding_client_order_id = _validated_client_order_id(
+            funding_client_order_id
+            or build_client_order_id(config_symbol, purpose="funding"),
+            "funding_client_order_id",
+        )
+        if client_order_id == funding_client_order_id:
+            raise ValueError("funding and buy client order IDs must be distinct")
+    except Exception as setup_error:
+        error_type = (
+            KrakenOrderStateUnknown if reconcile_only else KrakenPreSubmissionError
+        )
+        raise error_type(
+            f"Kraken GBP-funded setup failed before AddOrder: {setup_error}"
+        ) from setup_error
+
+    try:
+        funding_order = _find_matching_order(
+            exchange,
+            FUNDING_SYMBOL,
+            funding_client_order_id,
+            expected_side="sell",
+        )
+    except Exception as lookup_error:
+        error_type = (
+            KrakenOrderStateUnknown if reconcile_only else KrakenPreSubmissionError
+        )
+        raise error_type(
+            "Kraken funding duplicate check failed before AddOrder: "
+            f"{lookup_error}"
+        ) from lookup_error
+
+    try:
+        target_order = _find_matching_order(
+            exchange,
+            target_symbol,
+            client_order_id,
+            expected_side="buy",
+        )
+    except Exception as lookup_error:
+        error_type = (
+            KrakenOrderStateUnknown
+            if funding_order is not None or reconcile_only
+            else KrakenPreSubmissionError
+        )
+        raise error_type(
+            "Kraken target duplicate check failed before AddOrder: "
+            f"{lookup_error}"
+        ) from lookup_error
+
+    if target_order is not None and funding_order is None:
+        raise KrakenOrderStateUnknown(
+            "Kraken found the USD target order without its deterministic funding "
+            "order; manual review is required"
+        )
+
+    funding_fill = None
+    if funding_order is not None:
+        try:
+            funding_fill = _poll_known_order(
+                exchange,
+                FUNDING_SYMBOL,
+                str(funding_order["id"]),
+                funding_client_order_id,
+                initial_order=funding_order,
+                expected_side="sell",
+            )
+            _funding_fill_for_budget(funding_fill, requested_gbp)
+        except Exception as error:
+            raise KrakenOrderStateUnknown(
+                f"Kraken funding order could not be safely reconciled: {error}"
+            ) from error
+
+        if target_order is not None:
+            try:
+                buy_fill = _poll_known_order(
+                    exchange,
+                    target_symbol,
+                    str(target_order["id"]),
+                    client_order_id,
+                    initial_order=target_order,
+                    expected_side="buy",
+                )
+                return _combine_gbp_funded_fills(
+                    funding_fill, buy_fill, requested_gbp, target_symbol
+                )
+            except Exception as error:
+                raise KrakenOrderStateUnknown(
+                    f"Kraken target order could not be safely reconciled: {error}"
+                ) from error
+
+        if reconcile_only:
+            raise KrakenOrderStateUnknown(
+                "The GBP/USD funding order is confirmed but no matching USD target "
+                "order exists; reconciliation-only mode will not submit it"
+            )
+    elif reconcile_only:
+        raise KrakenOrderStateUnknown(
+            "A durable order intent exists but Kraken returned no matching funding "
+            "order; manual review is required"
+        )
+
+    if funding_fill is None:
+        try:
+            if exchange.has.get("createMarketBuyOrderWithCost") is not True:
+                raise RuntimeError(
+                    "Kraken quote-cost market buys are unavailable"
+                )
+            if not callable(getattr(exchange, "create_market_sell_order", None)):
+                raise RuntimeError("Kraken market sells are unavailable")
+
+            minimum = get_market_minimum_gbp(config_symbol, exchange=exchange)
+            effective_minimum = minimum["effective_minimum_gbp"]
+            if requested_gbp < effective_minimum:
+                raise ValueError(
+                    f"GBP amount {requested_gbp:.2f} is below Kraken's current "
+                    f"end-to-end minimum of approximately {effective_minimum:.2f} "
+                    f"GBP for {target_symbol}."
+                )
+
+            balance = exchange.fetch_balance()
+            free_gbp = _finite_nonnegative(
+                (balance.get("free") or {}).get(QUOTE_CURRENCY, 0),
+                "available GBP balance",
+            )
+            if free_gbp + 1e-9 < requested_gbp:
+                raise ValueError(
+                    f"Insufficient free GBP: {free_gbp:.2f} available, "
+                    f"{requested_gbp:.2f} required"
+                )
+
+            precise_gbp = float(
+                exchange.amount_to_precision(FUNDING_SYMBOL, requested_gbp)
+            )
+            if not math.isclose(
+                precise_gbp, requested_gbp, rel_tol=0, abs_tol=1e-9
+            ):
+                raise ValueError(
+                    "Kraken GBP/USD amount precision cannot represent the exact "
+                    "configured GBP budget"
+                )
+
+            if pre_submit_check is not None:
+                pre_submit_check()
+            funding_params = {
+                "clientOrderId": funding_client_order_id,
+                "deadline": _submission_deadline(),
+                # Deduct the conversion fee from USD proceeds, never from GBP.
+                "oflags": "fciq",
+            }
+        except Exception as preparation_error:
+            raise KrakenPreSubmissionError(
+                "Kraken GBP/USD funding preparation failed before AddOrder: "
+                f"{preparation_error}"
+            ) from preparation_error
+
+        try:
+            funding_order = exchange.create_market_sell_order(
+                FUNDING_SYMBOL, precise_gbp, funding_params
+            )
+        except Exception as submission_error:
+            try:
+                funding_order = _reconcile_after_submission_error(
+                    exchange,
+                    FUNDING_SYMBOL,
+                    funding_client_order_id,
+                    expected_side="sell",
+                )
+            except Exception as reconcile_error:
+                raise KrakenOrderStateUnknown(
+                    "Kraken GBP/USD funding submission outcome is unknown: "
+                    f"{reconcile_error}"
+                ) from submission_error
+            if funding_order is None:
+                raise KrakenOrderStateUnknown(
+                    "Kraken GBP/USD funding submission outcome is unknown and no "
+                    "matching order was found"
+                ) from submission_error
+
+        if not isinstance(funding_order, dict):
+            funding_order = {}
+        funding_order_id = funding_order.get("id")
+        if not funding_order_id:
+            funding_order = _reconcile_after_submission_error(
+                exchange,
+                FUNDING_SYMBOL,
+                funding_client_order_id,
+                expected_side="sell",
+            )
+            if funding_order is None:
+                raise KrakenOrderStateUnknown(
+                    "Kraken accepted the GBP/USD funding request without an order "
+                    "ID and no matching order was found"
+                )
+            funding_order_id = funding_order["id"]
+
+        try:
+            funding_fill = _poll_known_order(
+                exchange,
+                FUNDING_SYMBOL,
+                str(funding_order_id),
+                funding_client_order_id,
+                initial_order=funding_order,
+                expected_side="sell",
+            )
+            funding_budget = _funding_fill_for_budget(
+                funding_fill, requested_gbp
+            )
+        except Exception as error:
+            raise KrakenOrderStateUnknown(
+                f"Kraken GBP/USD funding state is unknown: {error}"
+            ) from error
+    else:
+        funding_budget = _funding_fill_for_budget(funding_fill, requested_gbp)
+
+    # From this point GBP has been exchanged.  No exception is safe to clear.
+    try:
+        # Refetch immediately before a possible target AddOrder so an order that
+        # became visible during funding cannot be duplicated.
+        target_order = _find_matching_order(
+            exchange,
+            target_symbol,
+            client_order_id,
+            expected_side="buy",
+        )
+        if target_order is not None:
+            buy_fill = _poll_known_order(
+                exchange,
+                target_symbol,
+                str(target_order["id"]),
+                client_order_id,
+                initial_order=target_order,
+                expected_side="buy",
+            )
+            return _combine_gbp_funded_fills(
+                funding_fill, buy_fill, requested_gbp, target_symbol
+            )
+
+        funded_usd = funding_budget["funded_usd"]
+        target_minimum = get_market_minimum_gbp(
+            config_symbol, exchange=exchange
+        )
+        minimum_usd = target_minimum["effective_minimum_quote"]
+        if funded_usd < minimum_usd:
+            raise ValueError(
+                f"Confirmed net funding of {funded_usd:.2f} USD is below "
+                f"Kraken's current {target_symbol} minimum of {minimum_usd:.2f} USD"
+            )
+
+        precise_usd = float(exchange.cost_to_precision(target_symbol, funded_usd))
+        if precise_usd <= 0 or precise_usd < minimum_usd:
+            raise ValueError(
+                "Confirmed USD funding falls below the target minimum after "
+                "Kraken cost precision"
+            )
+        if precise_usd > funded_usd + 1e-9:
+            raise ValueError(
+                "Kraken target cost precision would spend more than the "
+                "confirmed USD funding proceeds"
+            )
+
+        if pre_submit_check is not None:
+            pre_submit_check()
+        buy_params = {
+            "clientOrderId": client_order_id,
+            "deadline": _submission_deadline(),
+            # Deduct the crypto fee from the purchased asset so the confirmed
+            # USD proceeds remain a hard debit ceiling.
+            "oflags": "fcib",
+        }
+
+        try:
+            target_order = exchange.create_market_buy_order_with_cost(
+                target_symbol, precise_usd, buy_params
+            )
+        except Exception as submission_error:
+            target_order = _reconcile_after_submission_error(
+                exchange,
+                target_symbol,
+                client_order_id,
+                expected_side="buy",
+            )
+            if target_order is None:
+                raise KrakenOrderStateUnknown(
+                    "Kraken USD target submission outcome is unknown and no "
+                    "matching order was found"
+                ) from submission_error
+
+        if not isinstance(target_order, dict):
+            target_order = {}
+        target_order_id = target_order.get("id")
+        if not target_order_id:
+            target_order = _reconcile_after_submission_error(
+                exchange,
+                target_symbol,
+                client_order_id,
+                expected_side="buy",
+            )
+            if target_order is None:
+                raise KrakenOrderStateUnknown(
+                    "Kraken accepted the USD target request without an order ID "
+                    "and no matching order was found"
+                )
+            target_order_id = target_order["id"]
+
+        buy_fill = _poll_known_order(
+            exchange,
+            target_symbol,
+            str(target_order_id),
+            client_order_id,
+            initial_order=target_order,
+            expected_side="buy",
+        )
+        return _combine_gbp_funded_fills(
+            funding_fill, buy_fill, requested_gbp, target_symbol
+        )
+    except KrakenOrderStateUnknown:
+        raise
+    except Exception as error:
+        raise KrakenOrderStateUnknown(
+            f"GBP funding is complete but the USD target state is unknown: {error}"
+        ) from error

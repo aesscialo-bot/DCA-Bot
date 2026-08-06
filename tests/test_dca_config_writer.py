@@ -12,7 +12,7 @@ class DcaConfigWriterTests(unittest.TestCase):
 
     def _ready_state(self):
         state = empty_analysis_state(self.rules, now=self.now)
-        decision = state["TARGETS"]["BTC_GBP"]
+        decision = state["TARGETS"]["BTC_USD"]
         decision.update(
             {
                 "STATUS": "READY",
@@ -29,23 +29,23 @@ class DcaConfigWriterTests(unittest.TestCase):
         updated, should_write = apply_change(
             self.rules,
             action="set_amounts",
-            symbol="BTC_GBP",
+            symbol="BTC_USD",
             low_amount_gbp_json="10",
             up_amount_gbp_json="20",
         )
         self.assertTrue(should_write)
-        self.assertEqual(updated["BTC_GBP"]["REGIME_AMOUNTS_GBP"], {"LOW": 10, "UP": 20})
+        self.assertEqual(updated["BTC_USD"]["REGIME_AMOUNTS_GBP"], {"LOW": 10, "UP": 20})
 
     def test_budget_update_rejects_enabled_target(self):
-        self.rules["BTC_GBP"] = {
+        self.rules["BTC_USD"] = {
             "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 20},
             "BUY_ENABLED": True,
         }
-        with self.assertRaisesRegex(ValueError, "Disable BTC_GBP"):
+        with self.assertRaisesRegex(ValueError, "Disable BTC_USD"):
             apply_change(
                 self.rules,
                 action="set_amounts",
-                symbol="BTC_GBP",
+                symbol="BTC_USD",
                 low_amount_gbp_json="11",
                 up_amount_gbp_json="21",
             )
@@ -54,21 +54,21 @@ class DcaConfigWriterTests(unittest.TestCase):
         updated, should_write = apply_change(
             self.rules,
             action="dry_run",
-            symbol="BTC_GBP",
+            symbol="BTC_USD",
             low_amount_gbp_json="10",
             up_amount_gbp_json="20",
         )
         self.assertFalse(should_write)
-        self.assertEqual(updated["BTC_GBP"]["REGIME_AMOUNTS_GBP"]["UP"], 20)
+        self.assertEqual(updated["BTC_USD"]["REGIME_AMOUNTS_GBP"]["UP"], 20)
 
     def test_enable_is_bound_to_decision_and_live_market_minimum(self):
-        self.rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
+        self.rules["BTC_USD"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
         state = self._ready_state()
-        expected_hash = rules_hash("BTC_GBP", self.rules["BTC_GBP"])
-        state["TARGETS"]["BTC_GBP"]["RULES_HASH"] = expected_hash
+        expected_hash = rules_hash("BTC_USD", self.rules["BTC_USD"])
+        state["TARGETS"]["BTC_USD"]["RULES_HASH"] = expected_hash
         # A different disabled target may legitimately have an obsolete READY
         # decision after its own budget edit; it must not block BTC's enable.
-        state["TARGETS"]["ETH_GBP"].update(
+        state["TARGETS"]["HYPE_USD"].update(
             {
                 "STATUS": "READY",
                 "REGIME": "SIDEWAYS",
@@ -84,32 +84,32 @@ class DcaConfigWriterTests(unittest.TestCase):
             state,
             {},
             action="set_enabled",
-            symbol="BTC_GBP",
+            symbol="BTC_USD",
             enabled_json="true",
             expected_rules_hash=expected_hash,
-            expected_decision_id=state["TARGETS"]["BTC_GBP"]["DECISION_ID"],
+            expected_decision_id=state["TARGETS"]["BTC_USD"]["DECISION_ID"],
             expected_global_rules_hash=global_rules_pre_state_hash(self.rules),
             market_minimum_provider=lambda _symbol: 5,
             now=self.now,
         )
         self.assertTrue(should_write)
-        self.assertTrue(updated["BTC_GBP"]["BUY_ENABLED"])
+        self.assertTrue(updated["BTC_USD"]["BUY_ENABLED"])
 
     def test_enable_fails_when_minimum_or_confirmation_changed(self):
-        self.rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
+        self.rules["BTC_USD"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
         state = self._ready_state()
-        expected_hash = rules_hash("BTC_GBP", self.rules["BTC_GBP"])
-        state["TARGETS"]["BTC_GBP"]["RULES_HASH"] = expected_hash
+        expected_hash = rules_hash("BTC_USD", self.rules["BTC_USD"])
+        state["TARGETS"]["BTC_USD"]["RULES_HASH"] = expected_hash
         with self.assertRaisesRegex(ValueError, "below Kraken"):
             apply_change(
                 self.rules,
                 state,
                 {},
                 action="set_enabled",
-                symbol="BTC_GBP",
+                symbol="BTC_USD",
                 enabled_json="true",
                 expected_rules_hash=expected_hash,
-                expected_decision_id=state["TARGETS"]["BTC_GBP"]["DECISION_ID"],
+                expected_decision_id=state["TARGETS"]["BTC_USD"]["DECISION_ID"],
                 expected_global_rules_hash=global_rules_pre_state_hash(self.rules),
                 market_minimum_provider=lambda _symbol: 15,
                 now=self.now,
@@ -120,20 +120,20 @@ class DcaConfigWriterTests(unittest.TestCase):
                 state,
                 {},
                 action="set_enabled",
-                symbol="BTC_GBP",
+                symbol="BTC_USD",
                 enabled_json="true",
                 expected_rules_hash="0" * 64,
-                expected_decision_id=state["TARGETS"]["BTC_GBP"]["DECISION_ID"],
+                expected_decision_id=state["TARGETS"]["BTC_USD"]["DECISION_ID"],
                 expected_global_rules_hash=global_rules_pre_state_hash(self.rules),
                 market_minimum_provider=lambda _symbol: 5,
                 now=self.now,
             )
 
     def test_second_queued_enable_rejects_changed_global_pre_state(self):
-        for symbol in ("BTC_GBP", "ETH_GBP"):
+        for symbol in ("BTC_USD", "HYPE_USD"):
             self.rules[symbol]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
         state = empty_analysis_state(self.rules, now=self.now)
-        for symbol in ("BTC_GBP", "ETH_GBP"):
+        for symbol in ("BTC_USD", "HYPE_USD"):
             state["TARGETS"][symbol].update(
                 {
                     "STATUS": "READY",
@@ -151,10 +151,10 @@ class DcaConfigWriterTests(unittest.TestCase):
             state,
             {},
             action="set_enabled",
-            symbol="BTC_GBP",
+            symbol="BTC_USD",
             enabled_json="true",
-            expected_rules_hash=rules_hash("BTC_GBP", self.rules["BTC_GBP"]),
-            expected_decision_id=state["TARGETS"]["BTC_GBP"]["DECISION_ID"],
+            expected_rules_hash=rules_hash("BTC_USD", self.rules["BTC_USD"]),
+            expected_decision_id=state["TARGETS"]["BTC_USD"]["DECISION_ID"],
             expected_global_rules_hash=reviewed_global_hash,
             market_minimum_provider=lambda _symbol: 5,
             now=self.now,
@@ -165,26 +165,27 @@ class DcaConfigWriterTests(unittest.TestCase):
                 state,
                 {},
                 action="set_enabled",
-                symbol="ETH_GBP",
+                symbol="HYPE_USD",
                 enabled_json="true",
-                expected_rules_hash=rules_hash("ETH_GBP", self.rules["ETH_GBP"]),
-                expected_decision_id=state["TARGETS"]["ETH_GBP"]["DECISION_ID"],
+                expected_rules_hash=rules_hash("HYPE_USD", self.rules["HYPE_USD"]),
+                expected_decision_id=state["TARGETS"]["HYPE_USD"]["DECISION_ID"],
                 expected_global_rules_hash=reviewed_global_hash,
                 market_minimum_provider=lambda _symbol: 5,
                 now=self.now,
             )
 
     def test_enable_rejects_any_pending_order_reconciliation(self):
-        self.rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
+        self.rules["BTC_USD"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
         state = self._ready_state()
-        state["TARGETS"]["BTC_GBP"]["RULES_HASH"] = rules_hash(
-            "BTC_GBP", self.rules["BTC_GBP"]
+        state["TARGETS"]["BTC_USD"]["RULES_HASH"] = rules_hash(
+            "BTC_USD", self.rules["BTC_USD"]
         )
         execution = {
-            "ADA_GBP": {
+            "SOL_USD": {
                 "LAST_BUY_DATE": "",
                 "PENDING_ORDER": {
                     "client_order_id": "dca-1234567890abcd",
+                    "funding_client_order_id": "dca-fedcba09876543",
                     "trade_date": "2026-08-05",
                     "amount_gbp": 10,
                     "decision_id": "decision-ada",
@@ -192,32 +193,32 @@ class DcaConfigWriterTests(unittest.TestCase):
                 },
             }
         }
-        with self.assertRaisesRegex(ValueError, "reconciliation is pending for ADA_GBP"):
+        with self.assertRaisesRegex(ValueError, "reconciliation is pending for SOL_USD"):
             apply_change(
                 self.rules,
                 state,
                 execution,
                 action="set_enabled",
-                symbol="BTC_GBP",
+                symbol="BTC_USD",
                 enabled_json="true",
-                expected_rules_hash=rules_hash("BTC_GBP", self.rules["BTC_GBP"]),
-                expected_decision_id=state["TARGETS"]["BTC_GBP"]["DECISION_ID"],
+                expected_rules_hash=rules_hash("BTC_USD", self.rules["BTC_USD"]),
+                expected_decision_id=state["TARGETS"]["BTC_USD"]["DECISION_ID"],
                 expected_global_rules_hash=global_rules_pre_state_hash(self.rules),
                 market_minimum_provider=lambda _symbol: 5,
                 now=self.now,
             )
     def test_disabling_does_not_require_analysis_or_market_access(self):
-        self.rules["BTC_GBP"] = {
+        self.rules["BTC_USD"] = {
             "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 20},
             "BUY_ENABLED": True,
         }
         updated, _ = apply_change(
             self.rules,
             action="set_enabled",
-            symbol="BTC_GBP",
+            symbol="BTC_USD",
             enabled_json="false",
         )
-        self.assertFalse(updated["BTC_GBP"]["BUY_ENABLED"])
+        self.assertFalse(updated["BTC_USD"]["BUY_ENABLED"])
 
 
 if __name__ == "__main__":

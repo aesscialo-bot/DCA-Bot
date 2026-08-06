@@ -18,7 +18,8 @@ class KrakenOrderAuditTests(unittest.TestCase):
         self.assertTrue(result["safe_to_initialize_empty_execution_state"])
         self.assertEqual(result["unresolved_bot_orders"], 0)
         self.assertEqual(result["same_day_closed_bot_orders"], 0)
-        self.assertEqual(self.exchange.fetch_open_orders.call_count, 4)
+        self.assertTrue(result["flow_integrity_ok"])
+        self.exchange.fetch_open_orders.assert_called_once_with(None)
         self.assertEqual(self.exchange.fetch_closed_orders.call_count, 1)
         self.exchange.fetch_closed_orders.assert_called_once_with(
             None,
@@ -29,24 +30,18 @@ class KrakenOrderAuditTests(unittest.TestCase):
                 "closetime": "close",
             },
         )
-        self.assertFalse(
-            any(
-                call.startswith("create") or "order" in call.lower() and call.startswith("add")
-                for call in dir(self.exchange)
-            )
+        self.assertEqual(
+            [call[0] for call in self.exchange.method_calls],
+            ["fetch_closed_orders", "fetch_open_orders"],
         )
 
     def test_open_bot_order_blocks_empty_state_and_only_exposes_suffix(self):
-        self.exchange.fetch_open_orders.side_effect = [
-            [
-                {
-                    "id": "sensitive-prefix-ABC123",
-                    "clientOrderId": "dca-1234567890abcd",
-                }
-            ],
-            [],
-            [],
-            [],
+        self.exchange.fetch_open_orders.return_value = [
+            {
+                "id": "sensitive-prefix-ABC123",
+                "clientOrderId": "dca-1234567890abcd",
+                "symbol": "BTC/USD",
+            }
         ]
 
         result = kraken_order_audit.audit_orders(self.exchange, now=self.now)
@@ -54,7 +49,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
         self.assertFalse(result["safe_to_initialize_empty_execution_state"])
         self.assertEqual(result["unresolved_bot_orders"], 1)
         self.assertEqual(
-            result["markets"]["BTC_GBP"]["unresolved_order_id_suffixes"],
+            result["markets"]["BTC_USD"]["unresolved_order_id_suffixes"],
             ["ABC123"],
         )
         self.assertNotIn("sensitive-prefix", str(result))
@@ -72,13 +67,13 @@ class KrakenOrderAuditTests(unittest.TestCase):
                     "id": "closed-today-654321",
                     "clientOrderId": "dca-1234567890abcd",
                     "timestamp": same_day_ms,
-                    "symbol": "BTC/GBP",
+                    "symbol": "BTC/USD",
                 },
                 {
                     "id": "closed-old-111111",
                     "clientOrderId": "dca-aaaaaaaaaaaaaa",
                     "timestamp": previous_day_ms,
-                    "symbol": "BTC/GBP",
+                    "symbol": "BTC/USD",
                 },
             ]
         ]
@@ -97,7 +92,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
                 "clientOrderId": "dca-11111111111111",
                 "timestamp": int(opened_before_midnight.timestamp() * 1000),
                 "lastUpdateTimestamp": int(closed_after_midnight.timestamp() * 1000),
-                "symbol": "BTC/GBP",
+                "symbol": "BTC/USD",
             },
             {
                 "id": "closed-after-midnight-100002",
@@ -105,7 +100,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
                 "timestamp": int(opened_before_midnight.timestamp() * 1000),
                 "lastUpdateTimestamp": None,
                 "info": {"closetm": closed_after_midnight.timestamp()},
-                "symbol": "ETH/GBP",
+                "symbol": "HYPE/USD",
             },
         ]
 
@@ -113,24 +108,149 @@ class KrakenOrderAuditTests(unittest.TestCase):
 
         self.assertEqual(result["same_day_closed_bot_orders"], 2)
         self.assertEqual(
-            result["markets"]["BTC_GBP"]["same_day_closed_count"], 1
+            result["markets"]["BTC_USD"]["same_day_closed_count"], 1
         )
         self.assertEqual(
-            result["markets"]["ETH_GBP"]["same_day_closed_count"], 1
+            result["markets"]["HYPE_USD"]["same_day_closed_count"], 1
         )
         self.assertFalse(result["safe_to_initialize_empty_execution_state"])
 
     def test_non_bot_orders_are_ignored(self):
-        self.exchange.fetch_open_orders.side_effect = [
-            [{"id": "manual-order", "clientOrderId": "manual-123"}],
-            [],
-            [],
-            [],
+        self.exchange.fetch_open_orders.return_value = [
+            {
+                "id": "manual-order",
+                "clientOrderId": "manual-123",
+                "symbol": "BTC/USD",
+            }
         ]
 
         result = kraken_order_audit.audit_orders(self.exchange, now=self.now)
 
         self.assertTrue(result["safe_to_initialize_empty_execution_state"])
+
+    def test_complete_two_leg_order_is_one_flow_not_a_duplicate(self):
+        same_day_ms = int(
+            datetime(2026, 8, 5, 1, 0, tzinfo=timezone.utc).timestamp() * 1000
+        )
+        funding_client_id = kraken_order_audit.build_client_order_id(
+            "BTC_USD", "2026-08-05", purpose="funding"
+        )
+        crypto_client_id = kraken_order_audit.build_client_order_id(
+            "BTC_USD", "2026-08-05", purpose="buy"
+        )
+        self.exchange.fetch_closed_orders.return_value = [
+            {
+                "id": "funding-leg-100001",
+                "clientOrderId": funding_client_id,
+                "timestamp": same_day_ms,
+                "symbol": "GBP/USD",
+            },
+            {
+                "id": "crypto-leg-100002",
+                "clientOrderId": crypto_client_id,
+                "timestamp": same_day_ms,
+                "symbol": "BTC/USD",
+            },
+        ]
+
+        result = kraken_order_audit.audit_orders(self.exchange, now=self.now)
+
+        self.assertEqual(result["same_day_closed_bot_orders"], 2)
+        self.assertEqual(result["same_day_completed_dca_flows"], 1)
+        self.assertEqual(result["same_day_incomplete_dca_flows"], 0)
+        self.assertEqual(result["same_day_duplicate_order_legs"], 0)
+        self.assertEqual(result["same_day_mismatched_order_legs"], 0)
+        self.assertTrue(result["flow_integrity_ok"])
+        self.assertEqual(
+            result["markets"]["GBP_USD"]["same_day_closed_count"], 1
+        )
+        self.assertEqual(
+            result["markets"]["BTC_USD"]["same_day_closed_count"], 1
+        )
+        self.assertFalse(result["safe_to_initialize_empty_execution_state"])
+
+    def test_orphan_funding_leg_is_incomplete_and_fails_closed(self):
+        same_day_ms = int(
+            datetime(2026, 8, 5, 1, 0, tzinfo=timezone.utc).timestamp() * 1000
+        )
+        funding_client_id = kraken_order_audit.build_client_order_id(
+            "HYPE_USD", "2026-08-05", purpose="funding"
+        )
+        self.exchange.fetch_closed_orders.return_value = [
+            {
+                "id": "orphan-funding-200001",
+                "clientOrderId": funding_client_id,
+                "timestamp": same_day_ms,
+                "symbol": "GBP/USD",
+            }
+        ]
+
+        result = kraken_order_audit.audit_orders(self.exchange, now=self.now)
+
+        self.assertEqual(result["same_day_completed_dca_flows"], 0)
+        self.assertEqual(result["same_day_incomplete_dca_flows"], 1)
+        self.assertFalse(result["flow_integrity_ok"])
+        self.assertFalse(result["safe_to_initialize_empty_execution_state"])
+
+    def test_duplicate_crypto_leg_is_not_counted_as_a_complete_flow(self):
+        same_day_ms = int(
+            datetime(2026, 8, 5, 1, 0, tzinfo=timezone.utc).timestamp() * 1000
+        )
+        funding_client_id = kraken_order_audit.build_client_order_id(
+            "SOL_USD", "2026-08-05", purpose="funding"
+        )
+        crypto_client_id = kraken_order_audit.build_client_order_id(
+            "SOL_USD", "2026-08-05", purpose="buy"
+        )
+        self.exchange.fetch_closed_orders.return_value = [
+            {
+                "id": "funding-leg-300001",
+                "clientOrderId": funding_client_id,
+                "timestamp": same_day_ms,
+                "symbol": "GBP/USD",
+            },
+            {
+                "id": "crypto-leg-300002",
+                "clientOrderId": crypto_client_id,
+                "timestamp": same_day_ms,
+                "symbol": "SOL/USD",
+            },
+            {
+                "id": "crypto-leg-300003",
+                "clientOrderId": crypto_client_id,
+                "timestamp": same_day_ms,
+                "symbol": "SOL/USD",
+            },
+        ]
+
+        result = kraken_order_audit.audit_orders(self.exchange, now=self.now)
+
+        self.assertEqual(result["same_day_completed_dca_flows"], 0)
+        self.assertEqual(result["same_day_incomplete_dca_flows"], 1)
+        self.assertEqual(result["same_day_duplicate_order_legs"], 1)
+        self.assertFalse(result["flow_integrity_ok"])
+
+    def test_expected_client_id_on_wrong_market_is_mismatched(self):
+        same_day_ms = int(
+            datetime(2026, 8, 5, 1, 0, tzinfo=timezone.utc).timestamp() * 1000
+        )
+        crypto_client_id = kraken_order_audit.build_client_order_id(
+            "BTC_USD", "2026-08-05", purpose="buy"
+        )
+        self.exchange.fetch_closed_orders.return_value = [
+            {
+                "id": "wrong-market-400001",
+                "clientOrderId": crypto_client_id,
+                "timestamp": same_day_ms,
+                "symbol": "GBP/USD",
+            }
+        ]
+
+        result = kraken_order_audit.audit_orders(self.exchange, now=self.now)
+
+        self.assertEqual(result["same_day_mismatched_order_legs"], 1)
+        self.assertFalse(result["flow_integrity_ok"])
+        self.assertFalse(result["safe_to_initialize_empty_execution_state"])
 
     def test_closed_bot_order_with_missing_timestamp_fails_closed(self):
         self.exchange.fetch_closed_orders.side_effect = [
@@ -139,7 +259,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
                     "id": "closed-unknown-777777",
                     "clientOrderId": "dca-1234567890abcd",
                     "timestamp": None,
-                    "symbol": "BTC/GBP",
+                    "symbol": "BTC/USD",
                 }
             ]
         ]
@@ -157,7 +277,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
             "id": "closed-page-one-000001",
             "clientOrderId": "dca-11111111111111",
             "timestamp": same_day_ms,
-            "symbol": "BTC/GBP",
+            "symbol": "BTC/USD",
         }
         first_page = [first_bot]
         first_page.extend(
@@ -165,7 +285,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
                 "id": f"manual-page-one-{index:06d}",
                 "clientOrderId": f"manual-{index}",
                 "timestamp": same_day_ms,
-                "symbol": "BTC/GBP",
+                "symbol": "BTC/USD",
             }
             for index in range(49)
         )
@@ -175,7 +295,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
                 "id": "closed-page-two-000002",
                 "clientOrderId": "dca-22222222222222",
                 "timestamp": same_day_ms,
-                "symbol": "ETH/GBP",
+                "symbol": "HYPE/USD",
             },
         ]
         self.exchange.fetch_closed_orders.side_effect = [first_page, second_page]
@@ -184,10 +304,10 @@ class KrakenOrderAuditTests(unittest.TestCase):
 
         self.assertEqual(result["same_day_closed_bot_orders"], 2)
         self.assertEqual(
-            result["markets"]["BTC_GBP"]["same_day_closed_count"], 1
+            result["markets"]["BTC_USD"]["same_day_closed_count"], 1
         )
         self.assertEqual(
-            result["markets"]["ETH_GBP"]["same_day_closed_count"], 1
+            result["markets"]["HYPE_USD"]["same_day_closed_count"], 1
         )
         self.assertEqual(self.exchange.fetch_closed_orders.call_count, 2)
         self.assertEqual(
@@ -205,7 +325,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
                 "id": f"closed-repeat-{index:06d}",
                 "clientOrderId": f"manual-{index}",
                 "timestamp": 1,
-                "symbol": "BTC/GBP",
+                "symbol": "BTC/USD",
             }
             for index in range(kraken_order_audit.CLOSED_ORDER_PAGE_SIZE)
         ]
@@ -220,7 +340,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
                 "id": None,
                 "clientOrderId": "dca-1234567890abcd",
                 "timestamp": 1,
-                "symbol": "BTC/GBP",
+                "symbol": "BTC/USD",
             }
         ]
 
@@ -236,7 +356,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
                         "id": f"closed-{page_number}-{index:06d}",
                         "clientOrderId": f"manual-{page_number}-{index}",
                         "timestamp": 1,
-                        "symbol": "BTC/GBP",
+                        "symbol": "BTC/USD",
                     }
                     for index in range(kraken_order_audit.CLOSED_ORDER_PAGE_SIZE)
                 ]

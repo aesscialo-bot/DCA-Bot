@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       symbol:
-        description: BTC, ETH, SOL, ADA, a canonical GBP pair, or all
+        description: BTC, HYPE, SOL, a canonical USD pair, or all
         required: false
         default: all
         type: string
@@ -40,13 +40,38 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Analyze Kraken GBP markets
+      - name: Load protected production state
         env:
-          DCA_TARGET_MAP: ${{ vars.DCA_TARGET_MAP }}
-          DCA_ANALYSIS_STATE: ${{ vars.DCA_ANALYSIS_STATE || '' }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          load_variable() {
+            local name="$1"
+            local value
+            if ! value="$(gh variable get "$name" --repo "$GITHUB_REPOSITORY" 2>/dev/null)"; then
+              echo "Could not load required repository variable $name." >&2
+              exit 1
+            fi
+            while IFS= read -r line; do
+              [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+            done <<< "$value"
+            local delimiter="DCA_${GITHUB_RUN_ID}_${RANDOM}"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "$value" "$delimiter" >> "$GITHUB_ENV"
+          }
+          load_variable DCA_TARGET_MAP
+          if gh variable get DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            load_variable DCA_ANALYSIS_STATE
+          else
+            printf 'DCA_ANALYSIS_STATE={}\n' >> "$GITHUB_ENV"
+          fi
+
+      - name: Analyze Kraken USD markets
+        env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GH_PAT_FOR_VARS: ${{ secrets.GH_PAT_FOR_VARS }}
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Bangkok' }}
+          DCA_START_DATE: ${{ vars.DCA_START_DATE }}
           SYMBOL: ${{ inputs.symbol || 'all' }}
         run: python -u crypto_analysis.py

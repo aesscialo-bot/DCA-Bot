@@ -1,6 +1,6 @@
-"""Discord and Railway control plane for the Kraken GBP DCA service.
+"""Discord and Railway control plane for GBP-budgeted Kraken USD DCA.
 
-The bot never places an order.  It reads the three persisted GitHub variables,
+The bot never places an order.  It reads persisted GitHub variables,
 dispatches serialized GitHub Actions workflows, and runs a five-minute Railway
 scheduler against absolute per-asset analysis decisions.  Every write command
 is exact, allowlisted, and fail-closed.
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 import os
 import re
@@ -27,6 +27,7 @@ import requests
 from dca_config import (
     ALLOWED_TARGETS,
     ConfigError,
+    decision_analyzed_on_or_after,
     decision_age_minutes,
     effective_amount,
     global_rules_hash,
@@ -57,6 +58,7 @@ TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 RULES_VARIABLE = "DCA_TARGET_MAP"
 ANALYSIS_STATE_VARIABLE = "DCA_ANALYSIS_STATE"
 EXECUTION_STATE_VARIABLE = "DCA_EXECUTION_STATE"
+START_DATE_VARIABLE = "DCA_START_DATE"
 CONFIG_WRITE_PREFIX = "!dca "
 DCA_AMOUNT_MIN_GBP = 5.0
 DCA_AMOUNT_MAX_GBP = 1_000.0
@@ -79,6 +81,7 @@ _dca_dispatch_guard: dict[tuple[str, str], float] = {}
 _schedule_error: str | None = None
 _schedule_warning: str | None = None
 _last_schedule_alert: str | None = None
+_schedule_start_date: date | None = None
 
 
 def _log(message: str) -> None:
@@ -123,31 +126,31 @@ def _config_write_block_reason(
 
 _FULL_NAMES = {
     "bitcoin": "BTC",
-    "ethereum": "ETH",
+    "hyperliquid": "HYPE",
+    "hype": "HYPE",
     "solana": "SOL",
-    "cardano": "ADA",
 }
 
 
-def _normalise_gbp_key(value: str) -> str:
+def _normalise_usd_key(value: str) -> str:
     raw = value.strip()
     lowered = raw.lower()
     raw = _FULL_NAMES.get(lowered, raw).upper().replace("/", "_")
     parts = raw.split("_")
-    if len(parts) == 2 and parts[1] != "GBP":
-        raise ValueError("Only GBP trading pairs are supported")
+    if len(parts) == 2 and parts[1] != "USD":
+        raise ValueError("Only BTC/USD, HYPE/USD, and SOL/USD are supported")
     if len(parts) > 2:
-        raise ValueError("Only GBP trading pairs are supported")
+        raise ValueError("Only BTC/USD, HYPE/USD, and SOL/USD are supported")
     symbol = parts[0]
-    key = f"{symbol}_GBP"
+    key = f"{symbol}_USD"
     if key not in ALLOWED_TARGETS:
-        available = ", ".join(target.removesuffix("_GBP") for target in ALLOWED_TARGETS)
+        available = ", ".join(target.removesuffix("_USD") for target in ALLOWED_TARGETS)
         raise ValueError(f"Supported assets are {available}")
     return key
 
 
-def _to_gbp_pair(value: str) -> str:
-    return _normalise_gbp_key(value).replace("_", "/")
+def _to_usd_pair(value: str) -> str:
+    return _normalise_usd_key(value).replace("_", "/")
 
 
 def _parse_amount(value: Any, label: str) -> float:
@@ -183,6 +186,19 @@ def _local_timestamp(value: str | None) -> str:
     except (ConfigError, ValueError):
         return "invalid"
     return parsed.strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _parse_start_date(value: str | None) -> date | None:
+    if value is None or not value.strip():
+        return None
+    candidate = value.strip()
+    try:
+        parsed = date.fromisoformat(candidate)
+    except ValueError as exc:
+        raise ConfigError("DCA_START_DATE must be YYYY-MM-DD") from exc
+    if parsed.isoformat() != candidate:
+        raise ConfigError("DCA_START_DATE must be YYYY-MM-DD")
+    return parsed
 
 
 def _decision_age(decision: Mapping[str, Any], now: datetime | None = None) -> str:
@@ -345,7 +361,7 @@ async def handle_set_amounts(
         await message.reply("Blocked: this write requires an allowlisted Discord user.")
         return
     try:
-        symbol = _normalise_gbp_key(symbol_value)
+        symbol = _normalise_usd_key(symbol_value)
         low = _parse_amount(low_value, "LOW amount")
         up = _parse_amount(up_value, "UP amount")
     except ValueError as exc:
@@ -373,7 +389,7 @@ async def handle_set_amounts(
     if await asyncio.to_thread(trigger_workflow, "update_dca_config.yml", inputs):
         await message.reply(
             f"Queued atomic budgets for **{symbol}**: LOW {_display_amount(low)}, "
-            f"UP {_display_amount(up)}. Run `!dca analyze {symbol.removesuffix('_GBP')}` "
+            f"UP {_display_amount(up)}. Run `!dca analyze {symbol.removesuffix('_USD')}` "
             "after the workflow completes."
         )
     else:
@@ -385,7 +401,7 @@ async def handle_disable(symbol_value: str, message: discord.Message) -> None:
         await message.reply("Blocked: this write requires an allowlisted Discord user.")
         return
     try:
-        symbol = _normalise_gbp_key(symbol_value)
+        symbol = _normalise_usd_key(symbol_value)
     except ValueError as exc:
         await message.reply(f"Invalid request: {exc}")
         return
@@ -471,7 +487,7 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
         await message.reply("Blocked: this write requires an allowlisted Discord user.")
         return
     try:
-        symbol = _normalise_gbp_key(symbol_value)
+        symbol = _normalise_usd_key(symbol_value)
         rules, analysis, execution = await asyncio.to_thread(_load_live_state)
         review = _enable_review(
             symbol,
@@ -541,7 +557,7 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
     if current["global_rules_hash"] != expected["global_rules_hash"]:
         _pending_enable_confirmations.pop(author_id, None)
         await message.reply(
-            "Blocked: the global four-asset DCA rules changed after review. "
+            "Blocked: the global three-asset DCA rules changed after review. "
             "Run the enable command again to review current aggregate exposure."
         )
         return
@@ -588,10 +604,10 @@ async def handle_analyze(params: dict[str, Any], message: discord.Message) -> No
     raw_symbol = str(params.get("symbol") or params.get("symbols") or "all").strip()
     if raw_symbol.lower() == "all":
         workflow_symbol = "all"
-        label = "all four GBP targets"
+        label = "all three Kraken USD targets"
     else:
         try:
-            workflow_symbol = _to_gbp_pair(raw_symbol)
+            workflow_symbol = _to_usd_pair(raw_symbol)
         except ValueError as exc:
             await message.reply(f"Invalid request: {exc}")
             return
@@ -661,7 +677,7 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         return
 
     now = datetime.now(timezone.utc)
-    lines = ["**Kraken GBP DCA status**"]
+    lines = ["**Kraken USD-pair DCA status (GBP budgets)**"]
     for symbol in ALLOWED_TARGETS:
         lines.append(
             _decision_summary(
@@ -679,6 +695,11 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         scheduler = f"running with skipped target(s) — {_schedule_warning}"
     elif not DCA_CRON_ENABLED:
         scheduler = "paused by DCA_CRON_ENABLED=false"
+    elif _schedule_start_date is not None and now.astimezone(TIMEZONE).date() < _schedule_start_date:
+        scheduler = (
+            "armed; new trading starts "
+            f"{_schedule_start_date.isoformat()} {TIMEZONE.key}"
+        )
     else:
         scheduler = f"running; {len(_dca_schedule)} active target(s)"
     lines.append(f"Scheduler: **{scheduler}**")
@@ -751,13 +772,18 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     )
     lines = [
         f"**DCA health: {posture}**",
-        f"- Rules: valid ({len(rules)}/4 GBP targets)",
-        f"- Analysis: fresh READY {len(ready)}/4",
+        f"- Rules: valid ({len(rules)}/3 USD targets; GBP budgets)",
+        f"- Analysis: fresh READY {len(ready)}/3",
         f"- Execution state: valid; pending intents {pending_count}",
         f"- Scheduler: {'running' if DCA_CRON_ENABLED else 'paused'}; "
         f"active targets {len(_dca_schedule)}",
-        f"- Buy-enabled targets: {enabled_count}/4",
+        f"- Buy-enabled targets: {enabled_count}/3",
     ]
+    if _schedule_start_date is not None:
+        lines.append(
+            f"- First permitted trade date: {_schedule_start_date.isoformat()} "
+            f"{TIMEZONE.key}"
+        )
     if errors:
         lines.append("- Analysis ERROR: " + ", ".join(errors))
     if stale:
@@ -771,7 +797,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     await message.reply("\n".join(lines))
 
 
-HELP_TEXT = """**Kraken GBP DCA controls**
+HELP_TEXT = """**Kraken USD-pair DCA controls (GBP budgets)**
 
 `!dca set BTC amounts to 10 low and 20 up`
 `!dca disable BTC`
@@ -795,23 +821,25 @@ async def handle_help(params: dict[str, Any], message: discord.Message) -> None:
 
 
 def _clear_schedule(error: str | None = None) -> None:
-    global _schedule_error, _schedule_warning
+    global _schedule_error, _schedule_warning, _schedule_start_date
     _dca_schedule.clear()
     _pending_recovery_symbols.clear()
     _schedule_error = error
     _schedule_warning = None
+    _schedule_start_date = None
 
 
 def refresh_dca_schedule(
     rules_json: str | None,
     analysis_json: str | None,
     execution_json: str | None,
+    start_date_value: str | None = None,
     *,
     now: datetime | None = None,
 ) -> bool:
-    """Build a fail-closed schedule from all three durable GitHub variables."""
+    """Build a fail-closed schedule from durable GitHub configuration."""
 
-    global _schedule_error, _schedule_warning
+    global _schedule_error, _schedule_warning, _schedule_start_date
     try:
         if execution_json is None:
             raise ConfigError("DCA_EXECUTION_STATE is unavailable")
@@ -845,6 +873,13 @@ def refresh_dca_schedule(
         _schedule_error = "scheduler refresh time must include a timezone"
         _schedule_warning = None
         return False
+    try:
+        _schedule_start_date = _parse_start_date(start_date_value)
+    except ConfigError as exc:
+        _dca_schedule.clear()
+        _schedule_error = str(exc)
+        _schedule_warning = None
+        return False
     schedule: dict[str, dict[str, Any]] = {}
     invalid_enabled: list[str] = []
     for symbol in ALLOWED_TARGETS:
@@ -863,6 +898,11 @@ def refresh_dca_schedule(
             continue
         if decision_age_minutes(decision, now=current) < 0:
             invalid_enabled.append(f"{symbol}: future analysis timestamp")
+            continue
+        if not decision_analyzed_on_or_after(
+            decision, _schedule_start_date, TIMEZONE
+        ):
+            invalid_enabled.append(f"{symbol}: analysis predates start date")
             continue
         schedule[symbol] = {
             "execute_at": decision["EXECUTE_AT"],
@@ -901,6 +941,11 @@ def _due_symbols_for_dispatch(now: datetime) -> list[str]:
             due.append(symbol)
 
     local_date = now.astimezone(TIMEZONE).date().isoformat()
+    if (
+        _schedule_start_date is not None
+        and now.astimezone(TIMEZONE).date() < _schedule_start_date
+    ):
+        return due
     for symbol, schedule in sorted(_dca_schedule.items()):
         if schedule.get("last_buy_date") == local_date:
             continue
@@ -925,6 +970,14 @@ def _format_cron_status() -> str:
         return f"Scheduler invalid: {_schedule_error}"
     if _schedule_warning:
         return f"Scheduler running with skipped target(s): {_schedule_warning}"
+    if (
+        _schedule_start_date is not None
+        and datetime.now(TIMEZONE).date() < _schedule_start_date
+    ):
+        return (
+            "Scheduler armed; new trading starts "
+            f"{_schedule_start_date.isoformat()} {TIMEZONE.key}"
+        )
     if not _dca_schedule:
         return "Scheduler running; no enabled targets"
     parts = [
@@ -990,6 +1043,7 @@ async def dca_schedule_refresh() -> None:
         asyncio.to_thread(get_repo_variable, RULES_VARIABLE),
         asyncio.to_thread(get_repo_variable, ANALYSIS_STATE_VARIABLE),
         asyncio.to_thread(get_repo_variable, EXECUTION_STATE_VARIABLE),
+        asyncio.to_thread(get_repo_variable, START_DATE_VARIABLE),
     )
     valid = refresh_dca_schedule(*values)
     if not valid:
@@ -1061,6 +1115,7 @@ async def on_ready() -> None:
         asyncio.to_thread(get_repo_variable, RULES_VARIABLE),
         asyncio.to_thread(get_repo_variable, ANALYSIS_STATE_VARIABLE),
         asyncio.to_thread(get_repo_variable, EXECUTION_STATE_VARIABLE),
+        asyncio.to_thread(get_repo_variable, START_DATE_VARIABLE),
     )
     valid = refresh_dca_schedule(*values)
     if valid:
@@ -1174,6 +1229,6 @@ if __name__ == "__main__":
         _log("ERROR missing required environment variables: " + ", ".join(missing))
         sys.exit(1)
     _log(
-        f"INFO starting Kraken GBP DCA Discord service cron_enabled={DCA_CRON_ENABLED}"
+        f"INFO starting Kraken USD-pair DCA Discord service cron_enabled={DCA_CRON_ENABLED}"
     )
     client.run(DISCORD_BOT_TOKEN, log_handler=None)

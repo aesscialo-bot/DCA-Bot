@@ -38,6 +38,29 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
+      - name: Load protected production state
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          load_variable() {
+            local name="$1"
+            local value
+            if ! value="$(gh variable get "$name" --repo "$GITHUB_REPOSITORY" 2>/dev/null)"; then
+              echo "Could not load required repository variable $name; refusing to trade." >&2
+              exit 1
+            fi
+            while IFS= read -r line; do
+              [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+            done <<< "$value"
+            local delimiter="DCA_${GITHUB_RUN_ID}_${RANDOM}"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "$value" "$delimiter" >> "$GITHUB_ENV"
+          }
+          load_variable DCA_TARGET_MAP
+          load_variable DCA_ANALYSIS_STATE
+          load_variable DCA_EXECUTION_STATE
+
       - name: Run fail-closed DCA trader
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
@@ -47,11 +70,9 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GHOSTFOLIO_TOKEN: ${{ secrets.GHOSTFOLIO_TOKEN }}
-          DCA_TARGET_MAP: ${{ vars.DCA_TARGET_MAP }}
-          DCA_ANALYSIS_STATE: ${{ vars.DCA_ANALYSIS_STATE || '{}' }}
-          DCA_EXECUTION_STATE: ${{ vars.DCA_EXECUTION_STATE || '{}' }}
           GHOSTFOLIO_URL: ${{ vars.GHOSTFOLIO_URL || 'https://ghostfol.io' }}
           PORTFOLIO_ACCOUNT_MAP: ${{ vars.PORTFOLIO_ACCOUNT_MAP }}
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Bangkok' }}
+          DCA_START_DATE: ${{ vars.DCA_START_DATE }}
           DCA_SYMBOLS_JSON: ${{ inputs.symbols_json || '' }}
         run: python -u crypto_dca.py

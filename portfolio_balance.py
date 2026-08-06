@@ -1,8 +1,15 @@
-"""Kraken GBP portfolio reporting for the configured DCA markets."""
+"""Read-only Kraken portfolio reporting for the configured USD DCA markets.
+
+The configured crypto markets are quoted in USD, but the user's budgets and
+portfolio view remain GBP-denominated.  Current USD values are converted with
+Kraken's live GBP/USD ticker.  Kraken is the source of truth; Ghostfolio is an
+optional post-fill mirror and is never required for this report.
+"""
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -26,30 +33,37 @@ REPORT_CUTOFF_DAY = 5
 REPORT_CUTOFF_HOUR = 7
 TRADE_PAGE_SIZE = 100
 DISCORD_DESCRIPTION_LIMIT = 3900
+GBP_USD_SYMBOL = "GBP/USD"
 
 
 def _gha_mask(value: str) -> None:
-    """Hide a portfolio value when this module runs in GitHub Actions."""
+    """Hide an account value when this module runs in GitHub Actions."""
     if os.environ.get("GITHUB_ACTIONS") == "true" and value:
         print(f"::add-mask::{value}", flush=True)
 
 
-def extract_gbp_symbols(target_map: dict[str, Any]) -> list[str]:
-    """Return unique Kraken ``BASE/GBP`` symbols from DCA configuration keys.
+def _positive_number(value: Any, name: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive finite number") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return number
 
-    The portfolio job deliberately rejects unsupported quote currencies.
-    Silently translating them could make a GBP report disagree with the live trader.
-    """
+
+def extract_usd_symbols(target_map: dict[str, Any]) -> list[str]:
+    """Return unique Kraken ``BASE/USD`` symbols from canonical target keys."""
     symbols: list[str] = []
     for raw_key in target_map:
         if not isinstance(raw_key, str) or not re.fullmatch(
-            r"[A-Z0-9]+_GBP", raw_key
+            r"[A-Z0-9]+_USD", raw_key
         ):
             raise ValueError(
-                f"Invalid DCA market {raw_key!r}; expected a BASE_GBP key"
+                f"Invalid DCA market {raw_key!r}; expected a BASE_USD key"
             )
         base = raw_key[:-4]
-        symbol = f"{base}/GBP"
+        symbol = f"{base}/USD"
         if symbol not in symbols:
             symbols.append(symbol)
     return symbols
@@ -81,7 +95,7 @@ def monthly_reporting_window(now: datetime | None = None) -> tuple[datetime, dat
 
 
 def get_portfolio_balances(exchange: Any, symbols: list[str]) -> dict[str, float]:
-    """Fetch total Kraken balances for configured assets and GBP cash."""
+    """Fetch configured crypto totals plus GBP and USD cash from Kraken."""
     response = exchange.fetch_balance()
     totals = response.get("total", {}) or {}
     balances: dict[str, float] = {}
@@ -98,22 +112,33 @@ def get_portfolio_balances(exchange: Any, symbols: list[str]) -> dict[str, float
         balances[base] = float(raw_balance or 0)
 
     balances["GBP"] = float(totals.get("GBP") or 0)
-
+    balances["USD"] = float(totals.get("USD") or 0)
     return balances
 
 
-def get_gbp_prices(exchange: Any, symbols: list[str]) -> dict[str, float]:
-    """Fetch the latest usable Kraken GBP price for every configured market."""
+def _ticker_price(exchange: Any, symbol: str) -> float:
+    ticker = exchange.fetch_ticker(symbol)
+    return _positive_number(
+        ticker.get("last") or ticker.get("close") or ticker.get("bid"),
+        f"Kraken {symbol} ticker",
+    )
+
+
+def get_usd_prices(exchange: Any, symbols: list[str]) -> dict[str, float]:
+    """Fetch the latest usable USD price for each configured Kraken market."""
     prices: dict[str, float] = {}
     for symbol in symbols:
         try:
-            ticker = exchange.fetch_ticker(symbol)
-            price = ticker.get("last") or ticker.get("close") or ticker.get("bid")
-            prices[symbol] = float(price or 0)
+            prices[symbol] = _ticker_price(exchange, symbol)
         except Exception as exc:
             print(f"Warning: Kraken ticker unavailable for {symbol}: {exc}")
             prices[symbol] = 0.0
     return prices
+
+
+def get_live_gbp_usd_rate(exchange: Any) -> float:
+    """Return live USD received for one GBP from Kraken's GBP/USD market."""
+    return _ticker_price(exchange, GBP_USD_SYMBOL)
 
 
 def _normalise_buy_trade(trade: dict[str, Any]) -> dict[str, Any] | None:
@@ -128,17 +153,17 @@ def _normalise_buy_trade(trade: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     fee = trade.get("fee") or {}
-    fee_gbp = 0.0
-    if str(fee.get("currency", "")).upper() == "GBP":
-        fee_gbp = float(fee.get("cost") or 0)
+    fee_usd = 0.0
+    if str(fee.get("currency", "")).upper() == "USD":
+        fee_usd = float(fee.get("cost") or 0)
 
     return {
         "trade_id": str(trade.get("id") or ""),
         "order_id": str(trade.get("order") or trade.get("id") or "N/A"),
         "amount_crypto": amount,
-        "amount_gbp": cost,
-        "fee_gbp": fee_gbp,
-        "rate_gbp": price,
+        "amount_usd": cost,
+        "fee_usd": fee_usd,
+        "rate_usd": price,
         "timestamp": int(timestamp_ms) / 1000,
     }
 
@@ -149,7 +174,7 @@ def aggregate_buy_trades(
     start_ts: int,
     end_ts: int,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Fetch all Kraken buy fills in ``[start_ts, end_ts)`` by pagination."""
+    """Fetch all configured Kraken USD-market buy fills in ``[start, end)``."""
     start_ms = int(start_ts * 1000)
     end_ms = int(end_ts * 1000)
     result: dict[str, list[dict[str, Any]]] = {}
@@ -157,9 +182,8 @@ def aggregate_buy_trades(
     seen: set[tuple[Any, ...]] = set()
     offset = 0
 
-    # Kraken's private trade-history endpoint is account-wide. CCXT's symbol
-    # argument is not a server-side filter, so paginate once with Kraken's
-    # native offset and filter the parsed unified symbols ourselves.
+    # Kraken's private trade-history endpoint is account-wide. Paginate once,
+    # then filter CCXT's unified symbols locally.
     while True:
         page = exchange.fetch_my_trades(
             None,
@@ -186,7 +210,7 @@ def aggregate_buy_trades(
                 normalised["trade_id"],
                 normalised["timestamp"],
                 normalised["amount_crypto"],
-                normalised["rate_gbp"],
+                normalised["rate_usd"],
             )
             if identity in seen:
                 continue
@@ -200,28 +224,34 @@ def aggregate_buy_trades(
 
     for trades in result.values():
         trades.sort(key=lambda item: item["timestamp"], reverse=True)
-
     return result
 
 
-def _format_holding(base: str, balance: float, price: float) -> tuple[str, float]:
-    value = balance * price
+def _format_holding(
+    base: str,
+    balance: float,
+    usd_price: float,
+    gbp_usd_rate: float,
+) -> tuple[str, float]:
     _gha_mask(f"{balance:.8f}")
-    _gha_mask(f"{price:,.2f}")
-    _gha_mask(f"{value:,.2f}")
-    if price <= 0:
+    if usd_price <= 0:
         return (
             f"**{base}**\n"
             f"  Amount: `{balance:.8f}`\n"
-            "  GBP price and value unavailable",
+            "  USD price and GBP value unavailable",
             0.0,
         )
+
+    value_usd = balance * usd_price
+    value_gbp = value_usd / gbp_usd_rate
+    for value in (usd_price, value_usd, value_gbp):
+        _gha_mask(f"{value:,.2f}")
     return (
         f"**{base}**\n"
         f"  Amount: `{balance:.8f}`\n"
-        f"  Price: £{price:,.2f}\n"
-        f"  Value: £{value:,.2f}",
-        value,
+        f"  Price: ${usd_price:,.2f}\n"
+        f"  Value: £{value_gbp:,.2f} (${value_usd:,.2f})",
+        value_gbp,
     )
 
 
@@ -231,10 +261,16 @@ def build_portfolio_report(
     short_report: bool = True,
     now: datetime | None = None,
 ) -> str:
-    """Build a GBP-only holdings report and optional monthly Kraken history."""
+    """Build a GBP-valued Kraken report for the configured USD markets."""
     balances = get_portfolio_balances(exchange, symbols)
-    prices = get_gbp_prices(exchange, symbols)
-    lines = ["**📊 CONFIGURED KRAKEN HOLDINGS (GBP)**", ""]
+    prices = get_usd_prices(exchange, symbols)
+    gbp_usd_rate = get_live_gbp_usd_rate(exchange)
+    _gha_mask(f"{gbp_usd_rate:.8f}")
+    lines = [
+        "**📊 CONFIGURED KRAKEN HOLDINGS — GBP VALUATION**",
+        f"_Live Kraken FX: £1 = ${gbp_usd_rate:.4f}_",
+        "",
+    ]
     total_value_gbp = 0.0
     holding_count = 0
 
@@ -244,24 +280,37 @@ def build_portfolio_report(
         if balance <= 0:
             continue
         holding_count += 1
-        holding_text, value = _format_holding(base, balance, prices.get(symbol, 0))
+        holding_text, value = _format_holding(
+            base, balance, prices.get(symbol, 0), gbp_usd_rate
+        )
         total_value_gbp += value
         lines.extend([holding_text, ""])
 
     if not holding_count:
-        lines.extend(["_No balances found for the configured GBP markets._", ""])
+        lines.extend(["_No balances found for the configured USD markets._", ""])
 
     cash_gbp = balances.get("GBP", 0)
-    _gha_mask(f"{cash_gbp:,.2f}")
-    lines.extend(["**GBP Cash**", f"£{cash_gbp:,.2f}", ""])
-    total_value_gbp += cash_gbp
+    cash_usd = balances.get("USD", 0)
+    cash_usd_gbp = cash_usd / gbp_usd_rate
+    for value in (cash_gbp, cash_usd, cash_usd_gbp):
+        _gha_mask(f"{value:,.2f}")
+    lines.extend(
+        [
+            "**Cash on Kraken**",
+            f"  GBP: £{cash_gbp:,.2f}",
+            f"  USD: ${cash_usd:,.2f} (£{cash_usd_gbp:,.2f})",
+            "",
+        ]
+    )
+    total_value_gbp += cash_gbp + cash_usd_gbp
 
     _gha_mask(f"{total_value_gbp:,.2f}")
     lines.extend(
         [
-            "**💷 Configured DCA Assets + GBP Cash**",
+            "**💷 Configured Assets + GBP/USD Cash**",
             f"£{total_value_gbp:,.2f}",
-            "_Other Kraken assets not listed in DCA_TARGET_MAP are excluded._",
+            "_Kraken is the source of truth. Ghostfolio is an optional mirror._",
+            "_Other Kraken crypto assets are excluded._",
         ]
     )
 
@@ -270,43 +319,44 @@ def build_portfolio_report(
 
     start_dt, end_dt = monthly_reporting_window(now)
     start_ts, end_ts = int(start_dt.timestamp()), int(end_dt.timestamp())
-    report_label = (
-        f"{start_dt.strftime('%d %b %Y')} → {end_dt.strftime('%d %b %Y')}"
-    )
+    report_label = f"{start_dt.strftime('%d %b %Y')} → {end_dt.strftime('%d %b %Y')}"
     history = aggregate_buy_trades(exchange, symbols, start_ts, end_ts)
-    lines.extend(["", "═" * 40, f"**📈 KRAKEN BUY HISTORY ({report_label})**", ""])
+    lines.extend(["", "═" * 40, f"**📈 KRAKEN USD BUY HISTORY ({report_label})**", ""])
 
     if not history:
-        lines.append("_No Kraken buys in this period._")
+        lines.append("_No configured Kraken USD-market buys in this period._")
         return "\n".join(lines)
 
     for base in sorted(history):
         trades = history[base]
         total_crypto = sum(trade["amount_crypto"] for trade in trades)
-        total_gbp = sum(trade["amount_gbp"] for trade in trades)
-        total_fees_gbp = sum(trade.get("fee_gbp", 0) for trade in trades)
-        _gha_mask(f"{total_crypto:.8f}")
-        _gha_mask(f"{total_gbp:,.2f}")
-        _gha_mask(f"{total_fees_gbp:,.2f}")
+        total_usd = sum(trade["amount_usd"] for trade in trades)
+        total_fees_usd = sum(trade.get("fee_usd", 0) for trade in trades)
+        total_gbp = total_usd / gbp_usd_rate
+        for value in (total_crypto, total_usd, total_fees_usd, total_gbp):
+            _gha_mask(f"{value:,.8f}")
         lines.append(
             f"**{base}** ({len(trades)} buy{'s' if len(trades) != 1 else ''}) — "
-            f"`{total_crypto:.8f}` acquired — £{total_gbp:,.2f} cost — "
-            f"£{total_fees_gbp:,.2f} fees"
+            f"`{total_crypto:.8f}` acquired — ${total_usd:,.2f} "
+            f"(£{total_gbp:,.2f}) cost — ${total_fees_usd:,.2f} quote fees"
         )
 
         for trade in trades:
             order_id = trade["order_id"]
-            _gha_mask(order_id)
-            _gha_mask(f"{trade['amount_crypto']:.8f}")
-            _gha_mask(f"{trade['amount_gbp']:,.2f}")
-            _gha_mask(f"{trade['rate_gbp']:,.2f}")
-            _gha_mask(f"{trade.get('fee_gbp', 0):,.2f}")
+            for value in (
+                order_id,
+                f"{trade['amount_crypto']:.8f}",
+                f"{trade['amount_usd']:,.2f}",
+                f"{trade['rate_usd']:,.2f}",
+                f"{trade.get('fee_usd', 0):,.2f}",
+            ):
+                _gha_mask(str(value))
             traded_at = datetime.fromtimestamp(trade["timestamp"], tz=SELECTED_TZ)
             lines.append(
                 f"• {traded_at.strftime('%Y-%m-%d %H:%M %Z')} — "
-                f"{trade['amount_crypto']:.8f} {base} at £{trade['rate_gbp']:,.2f} — "
-                f"cost £{trade['amount_gbp']:,.2f} — "
-                f"fee £{trade.get('fee_gbp', 0):,.2f} — order `{order_id}`"
+                f"{trade['amount_crypto']:.8f} {base} at ${trade['rate_usd']:,.2f} — "
+                f"cost ${trade['amount_usd']:,.2f} — "
+                f"quote fee ${trade.get('fee_usd', 0):,.2f} — order `{order_id}`"
             )
         lines.append("")
 
@@ -354,9 +404,9 @@ def send_discord_notification(message: str) -> int:
             "timestamp": datetime.now(SELECTED_TZ).isoformat(),
         }
         if index == 0:
-            embed["title"] = "💼 Kraken GBP Portfolio Report"
+            embed["title"] = "💼 Kraken USD-Market Portfolio Report"
         if index == len(chunks) - 1:
-            embed["footer"] = {"text": "Kraken DCA Portfolio Tracker"}
+            embed["footer"] = {"text": "Kraken is the authoritative portfolio"}
 
         response = requests.post(
             DISCORD_WEBHOOK_URL,
@@ -372,16 +422,16 @@ def send_discord_notification(message: str) -> int:
 
 def main() -> None:
     """Fetch Kraken data, build the selected report, and notify Discord."""
-    print("--- Kraken GBP Portfolio Balance Check ---")
+    print("--- Kraken USD-Market Portfolio Balance Check (GBP valuation) ---")
     try:
         target_map = validate_rules_map(json.loads(DCA_TARGET_MAP_JSON))
-        symbols = extract_gbp_symbols(target_map)
+        symbols = extract_usd_symbols(target_map)
         exchange = get_kraken_exchange()
         report = build_portfolio_report(exchange, symbols, SHORT_REPORT)
         print(report)
         send_discord_notification(report)
     except Exception as exc:
-        error_message = f"❌ Kraken GBP portfolio check failed: {exc}"
+        error_message = f"❌ Kraken portfolio check failed: {exc}"
         print(error_message)
         try:
             send_discord_notification(error_message)
