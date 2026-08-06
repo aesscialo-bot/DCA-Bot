@@ -7,6 +7,12 @@ and understand when a code change is required.
 The production source is [`main`](https://github.com/aesscialo-bot/DCA-Bot/tree/main).
 Kraken is the source of truth for balances, holdings, fees, and orders.
 
+> [!IMPORTANT]
+> **The bot is counter-cyclical:** a downtrend uses the configured higher
+> endpoint, sideways uses the automatically calculated midpoint, and an
+> uptrend uses the configured lower endpoint. You do not configure a separate
+> sideways amount.
+
 ## Quick links
 
 | What you need | Link |
@@ -21,6 +27,41 @@ Kraken is the source of truth for balances, holdings, fees, and orders.
 | Configuration changes | [Update DCA Configuration workflow](https://github.com/aesscialo-bot/DCA-Bot/actions/workflows/update_dca_config.yml) |
 | Kraken holdings report | [Portfolio Balance Check workflow](https://github.com/aesscialo-bot/DCA-Bot/actions/workflows/portfolio_check.yml) |
 | Code validation and deployment gate | [CI workflow](https://github.com/aesscialo-bot/DCA-Bot/actions/workflows/ci.yml) |
+
+## Quickstart checklist
+
+To check the live bot, send these commands in the Discord channel:
+
+```text
+show status
+!dca health
+```
+
+`show status` displays the latest decision's regime or status, effective GBP
+amount, execution time, decision age, and pending state for every pair.
+`!dca health` confirms whether Railway scheduling and the shared configuration
+are ready.
+
+To change an existing pair, follow this order and wait for each named workflow
+to succeed before continuing:
+
+1. Send `!dca disable BTC`, then wait for **Update DCA Configuration** to
+   succeed.
+2. Send `!dca set BTC amounts to 12 low and 25 high`, then wait for the next
+   **Update DCA Configuration** run to succeed.
+3. Send `!dca analyze BTC`, then wait for **Crypto Analysis** to succeed and
+   Discord to show a fresh `READY` summary.
+4. Send `!dca enable BTC` and review the returned live summary.
+5. Within five minutes, copy the exact confirmation returned by the bot, such
+   as `!dca confirm enable BTC_USD`. Wait for the final **Update DCA
+   Configuration** run to succeed, then allow up to five minutes for Railway to
+   refresh its schedule.
+6. Only then run `show status` and `!dca health` again.
+
+Replace `BTC` with `HYPE` or `SOL`. Do not paste the whole sequence at once:
+disabling, writing, analysis, and enabling are deliberately serialized safety
+steps. The detailed procedure is in
+[Everyday Discord controls](#everyday-discord-controls).
 
 ## Production baseline
 
@@ -140,6 +181,9 @@ Kraken's current market minimum before enabling. Zero is permitted only as a
 disabled placeholder. Sideways uses `(lower + higher) / 2`, rounded to the
 nearest penny with half-up currency rounding.
 
+For command compatibility, the final word `up` is still accepted as an alias
+for `high`. Both write the upper endpoint; neither means the uptrend amount.
+
 ### Stop buying a pair
 
 ```text
@@ -211,8 +255,9 @@ Do not manually edit:
 - `DCA_EXECUTION_STATE`: owned by the trader and pending-order recovery.
 - API keys or tokens in JSON, Discord, source files, or public logs.
 
-Changing either endpoint changes its mapped regime amount and can change the
-derived midpoint; every endpoint change invalidates that target's old decision
+Changing the lower endpoint changes the uptrend amount and the derived
+midpoint. Changing the upper endpoint changes the downtrend amount and the
+derived midpoint. Every endpoint change invalidates that target's old decision
 fingerprint. Enabling or disabling changes the globally reviewed rules state.
 Run fresh analysis after a budget change before trying to re-enable or trade.
 
@@ -256,7 +301,7 @@ Primary code locations:
 - [Analysis pair parsing](crypto_analysis.py#L81-L117)
 - [Kraken order-audit target list](kraken_order_audit.py#L21-L24)
 - [Analysis workflow input](.github/workflows/crypto_analysis.yml#L7-L13)
-- [Configuration workflow input](.github/workflows/update_dca_config.yml#L3-L17)
+- [Configuration workflow input](.github/workflows/update_dca_config.yml#L3-L27)
 - [Automated tests](tests)
 
 Never permanently remove a pair that has a pending order. Reconcile it first.

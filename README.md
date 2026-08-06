@@ -4,6 +4,9 @@
 > **Start here:** [DCA Bot Operating and Configuration Guide](00_START_HERE.md)
 > contains the everyday Discord commands, direct app links, current GBP budgets,
 > JSON ownership rules, pair-change procedure, and troubleshooting steps.
+>
+> **Current budget direction:** downtrend uses the higher endpoint, sideways uses
+> the automatically derived midpoint, and uptrend uses the lower endpoint.
 
 This repository is the production source for a fully automated Kraken spot DCA
 service. It tracks and buys exactly these USD markets:
@@ -61,7 +64,7 @@ Each enabled asset can buy at most once per Bangkok calendar day.
 
 ```mermaid
 flowchart TD
-    A["04:00 Asia/Bangkok"] --> B["Analyze completed Kraken candles"]
+    A["Scheduled 04:00 Asia/Bangkok"] --> B["Analyze completed Kraken candles"]
     B --> C["Classify each target: up, down, or sideways"]
     C --> D["Select GBP budget and best 15-minute execution time"]
     D --> E["Write fresh DCA_ANALYSIS_STATE"]
@@ -88,7 +91,9 @@ funding leg merely because an API response was interrupted.
 
 ## Trend and timing decisions
 
-Analysis runs daily at 04:00 Bangkok time and uses completed Kraken candles only.
+Analysis is scheduled daily for 04:00 Asia/Bangkok (21:00 UTC) and uses
+completed Kraken candles only. GitHub may queue or start the workflow a few
+minutes after the scheduled time.
 
 - `UPTREND`: two consecutive daily closes above SMA150, EMA20 above EMA50,
   completed weekly close above weekly EMA20, and a positive 20-day SMA150 slope.
@@ -104,7 +109,9 @@ lower endpoint cannot exceed the upper endpoint.
 The execution-time engine deterministically evaluates completed 15-minute data
 over 3-, 5-, and 7-day windows. A decision contains an absolute `EXECUTE_AT`, is
 valid only for its stated window, and must be at least 30 minutes after analysis.
-Gemini may explain the result but cannot choose the regime, budget, or time.
+Gemini Flash-Lite optionally explains the deterministic Python result. If it is
+unavailable, the decision is unchanged; Gemini cannot choose the regime,
+budget, or time.
 
 Insufficient, stale, missing, or failed analysis sets that target to `ERROR`,
 alerts Discord, and skips the purchase. Old decisions are never reused.
@@ -221,7 +228,7 @@ maximum daily exposure.
 
 | Workflow | Trigger | Responsibility |
 | --- | --- | --- |
-| `crypto_analysis.yml` | Daily 04:00 Bangkok or manual | Build fresh decisions for BTC/USD, HYPE/USD, and SOL/USD. |
+| `crypto_analysis.yml` | Scheduled 04:00 Bangkok or manual | Build fresh decisions for BTC/USD, HYPE/USD, and SOL/USD; GitHub may start a scheduled run a few minutes late. |
 | `daily_dca.yml` | Railway dispatch | Enforce `DCA_START_DATE`, revalidate state, and execute due two-leg purchases. |
 | `portfolio_check.yml` | Monthly or manual | Read-only Kraken holdings and USD-market history, valued in GBP with live Kraken GBP/USD. |
 | `update_dca_config.yml` | Manual/Discord dispatch | Serialize atomic GBP budget and enable-state updates. |
