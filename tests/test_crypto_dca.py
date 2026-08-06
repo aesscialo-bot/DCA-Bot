@@ -4,7 +4,12 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import crypto_dca
-from dca_config import default_rules_map, empty_analysis_state, rules_hash
+from dca_config import (
+    amount_tier_for_regime,
+    default_rules_map,
+    empty_analysis_state,
+    rules_hash,
+)
 
 
 NOW = datetime(2026, 8, 5, 5, 0, tzinfo=timezone.utc)
@@ -23,7 +28,7 @@ def rules_with(*enabled_targets, low=10, up=20):
 def ready_decision(target, rule, *, now=NOW, regime="UPTREND", offset=0):
     execute_at = now + timedelta(minutes=offset)
     analyzed_at = min(now, execute_at - timedelta(minutes=30))
-    tier = "UP" if regime == "UPTREND" else "LOW"
+    tier = amount_tier_for_regime(regime)
     return {
         "STATUS": "READY",
         "REGIME": regime,
@@ -125,9 +130,9 @@ class DecisionGateTests(unittest.TestCase):
             status, _reason, amount = crypto_dca._decision_gate(
                 "BTC_USD", rules["BTC_USD"], decision, execute_at
             )
-            self.assertEqual((status, amount), ("READY", 20.0))
+            self.assertEqual((status, amount), ("READY", 10.0))
 
-    def test_uptrend_uses_up_budget(self):
+    def test_uptrend_uses_lower_budget(self):
         rules = rules_with("BTC_USD", low=10, up=20)
         decision = ready_decision("BTC_USD", rules["BTC_USD"])
 
@@ -135,11 +140,12 @@ class DecisionGateTests(unittest.TestCase):
             "BTC_USD", rules["BTC_USD"], decision, NOW
         )
 
-        self.assertEqual((status, amount), ("READY", 20.0))
+        self.assertEqual((status, amount), ("READY", 10.0))
 
-    def test_sideways_and_downtrend_use_low_budget(self):
+    def test_sideways_uses_midpoint_and_downtrend_uses_higher_budget(self):
         rules = rules_with("BTC_USD", low=10, up=20)
-        for regime in ("SIDEWAYS", "DOWNTREND"):
+        expected = {"SIDEWAYS": 15.0, "DOWNTREND": 20.0}
+        for regime, expected_amount in expected.items():
             decision = ready_decision(
                 "BTC_USD", rules["BTC_USD"], regime=regime
             )
@@ -147,7 +153,7 @@ class DecisionGateTests(unittest.TestCase):
                 status, _reason, amount = crypto_dca._decision_gate(
                     "BTC_USD", rules["BTC_USD"], decision, NOW
                 )
-                self.assertEqual((status, amount), ("READY", 10.0))
+                self.assertEqual((status, amount), ("READY", expected_amount))
 
     def test_window_is_five_minutes_early_through_sixty_minutes_late(self):
         rules = rules_with("BTC_USD")
@@ -835,7 +841,7 @@ class MainSchedulingTests(unittest.TestCase):
 
         self.assertEqual(execute.call_count, 2)
         calls = {call.args[0]: call.args[1] for call in execute.call_args_list}
-        self.assertEqual(calls, {"BTC_USD": 20.0, "HYPE_USD": 10.0})
+        self.assertEqual(calls, {"BTC_USD": 10.0, "HYPE_USD": 15.0})
 
     def test_error_or_missed_decision_alerts_and_never_trades(self):
         rules = rules_with("BTC_USD")
@@ -878,7 +884,7 @@ class MainSchedulingTests(unittest.TestCase):
             self.assertTrue(crypto_dca.main())
 
         execute.assert_called_once()
-        self.assertEqual(execute.call_args.args[:2], ("BTC_USD", 20.0))
+        self.assertEqual(execute.call_args.args[:2], ("BTC_USD", 10.0))
 
     def test_explicit_empty_filter_is_a_successful_noop(self):
         rules = rules_with("BTC_USD")

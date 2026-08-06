@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 import discord_bot
-from dca_config import ALLOWED_TARGETS, rules_hash
+from dca_config import ANALYSIS_STATE_VERSION, ALLOWED_TARGETS, rules_hash
 
 
 NOW = datetime(2026, 8, 5, 4, 0, tzinfo=timezone.utc)
@@ -60,7 +60,7 @@ def analysis_state(
         targets[symbol] = {
             "STATUS": status,
             "REGIME": "UPTREND" if status == "READY" else None,
-            "AMOUNT_TIER": "UP" if status == "READY" else None,
+            "AMOUNT_TIER": "LOW" if status == "READY" else None,
             "EXECUTE_AT": execute_at.isoformat().replace("+00:00", "Z")
             if status == "READY"
             else None,
@@ -77,7 +77,7 @@ def analysis_state(
             },
         }
     return {
-        "VERSION": 1,
+        "VERSION": ANALYSIS_STATE_VERSION,
         "GENERATED_AT": generated_at.isoformat().replace("+00:00", "Z"),
         "TARGETS": targets,
     }
@@ -146,6 +146,7 @@ class DiscordBotControlTests(unittest.TestCase):
             },
         )
         self.assertIn("atomic budgets", message.replies[-1])
+        self.assertIn("sideways midpoint £15", message.replies[-1])
 
         enabled_rules = rules(enabled={"BTC_USD"})
         blocked = MessageStub()
@@ -173,6 +174,13 @@ class DiscordBotControlTests(unittest.TestCase):
         dispatch.assert_called_once()
         with self.assertRaisesRegex(ValueError, "£0 or"):
             discord_bot._parse_amount(4.99, "LOW amount")
+
+    def test_budget_command_rejects_lower_amount_above_higher_amount(self):
+        message = MessageStub()
+        with patch.object(discord_bot, "trigger_workflow") as dispatch:
+            asyncio.run(discord_bot.handle_set_amounts("BTC", 20, 10, message))
+        dispatch.assert_not_called()
+        self.assertIn("lower amount must not exceed", message.replies[-1])
 
     def test_write_safety_is_allowlisted_and_exact_prefix(self):
         message = MessageStub()
@@ -204,6 +212,18 @@ class DiscordBotControlTests(unittest.TestCase):
         handler.assert_not_called()
         self.assertIn("Unrecognized exact", message.replies[-1])
 
+    def test_budget_command_accepts_clear_high_word_and_legacy_up_alias(self):
+        self.assertIsNotNone(
+            discord_bot._SET_AMOUNTS_RE.fullmatch(
+                "!dca set BTC amounts to 10 low and 20 high"
+            )
+        )
+        self.assertIsNotNone(
+            discord_bot._SET_AMOUNTS_RE.fullmatch(
+                "!dca set BTC amounts to 10 low and 20 up"
+            )
+        )
+
     def test_disable_uses_serialized_writer_without_confirmation(self):
         message = MessageStub()
         with patch.object(discord_bot, "trigger_workflow", return_value=True) as dispatch:
@@ -226,10 +246,11 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             asyncio.run(discord_bot.handle_enable("BTC", message))
         reply = message.replies[-1]
-        self.assertIn("LOW: £10", reply)
-        self.assertIn("UP: £20", reply)
+        self.assertIn("UPTREND/lower: £10", reply)
+        self.assertIn("SIDEWAYS/midpoint: £15", reply)
+        self.assertIn("DOWNTREND/higher: £20", reply)
         self.assertIn("Latest regime", reply)
-        self.assertIn("Effective amount: £20", reply)
+        self.assertIn("Effective amount: £10", reply)
         self.assertIn("Next execution", reply)
         self.assertIn("Decision age", reply)
         self.assertIn("Maximum aggregate daily exposure", reply)
@@ -419,8 +440,9 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             asyncio.run(discord_bot.handle_status({}, status_message))
         self.assertIn("BTC_USD", status_message.replies[-1])
-        self.assertIn("LOW £10", status_message.replies[-1])
-        self.assertIn("UP £20", status_message.replies[-1])
+        self.assertIn("UPTREND/lower £10", status_message.replies[-1])
+        self.assertIn("SIDEWAYS/midpoint £15", status_message.replies[-1])
+        self.assertIn("DOWNTREND/higher £20", status_message.replies[-1])
         self.assertIn("ready-but-disabled", status_message.replies[-1])
 
         with (
@@ -520,6 +542,24 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         discord_bot._schedule_error = None
         discord_bot._schedule_warning = None
         discord_bot._schedule_start_date = None
+
+    def test_v1_analysis_state_clears_schedule_and_fails_closed(self):
+        live_rules = rules(enabled={"BTC_USD", "HYPE_USD", "SOL_USD"})
+        decisions = analysis_state(live_rules)
+        decisions["VERSION"] = 1
+
+        self.assertFalse(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules),
+                json.dumps(decisions),
+                "{}",
+                "2026-08-07",
+                now=NOW,
+            )
+        )
+        self.assertEqual(discord_bot._dca_schedule, {})
+        self.assertEqual(discord_bot._due_symbols_for_dispatch(NOW), [])
+        self.assertIn("VERSION must be 2", discord_bot._schedule_error)
 
     def test_multiple_assets_can_share_or_use_different_absolute_times(self):
         live_rules = rules(enabled={"BTC_USD", "HYPE_USD", "SOL_USD"})

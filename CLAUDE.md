@@ -7,13 +7,16 @@ workflows, or release configuration.
 ## Production invariants and current defaults
 
 - Supported targets are exactly `BTC_USD`, `HYPE_USD`, and `SOL_USD`.
-- `DCA_TARGET_MAP` contains only `REGIME_AMOUNTS_GBP` (`LOW` and `UP`) and
-  `BUY_ENABLED` for each exact target.
+- `DCA_TARGET_MAP` contains only `REGIME_AMOUNTS_GBP` (`LOW` lower endpoint and
+  compatibility-named `UP` upper endpoint) and `BUY_ENABLED` for each target.
 - The current release gate is `DCA_START_DATE=2026-08-07`, interpreted as a
   strict `YYYY-MM-DD` date in `Asia/Bangkok`; all earlier trading fails closed.
-- Downtrend and sideways select `LOW`; uptrend selects `UP`.
-- The current approved baseline budgets are BTC £10/£20, HYPE £10/£15, and SOL
-  £5/£15. Budget changes must use the guarded configuration flow.
+- Counter-cyclical spend mapping is downtrend=`HIGH`, sideways=`MID`, and
+  uptrend=`LOW`. `MID` is the half-up penny-rounded arithmetic midpoint.
+- The current lower/higher endpoints are BTC £10/£20, HYPE £10/£15, and SOL
+  £5/£15, producing sideways amounts £15/£12.50/£10. Budget changes must use
+  the guarded configuration flow and must keep the lower endpoint at or below
+  the higher endpoint.
 - Each buy is two reconciled Kraken orders: sell the exact GBP budget on
   `GBP/USD` with `fciq`, then spend confirmed net USD on the target with `fcib`.
 - One purchase per enabled asset per Bangkok calendar day is permitted.

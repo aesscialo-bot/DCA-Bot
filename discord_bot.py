@@ -27,6 +27,7 @@ import requests
 from dca_config import (
     ALLOWED_TARGETS,
     ConfigError,
+    amount_for_tier_gbp,
     decision_analyzed_on_or_after,
     decision_age_minutes,
     effective_amount,
@@ -397,7 +398,7 @@ async def classify_intent(text: str) -> dict[str, Any]:
 async def handle_set_amounts(
     symbol_value: str,
     low_value: Any,
-    up_value: Any,
+    high_value: Any,
     message: discord.Message,
 ) -> None:
     """Atomically queue both user budgets; edits require a disabled target."""
@@ -407,8 +408,10 @@ async def handle_set_amounts(
         return
     try:
         symbol = _normalise_usd_key(symbol_value)
-        low = _parse_amount(low_value, "LOW amount")
-        up = _parse_amount(up_value, "UP amount")
+        low = _parse_amount(low_value, "lower amount")
+        high = _parse_amount(high_value, "higher amount")
+        if low > high:
+            raise ValueError("the lower amount must not exceed the higher amount")
     except ValueError as exc:
         await message.reply(f"Invalid request: {exc}")
         return
@@ -429,12 +432,22 @@ async def handle_set_amounts(
         "action": "set_amounts",
         "symbol": symbol,
         "low_amount_gbp_json": json.dumps(low, separators=(",", ":")),
-        "up_amount_gbp_json": json.dumps(up, separators=(",", ":")),
+        # This compatibility-named workflow input stores the upper endpoint;
+        # it no longer means that an uptrend selects the amount.
+        "up_amount_gbp_json": json.dumps(high, separators=(",", ":")),
     }
     if await asyncio.to_thread(trigger_workflow, "update_dca_config.yml", inputs):
+        midpoint = amount_for_tier_gbp(
+            {
+                "REGIME_AMOUNTS_GBP": {"LOW": low, "UP": high},
+                "BUY_ENABLED": False,
+            },
+            "MID",
+        )
         await message.reply(
-            f"Queued atomic budgets for **{symbol}**: LOW {_display_amount(low)}, "
-            f"UP {_display_amount(up)}. Run `!dca analyze {symbol.removesuffix('_USD')}` "
+            f"Queued atomic budgets for **{symbol}**: lower {_display_amount(low)}, "
+            f"sideways midpoint {_display_amount(midpoint)}, higher "
+            f"{_display_amount(high)}. Run `!dca analyze {symbol.removesuffix('_USD')}` "
             "after the workflow completes."
         )
     else:
@@ -514,7 +527,8 @@ def _enable_review(
     return {
         "symbol": symbol,
         "low": float(amounts["LOW"]),
-        "up": float(amounts["UP"]),
+        "mid": float(amount_for_tier_gbp(rule, "MID")),
+        "high": float(amounts["UP"]),
         "regime": decision["REGIME"],
         "effective_amount": float(effective_amount(rule, decision)),
         "execute_at": decision["EXECUTE_AT"],
@@ -554,7 +568,9 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
     }
     await message.reply(
         f"**Enable review for {symbol}**\n"
-        f"LOW: {_display_amount(review['low'])} | UP: {_display_amount(review['up'])}\n"
+        f"UPTREND/lower: {_display_amount(review['low'])} | "
+        f"SIDEWAYS/midpoint: {_display_amount(review['mid'])} | "
+        f"DOWNTREND/higher: {_display_amount(review['high'])}\n"
         f"Latest regime: `{review['regime']}` | Effective amount: "
         f"{_display_amount(review['effective_amount'])}\n"
         f"Next execution: `{_local_timestamp(review['execute_at'])}` | "
@@ -609,7 +625,8 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
 
     bound_fields = (
         "low",
-        "up",
+        "mid",
+        "high",
         "effective_amount",
         "execute_at",
         "decision_id",
@@ -703,8 +720,10 @@ def _decision_summary(
         age = _decision_age(decision, now)
         decision_status = "ERROR"
     return (
-        f"**{symbol}** — {status} | LOW {_display_amount(amounts['LOW'])} | "
-        f"UP {_display_amount(amounts['UP'])}\n"
+        f"**{symbol}** — {status} | UPTREND/lower "
+        f"{_display_amount(amounts['LOW'])} | SIDEWAYS/midpoint "
+        f"{_display_amount(amount_for_tier_gbp(rule, 'MID'))} | DOWNTREND/higher "
+        f"{_display_amount(amounts['UP'])}\n"
         f"  Analysis: {decision_status} | Regime: `{regime}` | Effective: {amount} | "
         f"Next: `{next_time}` | Age: `{age}`\n"
         f"  Last buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}`{pending_text}"
@@ -865,7 +884,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
 
 HELP_TEXT = """**Kraken USD-pair DCA controls (GBP budgets)**
 
-`!dca set BTC amounts to 10 low and 20 up`
+`!dca set BTC amounts to 10 low and 20 high`
 `!dca disable BTC`
 `!dca enable BTC` (then send the exact confirmation returned)
 `!dca analyze BTC` or `!dca analyze all`
@@ -1212,7 +1231,7 @@ async def on_ready() -> None:
 _SET_AMOUNTS_RE = re.compile(
     r"^!dca set ([A-Za-z]+) amounts to "
     r"([0-9]+(?:\.[0-9]{1,2})?) low and "
-    r"([0-9]+(?:\.[0-9]{1,2})?) up$"
+    r"([0-9]+(?:\.[0-9]{1,2})?) (?:high|up)$"
 )
 _DISABLE_RE = re.compile(r"^!dca disable ([A-Za-z]+)$")
 _ENABLE_RE = re.compile(r"^!dca enable ([A-Za-z]+)$")

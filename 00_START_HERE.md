@@ -26,16 +26,16 @@ Kraken is the source of truth for balances, holdings, fees, and orders.
 
 The configured target set is exactly:
 
-| Pair | `LOW` budget | `UP` budget | Intended state |
-| --- | ---: | ---: | --- |
-| `BTC/USD` | £10 | £20 | Enabled |
-| `HYPE/USD` | £10 | £15 | Enabled |
-| `SOL/USD` | £5 | £15 | Enabled |
+| Pair | `UPTREND` lower | `SIDEWAYS` midpoint | `DOWNTREND` higher | Intended state |
+| --- | ---: | ---: | ---: | --- |
+| `BTC/USD` | £10 | £15 | £20 | Enabled |
+| `HYPE/USD` | £10 | £12.50 | £15 | Enabled |
+| `SOL/USD` | £5 | £10 | £15 | Enabled |
 
-- `DOWNTREND` and `SIDEWAYS` select `LOW`.
-- `UPTREND` selects `UP`.
-- Maximum configured exposure is £25 if all pairs select `LOW`, or £50 if all
-  pairs select `UP`.
+- The bot deliberately buys more in a `DOWNTREND`, the midpoint in a
+  `SIDEWAYS` market, and less in an `UPTREND`.
+- Aggregate daily exposure is £50 / £37.50 / £25 when every pair is downtrend /
+  sideways / uptrend respectively.
 - Each enabled pair can buy at most once per Asia/Bangkok calendar day.
 - The strict trading start gate is `DCA_START_DATE=2026-08-07` in
   `Asia/Bangkok`. Earlier orders are blocked.
@@ -51,8 +51,9 @@ rules, decisions, pending state, and scheduler posture.
    few minutes after 04:00.
 2. Deterministic Python classifies each pair as `UPTREND`, `DOWNTREND`, or
    `SIDEWAYS`.
-3. Python selects the corresponding GBP budget and the best 15-minute execution
-   time from deterministic 3-, 5-, and 7-day timing windows.
+3. Python selects the higher / midpoint / lower GBP spend for downtrend /
+   sideways / uptrend respectively, plus the best 15-minute execution time from
+   deterministic 3-, 5-, and 7-day timing windows.
 4. The workflow writes a fresh `DCA_ANALYSIS_STATE` and posts a readable summary
    to Discord.
 5. Railway checks the absolute execution times every five minutes and dispatches
@@ -90,7 +91,8 @@ decisions, regimes, and execution times.
 
 ### Change both budgets for an existing pair
 
-Example: change BTC to £12 in `LOW` and £25 in `UP`.
+Example: change BTC to a £12 lower endpoint and £25 higher endpoint. Sideways
+will then use the derived £18.50 midpoint.
 
 ```text
 !dca disable BTC
@@ -99,7 +101,7 @@ Example: change BTC to £12 in `LOW` and £25 in `UP`.
 Wait for the first **Update DCA Configuration** run to succeed, then send:
 
 ```text
-!dca set BTC amounts to 12 low and 25 up
+!dca set BTC amounts to 12 low and 25 high
 ```
 
 Wait for the second **Update DCA Configuration** run to succeed. Only then send:
@@ -132,9 +134,11 @@ show status
 ```
 
 Replace `BTC` with `HYPE` or `SOL` as needed. Enter numbers without a `£` sign
-and with no more than two decimal places. Enabled `LOW` and `UP` budgets must
-both be between £5 and £1,000 and at or above Kraken's current market minimum.
-Zero is permitted only as a disabled placeholder.
+and with no more than two decimal places. The lower amount cannot exceed the
+higher amount. Both endpoints must be between £5 and £1,000 and at or above
+Kraken's current market minimum before enabling. Zero is permitted only as a
+disabled placeholder. Sideways uses `(lower + higher) / 2`, rounded to the
+nearest penny with half-up currency rounding.
 
 ### Stop buying a pair
 
@@ -177,6 +181,11 @@ The user-owned repository variable is `DCA_TARGET_MAP`. Its approved shape is:
 }
 ```
 
+For compatibility, the JSON field `LOW` stores the lower endpoint and `UP`
+stores the upper/higher endpoint. `UP` does **not** mean the amount used in an
+uptrend. Analysis records the derived tiers `LOW`, `MID`, or `HIGH` according to
+the counter-cyclical policy.
+
 Use Discord for routine changes. It validates and serializes the write, checks
 fresh analysis before enabling, and checks Kraken's current market minimum.
 
@@ -190,6 +199,9 @@ can safely perform these limited operations:
 - Validate without writing: `action=dry_run`, canonical `symbol`, both numeric
   LOW/UP inputs, and a target that is already disabled.
 
+The workflow input `up_amount_gbp_json` is a compatibility name for the
+upper/higher endpoint.
+
 Do not manually use `set_enabled=true`; safe enabling binds to fresh decision
 and rules fingerprints that Discord supplies during exact confirmation.
 
@@ -199,7 +211,8 @@ Do not manually edit:
 - `DCA_EXECUTION_STATE`: owned by the trader and pending-order recovery.
 - API keys or tokens in JSON, Discord, source files, or public logs.
 
-Changing either `LOW` or `UP` invalidates that target's old decision
+Changing either endpoint changes its mapped regime amount and can change the
+derived midpoint; every endpoint change invalidates that target's old decision
 fingerprint. Enabling or disabling changes the globally reviewed rules state.
 Run fresh analysis after a budget change before trying to re-enable or trade.
 
@@ -256,6 +269,7 @@ These changes require a tested pull request and cannot be made through Discord:
 - Daily analysis time: [`.github/workflows/crypto_analysis.yml`](.github/workflows/crypto_analysis.yml#L3-L7).
   GitHub cron uses UTC; `0 21 * * *` is 04:00 Asia/Bangkok.
 - Trend policy: [`crypto_analysis.py`](crypto_analysis.py#L229-L321).
+- Regime-to-budget policy and midpoint rounding: [`dca_config.py`](dca_config.py).
 - Best-time policy: [`crypto_analysis.py`](crypto_analysis.py#L423-L500).
 - Gemini explanation contract and model fallback:
   [`crypto_analysis.py`](crypto_analysis.py#L665-L688).

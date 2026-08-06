@@ -9,13 +9,17 @@ schemas, workflows, or deployment configuration.
 - Supported targets are exactly `BTC_USD`, `HYPE_USD`, and `SOL_USD` unless a
   deliberately staged pair-membership migration changes the full system.
 - `DCA_TARGET_MAP` contains every canonical target with only
-  `REGIME_AMOUNTS_GBP` (`LOW` and `UP`) and boolean `BUY_ENABLED`.
+  `REGIME_AMOUNTS_GBP` (`LOW` lower endpoint and compatibility-named `UP` upper
+  endpoint) and boolean `BUY_ENABLED`.
 - Budgets remain GBP-denominated. The target markets execute in USD.
 - The bot sells the exact GBP budget on Kraken `GBP/USD` with `fciq`, waits for
   confirmed net USD, and spends that USD on crypto/USD with `fcib`.
 - Never restore a direct crypto/GBP order path, implicit budget conversion,
   THB, Bitkub, or the legacy `AMOUNT_GBP` / `TIME` schema.
-- Downtrend and sideways select `LOW`; uptrend selects `UP`.
+- Counter-cyclical spend mapping is `DOWNTREND`→`HIGH`, `SIDEWAYS`→`MID`, and
+  `UPTREND`→`LOW`. `MID` is `(LOW + UP) / 2`, rounded to the nearest penny with
+  `ROUND_HALF_UP`; `HIGH` reads the stored `UP` endpoint. Never infer spend from
+  the similarity between the `UP` endpoint name and `UPTREND`.
 - Deterministic Python chooses regime, tier, and execution time from completed
   Kraken candles. Gemini Flash-Lite may explain but never choose or override.
 - `DCA_START_DATE` is a strict Asia/Bangkok release gate. One purchase per
@@ -26,6 +30,9 @@ schemas, workflows, or deployment configuration.
 - Analysis owns `DCA_ANALYSIS_STATE`, including `STATUS`, `REGIME`,
   `AMOUNT_TIER`, `EXECUTE_AT`, `VALID_UNTIL`, `DECISION_ID`, `RULES_HASH`,
   signals, and timing metrics.
+- READY `AMOUNT_TIER` is exactly `LOW`, `MID`, or `HIGH` and must match the
+  counter-cyclical regime mapping. Policy-version changes invalidate old
+  decisions and require fresh analysis.
 - The trader owns `DCA_EXECUTION_STATE`, including `LAST_BUY_DATE` and durable
   `PENDING_ORDER` state for both funding and crypto legs.
 - Persist a deterministic two-leg intent before Kraken can receive a create
@@ -48,8 +55,9 @@ schemas, workflows, or deployment configuration.
 - Exact Discord controls queue serialized writes through
   `.github/workflows/update_dca_config.yml`; Railway never patches repository
   variables directly.
-- Budget edits atomically replace both `LOW` and `UP` and require the target to
-  be disabled.
+- Budget edits atomically replace the lower `LOW` and upper `UP` endpoints,
+  require `LOW <= UP`, use no more than two decimal places, and require the
+  target to be disabled.
 - Enabling requires a fresh matching decision, zero pending intents, a live
   Kraken minimum check, an allowlisted user, the exact `!dca ` prefix, and the
   exact second confirmation bound to the global rules snapshot.
@@ -108,4 +116,7 @@ schemas, workflows, or deployment configuration.
   timing rules, live minimums, both order legs, partial/unknown responses,
   reconcile-only recovery, duplicate suppression, final live-state checks,
   scheduler windows, portfolio reporting, and optional logger failures.
+- Cover all three exact regime/tier mappings, ordered endpoints, equal
+  endpoints, half-penny midpoint rounding, and rejection of obsolete analysis
+  state versions/tier pairs.
 - Run tests with UTF-8 enabled on Windows.

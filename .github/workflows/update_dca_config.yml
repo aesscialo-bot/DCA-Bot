@@ -16,12 +16,12 @@ on:
         required: true
         type: string
       low_amount_gbp_json:
-        description: JSON number for the LOW tier
+        description: JSON number for the lower endpoint used in UPTREND
         required: false
         default: ""
         type: string
       up_amount_gbp_json:
-        description: JSON number for the UP tier
+        description: Compatibility name for the upper endpoint used in DOWNTREND
         required: false
         default: ""
         type: string

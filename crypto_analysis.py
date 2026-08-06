@@ -29,7 +29,9 @@ from dca_config import (
     READY_STATUS,
     TARGET_KEYS,
     TARGET_SYMBOLS,
+    amount_tier_for_regime,
     default_rules_map,
+    effective_amount,
     empty_analysis_state,
     rules_hash,
     validate_analysis_state,
@@ -623,7 +625,7 @@ def analyze_asset(
     execute_at = next_execution_time(
         selected_time, analyzed_at=generated, local_tz=LOCAL_TZ
     )
-    amount_tier = "UP" if regime == "UPTREND" else "LOW"
+    amount_tier = amount_tier_for_regime(regime)
     return {
         "STATUS": READY_STATUS,
         "REGIME": regime,
@@ -695,7 +697,7 @@ def _decision_report(target: str, decision: Mapping[str, Any], rule: Mapping[str
             f"Purchase skipped. {decision['SIGNALS'].get('ERROR', 'Unknown error')}"
         )
     tier = decision["AMOUNT_TIER"]
-    amount = rule["REGIME_AMOUNTS_GBP"][tier]
+    amount = effective_amount(rule, decision)
     timing = decision["TIMING"]
     return (
         f"📊 **{target} daily decision**\n"
