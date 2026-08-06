@@ -55,6 +55,14 @@ schemas, workflows, or deployment configuration.
 - Exact Discord controls queue serialized writes through
   `.github/workflows/update_dca_config.yml`; Railway never patches repository
   variables directly.
+- Gemini Flash-Lite provides optional personality and natural-language chat.
+  It may only classify an approved chat topic or read-only action, receives no
+  tools, and its free-form prose must never be posted. Code-owned templates
+  render chat replies. It must never dispatch analysis, configuration,
+  enable/disable, confirmation, scheduler, or order handlers.
+- Keep the complete Discord `HELP_TEXT`, deterministic aliases, exact parsers,
+  and routing tests synchronized. Consume all command-like near misses before
+  any AI call.
 - Budget edits atomically replace the lower `LOW` and upper `UP` endpoints,
   require `LOW <= UP`, use no more than two decimal places, and require the
   target to be disabled.

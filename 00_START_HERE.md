@@ -81,8 +81,29 @@ exact lowercase `!dca ` prefix and spacing.
 
 ```text
 show status
+!dca status
 !dca health
+show portfolio
+!dca portfolio
+!dca help
 ```
+
+`show portfolio` and `!dca portfolio` queue the same read-only Kraken holdings
+report. `!dca help` shows every supported command, alias, authorization rule,
+and confirmation step directly in Discord.
+
+### Chat with Krakie
+
+With `GEMINI_API_KEY` configured in Railway, ordinary messages receive a short,
+friendly Krakie reply. Gemini Flash-Lite understands the message and selects an
+approved educational topic or read-only status, health, help, or portfolio
+action; reviewed code templates provide the wording. Free-form model prose is
+never posted. Natural language cannot change a budget, run analysis, enable or
+disable a pair, confirm a change, or submit an order. Use the exact lowercase
+commands below for those operations.
+
+If Gemini is unavailable, the exact commands and automated scheduler continue
+normally; common read-only requests use deterministic fallbacks.
 
 Before the configured start day or before its first 04:00 analysis, a pair may
 show an `ERROR` placeholder while overall health correctly reports `ARMED`.

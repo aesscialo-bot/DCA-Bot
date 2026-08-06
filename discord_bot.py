@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo
 import discord
 from discord.ext import tasks
 from google import genai
+from google.genai import types
+import httpx
 import requests
 
 from dca_config import (
@@ -65,6 +67,11 @@ DCA_AMOUNT_MIN_GBP = 5.0
 DCA_AMOUNT_MAX_GBP = 1_000.0
 ENABLE_CONFIRMATION_TTL_SECONDS = 300
 DISPATCH_RETRY_SECONDS = 30 * 60
+CHAT_HISTORY_TURNS = 3
+CHAT_HISTORY_TTL_SECONDS = 30 * 60
+MAX_CHAT_SESSIONS = 100
+GEMINI_TIMEOUT_SECONDS = 15
+ASSET_EMOJIS = {symbol: "🪙" for symbol in ALLOWED_TARGETS}
 # The daily workflow is scheduled for 04:00 Bangkok. Give GitHub Actions a
 # bounded startup window before treating a missing start-day decision as an
 # operational error.
@@ -88,6 +95,8 @@ _schedule_error: str | None = None
 _schedule_warning: str | None = None
 _last_schedule_alert: str | None = None
 _schedule_start_date: date | None = None
+_chat_histories: dict[tuple[str, str], list[tuple[str, str]]] = {}
+_chat_history_updated_at: dict[tuple[str, str], float] = {}
 
 
 def _log(message: str) -> None:
@@ -349,45 +358,244 @@ def _symbols_from_dca_map() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Optional Gemini classifier for read-only conversational commands
+# Optional Gemini chat and read-only conversational routing
 # ---------------------------------------------------------------------------
 
 
-AI_MODEL_CANDIDATES = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
-VALID_ACTIONS = {"portfolio", "status", "help", "unknown"}
-CLASSIFY_PROMPT = """Classify a read-only Discord command for a DCA service.
-Allowed actions are portfolio, status, help, and unknown. Never classify a
-configuration change, analysis request, enable, disable, or purchase. Respond
-with JSON only: {"action":"...","params":{},"reply":"..."}."""
+AI_MODEL_CANDIDATES = ["gemini-3.5-flash-lite", "gemini-2.5-flash-lite"]
+VALID_ACTIONS = {"portfolio", "status", "health", "help", "chat", "unknown"}
+VALID_CHAT_TOPICS = {
+    "greeting",
+    "dca",
+    "regimes",
+    "timing",
+    "risk",
+    "markets",
+    "controls",
+    "capabilities",
+}
+CHAT_TOPIC_REPLIES = {
+    "greeting": (
+        "🐚 Ahoy! I'm Krakie, your tiny Kraken DCA guide. I can explain how the "
+        "bot works, show read-only status, or point you to an exact safe command."
+    ),
+    "dca": (
+        "🪙 DCA means investing a fixed rules-based amount at repeated intervals. "
+        "It can smooth entry timing, but it cannot remove crypto risk or guarantee returns."
+    ),
+    "regimes": (
+        "🧭 The deterministic engine labels completed-candle conditions as uptrend, "
+        "sideways, or downtrend. Those labels choose a configured budget tier; they "
+        "are operational rules, not price forecasts."
+    ),
+    "timing": (
+        "⏰ At 04:00 Asia/Bangkok, completed Kraken candles are analyzed and each "
+        "asset receives a bounded execution window. Type `show status` for the latest "
+        "stored times and decision ages."
+    ),
+    "risk": (
+        "🛟 Crypto prices can move sharply and losses are possible. Krakie keeps "
+        "natural-language chat read-only, requires exact commands for changes, and "
+        "fails closed when decisions or configuration are invalid."
+    ),
+    "markets": (
+        "🌊 This bot tracks `BTC/USD`, `HYPE/USD`, and `SOL/USD` on Kraken, using "
+        "GBP-denominated spending limits. Type `show portfolio` for a read-only "
+        "holdings check."
+    ),
+    "controls": (
+        "🧰 Configuration changes require exact, allowlisted `!dca` commands; chat "
+        "cannot apply them. Type `help` for every command and confirmation step."
+    ),
+    "capabilities": (
+        "💬 Ask me about DCA, regimes, timing, risk, supported markets, status, or "
+        "health. I keep conversation read-only—type `help` whenever you want the "
+        "reviewed controls."
+    ),
+}
+CLASSIFY_PROMPT = """You are Krakie, a pocket-sized Kraken octopus and the
+intent and topic classifier for a GBP-funded USD-market DCA bot. Understand
+warm, casual natural language, but do not write a reply or financial advice.
+
+Choose exactly one action:
+- portfolio: the user explicitly asks to run a read-only holdings/balance check.
+- status: the user asks about latest regimes, amounts, execution times, or pair status.
+- health: the user asks whether the bot, scheduler, configuration, or cloud worker is healthy.
+- help: the user asks for commands, capabilities, or instructions.
+- chat: every other conversational or educational message. Choose one topic:
+  greeting, dca, regimes, timing, risk, markets, controls, or capabilities.
+- unknown: only when the message is empty or impossible to answer safely.
+
+Natural language is read-only. Never choose or invent an action that changes
+budgets, analyzes markets, enables/disables a target, confirms enablement, or
+places an order. If asked for a write or analysis action, use chat and explain
+that the user must type an exact command from `help`; never say it was executed.
+Do not claim access to live prices or news. The exact supported markets are
+BTC/USD, HYPE/USD, and SOL/USD. Downtrend uses the higher GBP endpoint,
+sideways the derived midpoint, and uptrend the lower endpoint. Kraken is the
+authoritative record.
+
+Respond as JSON only with exactly `action` and `topic`. Use topic `capabilities`
+for every non-chat action. Never return reply text, parameters, commands, tools,
+prices, amounts, assets, or other fields."""
+
+INTENT_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": sorted(VALID_ACTIONS)},
+        "topic": {
+            "type": "string",
+            "enum": sorted(VALID_CHAT_TOPICS),
+        },
+    },
+    "required": ["action", "topic"],
+    "additionalProperties": False,
+}
+
+
+def _rule_based_read_only_intent(text: str) -> dict[str, Any]:
+    """Keep common read-only requests useful when Gemini is unavailable."""
+
+    lowered = text.casefold()
+    if any(word in lowered for word in ("help", "command", "how do i")):
+        action = "help"
+    elif any(word in lowered for word in ("portfolio", "balance", "holding")):
+        action = "portfolio"
+    elif any(word in lowered for word in ("health", "healthy", "online", "scheduler")):
+        action = "health"
+    elif any(
+        word in lowered
+        for word in ("status", "regime", "trend", "amount", "execution time")
+    ):
+        action = "status"
+    else:
+        action = "unknown"
+    return {"action": action, "params": {}, "reply": ""}
 
 
 def _validate_intent(intent: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(intent, dict) or intent.get("action") not in VALID_ACTIONS:
         return {"action": "unknown", "params": {}, "reply": ""}
-    params = intent.get("params")
+    action = intent["action"]
+    topic = str(intent.get("topic", "capabilities"))
+    if topic not in VALID_CHAT_TOPICS:
+        topic = "capabilities"
     return {
-        "action": intent["action"],
-        "params": params if isinstance(params, dict) else {},
-        "reply": str(intent.get("reply", ""))[:300],
+        "action": action,
+        # Model-supplied parameters never influence a workflow dispatch.
+        "params": {},
+        # Model-supplied prose is never posted to Discord. For chat, code maps
+        # the classified topic to a reviewed, neutral Krakie response.
+        "reply": CHAT_TOPIC_REPLIES[topic] if action == "chat" else "",
+        "topic": topic,
     }
 
 
-async def classify_intent(text: str) -> dict[str, Any]:
-    prompt = f"{CLASSIFY_PROMPT}\nUser message: {text}"
+async def classify_intent(
+    text: str, *, history: list[tuple[str, str]] | None = None
+) -> dict[str, Any]:
+    if not GEMINI_API_KEY:
+        return _rule_based_read_only_intent(text)
+    history_lines = []
+    for user_text, bot_text in (history or [])[-CHAT_HISTORY_TURNS:]:
+        history_lines.append(f"User: {user_text[:400]}")
+        history_lines.append(f"Krakie: {bot_text[:400]}")
+    history_block = "\n".join(history_lines) or "No earlier chat turns."
+    prompt = f"Recent conversation:\n{history_block}\n\nCurrent user message: {text[:1_500]}"
     last_error: Exception | None = None
     for model in AI_MODEL_CANDIDATES:
+        ai_client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options=types.HttpOptions(
+                timeout=GEMINI_TIMEOUT_SECONDS * 1_000,
+                retry_options=types.HttpRetryOptions(attempts=1),
+                # Discord.py installs aiohttp. Force the SDK's HTTPX transport
+                # so Windows and Railway use the same cancellable DNS/client path.
+                async_client_args={
+                    "transport": httpx.AsyncHTTPTransport(retries=0),
+                },
+            ),
+        )
         try:
-            def generate():
-                with genai.Client(api_key=GEMINI_API_KEY) as ai_client:
-                    return ai_client.models.generate_content(model=model, contents=prompt)
-
-            response = await asyncio.to_thread(generate)
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.text.strip())
-            return _validate_intent(json.loads(raw))
+            response = await asyncio.wait_for(
+                ai_client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=CLASSIFY_PROMPT,
+                        response_mime_type="application/json",
+                        response_json_schema=INTENT_RESPONSE_SCHEMA,
+                        max_output_tokens=512,
+                    ),
+                ),
+                timeout=GEMINI_TIMEOUT_SECONDS,
+            )
+            raw = re.sub(
+                r"^```(?:json)?\s*|\s*```$", "", str(response.text or "").strip()
+            )
+            intent = _validate_intent(json.loads(raw))
+            return intent
         except Exception as exc:  # Gemini is optional and never authorizes writes.
             last_error = exc
+        finally:
+            await ai_client.aio.aclose()
     _log(f"WARN read-only command classifier unavailable: {type(last_error).__name__}")
-    return {"action": "unknown", "params": {}, "reply": "Classifier unavailable"}
+    fallback = _rule_based_read_only_intent(text)
+    if fallback["action"] == "unknown":
+        fallback["reply"] = (
+            "🌙 My Gemini chat brain is taking a quick nap. Exact commands still "
+            "work—type `help` for the full command deck."
+        )
+    return fallback
+
+
+def _conversation_key(message: discord.Message) -> tuple[str, str]:
+    channel_id = str(getattr(getattr(message, "channel", None), "id", "dm"))
+    return channel_id, _message_author_id(message)
+
+
+def _prune_chat_histories(now: float | None = None) -> None:
+    """Expire inactive chat text globally and enforce a hard session bound."""
+
+    current = monotonic() if now is None else now
+    keys = set(_chat_histories) | set(_chat_history_updated_at)
+    for key in keys:
+        updated_at = _chat_history_updated_at.get(key)
+        if (
+            updated_at is None
+            or key not in _chat_histories
+            or current - updated_at > CHAT_HISTORY_TTL_SECONDS
+        ):
+            _chat_histories.pop(key, None)
+            _chat_history_updated_at.pop(key, None)
+
+    excess = len(_chat_histories) - MAX_CHAT_SESSIONS
+    if excess > 0:
+        oldest = sorted(
+            _chat_histories,
+            key=lambda key: _chat_history_updated_at.get(key, float("-inf")),
+        )[:excess]
+        for key in oldest:
+            _chat_histories.pop(key, None)
+            _chat_history_updated_at.pop(key, None)
+
+
+def _recent_chat_history(message: discord.Message) -> list[tuple[str, str]]:
+    now = monotonic()
+    _prune_chat_histories(now)
+    key = _conversation_key(message)
+    return list(_chat_histories.get(key, []))
+
+
+def _remember_chat_turn(message: discord.Message, user_text: str, reply: str) -> None:
+    now = monotonic()
+    _prune_chat_histories(now)
+    key = _conversation_key(message)
+    history = _chat_histories.setdefault(key, [])
+    history.append((user_text[:400], reply[:400]))
+    del history[:-CHAT_HISTORY_TURNS]
+    _chat_history_updated_at[key] = now
+    _prune_chat_histories(now)
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +612,7 @@ async def handle_set_amounts(
     """Atomically queue both user budgets; edits require a disabled target."""
 
     if not _is_authorized_config_writer(message):
-        await message.reply("Blocked: this write requires an allowlisted Discord user.")
+        await message.reply("🛡️ Blocked: this write requires an allowlisted Discord user.")
         return
     try:
         symbol = _normalise_usd_key(symbol_value)
@@ -413,18 +621,18 @@ async def handle_set_amounts(
         if low > high:
             raise ValueError("the lower amount must not exceed the higher amount")
     except ValueError as exc:
-        await message.reply(f"Invalid request: {exc}")
+        await message.reply(f"⚠️ Invalid request: {exc}")
         return
 
     raw = await asyncio.to_thread(get_repo_variable, RULES_VARIABLE)
     try:
         rules = validate_rules_map(raw or "")
     except ConfigError as exc:
-        await message.reply(f"Blocked: live rules are invalid ({exc}).")
+        await message.reply(f"🛡️ Blocked: live rules are invalid ({exc}).")
         return
     if rules[symbol]["BUY_ENABLED"]:
         await message.reply(
-            f"Blocked: disable **{symbol}** before changing either budget."
+            f"🛡️ Blocked: disable **{symbol}** before changing either budget."
         )
         return
 
@@ -445,23 +653,24 @@ async def handle_set_amounts(
             "MID",
         )
         await message.reply(
-            f"Queued atomic budgets for **{symbol}**: lower {_display_amount(low)}, "
+            f"⏳ Budget update queued — not applied yet for **{symbol}**: "
+            f"lower {_display_amount(low)}, "
             f"sideways midpoint {_display_amount(midpoint)}, higher "
             f"{_display_amount(high)}. Run `!dca analyze {symbol.removesuffix('_USD')}` "
             "after the workflow completes."
         )
     else:
-        await message.reply("Failed to queue the budget update. No rules were changed.")
+        await message.reply("❌ Failed to queue the budget update. No rules were changed.")
 
 
 async def handle_disable(symbol_value: str, message: discord.Message) -> None:
     if not _is_authorized_config_writer(message):
-        await message.reply("Blocked: this write requires an allowlisted Discord user.")
+        await message.reply("🛡️ Blocked: this write requires an allowlisted Discord user.")
         return
     try:
         symbol = _normalise_usd_key(symbol_value)
     except ValueError as exc:
-        await message.reply(f"Invalid request: {exc}")
+        await message.reply(f"⚠️ Invalid request: {exc}")
         return
     inputs = {
         "action": "set_enabled",
@@ -471,12 +680,13 @@ async def handle_disable(symbol_value: str, message: discord.Message) -> None:
     if await asyncio.to_thread(trigger_workflow, "update_dca_config.yml", inputs):
         _pending_enable_confirmations.pop(_message_author_id(message), None)
         await message.reply(
-            f"Queued disable for **{symbol}**. Once applied, the trader's live "
+            f"⏳ Disable queued — not applied yet for **{symbol}**. Once applied, "
+            "the trader's live "
             "pre-submit check blocks a new order; an order already accepted by "
             "Kraken will still be reconciled."
         )
     else:
-        await message.reply("Failed to queue disable. Check GitHub Actions and retry.")
+        await message.reply("❌ Failed to queue disable. No change was applied; check GitHub Actions and retry.")
 
 
 def _enable_review(
@@ -543,7 +753,7 @@ def _enable_review(
 
 async def handle_enable(symbol_value: str, message: discord.Message) -> None:
     if not _is_authorized_config_writer(message):
-        await message.reply("Blocked: this write requires an allowlisted Discord user.")
+        await message.reply("🛡️ Blocked: this write requires an allowlisted Discord user.")
         return
     try:
         symbol = _normalise_usd_key(symbol_value)
@@ -556,7 +766,7 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
             now=datetime.now(timezone.utc),
         )
     except (ValueError, ConfigError) as exc:
-        await message.reply(f"Blocked: {exc}.")
+        await message.reply(f"🛡️ Blocked: {exc}.")
         return
 
     command = f"!dca confirm enable {symbol}"
@@ -567,7 +777,7 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
         "expires_at": monotonic() + ENABLE_CONFIRMATION_TTL_SECONDS,
     }
     await message.reply(
-        f"**Enable review for {symbol}**\n"
+        f"🧾🔐 **Enable review for {symbol}**\n"
         f"UPTREND/lower: {_display_amount(review['low'])} | "
         f"SIDEWAYS/midpoint: {_display_amount(review['mid'])} | "
         f"DOWNTREND/higher: {_display_amount(review['high'])}\n"
@@ -577,6 +787,7 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
         f"Decision age: `{review['decision_age_minutes']:.0f} min`\n"
         f"Maximum aggregate daily exposure after enable: "
         f"**{_display_amount(review['maximum_exposure'])}**\n"
+        "No change has been made. "
         "The serialized workflow will re-read this decision and check Kraken's "
         "current market minimum before enabling.\n"
         f"Send exactly `{command}` within {ENABLE_CONFIRMATION_TTL_SECONDS // 60} minutes."
@@ -585,19 +796,19 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
 
 async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -> None:
     if not _is_authorized_config_writer(message):
-        await message.reply("Blocked: enable confirmations require an allowlisted user.")
+        await message.reply("🛡️ Blocked: enable confirmations require an allowlisted user.")
         return
     author_id = _message_author_id(message)
     pending = _pending_enable_confirmations.get(author_id)
     if not pending:
-        await message.reply("Blocked: no enable confirmation is pending for your user.")
+        await message.reply("🛡️ Blocked: no enable confirmation is pending for your user.")
         return
     if monotonic() > pending["expires_at"]:
         _pending_enable_confirmations.pop(author_id, None)
-        await message.reply("Blocked: that enable confirmation expired; review again.")
+        await message.reply("⌛ Blocked: that enable confirmation expired; review again.")
         return
     if raw_text != pending["command"]:
-        await message.reply(f"Blocked: send exactly `{pending['command']}`.")
+        await message.reply(f"🛡️ Blocked: send exactly `{pending['command']}`.")
         return
 
     expected = pending["review"]
@@ -612,13 +823,13 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
         )
     except ConfigError as exc:
         _pending_enable_confirmations.pop(author_id, None)
-        await message.reply(f"Blocked after live revalidation: {exc}.")
+        await message.reply(f"🛡️ Blocked after live revalidation: {exc}.")
         return
 
     if current["global_rules_hash"] != expected["global_rules_hash"]:
         _pending_enable_confirmations.pop(author_id, None)
         await message.reply(
-            "Blocked: the global three-asset DCA rules changed after review. "
+            "🛡️ Blocked: the global three-asset DCA rules changed after review. "
             "Run the enable command again to review current aggregate exposure."
         )
         return
@@ -636,7 +847,7 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
     if any(current[field] != expected[field] for field in bound_fields):
         _pending_enable_confirmations.pop(author_id, None)
         await message.reply(
-            "Blocked: budgets, decision, execution time, or aggregate exposure changed. "
+            "🛡️ Blocked: budgets, decision, execution time, or aggregate exposure changed. "
             "Run the enable command again to review the live state."
         )
         return
@@ -652,16 +863,16 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
     _pending_enable_confirmations.pop(author_id, None)
     if await asyncio.to_thread(trigger_workflow, "update_dca_config.yml", inputs):
         await message.reply(
-            f"Enable validation queued for **{expected['symbol']}**. It remains disabled "
+            f"⏳🔐 Enable validation queued for **{expected['symbol']}**. The target is still disabled "
             "unless the workflow confirms the same live rules, decision, and Kraken minimum."
         )
     else:
-        await message.reply("Failed to queue enable validation. The target remains disabled.")
+        await message.reply("❌ Failed to queue enable validation. The target remains disabled.")
 
 
 async def handle_analyze(params: dict[str, Any], message: discord.Message) -> None:
     if not _is_authorized_config_writer(message):
-        await message.reply("Blocked: analysis requires an allowlisted Discord user.")
+        await message.reply("🛡️ Blocked: analysis requires an allowlisted Discord user.")
         return
     raw_symbol = str(params.get("symbol") or params.get("symbols") or "all").strip()
     if raw_symbol.lower() == "all":
@@ -671,25 +882,26 @@ async def handle_analyze(params: dict[str, Any], message: discord.Message) -> No
         try:
             workflow_symbol = _to_usd_pair(raw_symbol)
         except ValueError as exc:
-            await message.reply(f"Invalid request: {exc}")
+            await message.reply(f"⚠️ Invalid request: {exc}")
             return
         label = workflow_symbol
     inputs = {"symbol": workflow_symbol}
     if await asyncio.to_thread(trigger_workflow, "crypto_analysis.yml", inputs):
         await message.reply(
-            f"Analysis queued for **{label}**. Deterministic Python selects regime, "
-            "budget tier, and execution time; Gemini only explains the result."
+            f"🔎 Analysis queued for **{label}**. Deterministic Python selects an "
+            "operational regime label, budget tier, and execution time; it is not "
+            "a return forecast and cannot submit an order. Gemini only explains the result."
         )
     else:
-        await message.reply("Failed to queue analysis. Existing decisions will not be reused.")
+        await message.reply("❌ Failed to queue analysis. Existing decisions will not be reused.")
 
 
 async def handle_portfolio(params: dict[str, Any], message: discord.Message) -> None:
     inputs = {"short_report": "true" if params.get("short_report", True) else "false"}
     if await asyncio.to_thread(trigger_workflow, "portfolio_check.yml", inputs):
-        await message.reply("Read-only Kraken portfolio check queued.")
+        await message.reply("📊🐙 Read-only Kraken portfolio check queued.")
     else:
-        await message.reply("Failed to queue the portfolio check.")
+        await message.reply("❌ Failed to queue the portfolio check; no trading action was taken.")
 
 
 def _decision_summary(
@@ -702,10 +914,10 @@ def _decision_summary(
 ) -> str:
     enabled = rule["BUY_ENABLED"]
     amounts = rule["REGIME_AMOUNTS_GBP"]
-    status = "ENABLED" if enabled else "disabled"
+    status = "🔘 ENABLED" if enabled else "⚪ disabled"
     state_entry = execution.get(symbol, {})
     pending = isinstance(state_entry.get("PENDING_ORDER"), Mapping)
-    pending_text = " | PENDING ORDER RECOVERY" if pending else ""
+    pending_text = " | 🔒 PENDING ORDER RECOVERY" if pending else ""
     if decision["STATUS"] == "READY":
         regime = decision["REGIME"]
         amount = _display_amount(effective_amount(rule, decision))
@@ -720,11 +932,12 @@ def _decision_summary(
         age = _decision_age(decision, now)
         decision_status = "ERROR"
     return (
-        f"**{symbol}** — {status} | UPTREND/lower "
+        f"{ASSET_EMOJIS.get(symbol, '🪙')} **{symbol}** — {status} | UPTREND/lower "
         f"{_display_amount(amounts['LOW'])} | SIDEWAYS/midpoint "
         f"{_display_amount(amount_for_tier_gbp(rule, 'MID'))} | DOWNTREND/higher "
         f"{_display_amount(amounts['UP'])}\n"
-        f"  Analysis: {decision_status} | Regime: `{regime}` | Effective: {amount} | "
+        f"  Analysis: {decision_status} | Regime: `{regime}` | "
+        f"Configured amount for current rule: {amount} | "
         f"Next: `{next_time}` | Age: `{age}`\n"
         f"  Last buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}`{pending_text}"
     )
@@ -735,13 +948,13 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         rules, analysis, execution = await asyncio.to_thread(_load_live_state)
     except ConfigError as exc:
         await message.reply(
-            f"**DCA status: NOT READY**\nConfiguration/state validation failed: `{exc}`\n"
-            "Trading and scheduling fail closed."
+            f"🛡️🐙 **DCA status: NOT READY**\nConfiguration/state validation failed: `{exc}`\n"
+            "🛡️ Trading and scheduling fail closed."
         )
         return
 
     now = datetime.now(timezone.utc)
-    lines = ["**Kraken USD-pair DCA status (GBP budgets)**"]
+    lines = ["📊🐙 **Krakie's Kraken DCA status (GBP budgets)**"]
     for symbol in ALLOWED_TARGETS:
         lines.append(
             _decision_summary(
@@ -769,7 +982,7 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         )
     else:
         scheduler = f"running; {len(_dca_schedule)} active target(s)"
-    lines.append(f"Scheduler: **{scheduler}**")
+    lines.append(f"⏰ Scheduler: **{scheduler}**")
     analysis_ready = all(
         decision["STATUS"] == "READY"
         and decision["RULES_HASH"] == rules_hash(symbol, rules[symbol])
@@ -788,9 +1001,9 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         and _schedule_error is None
         and _schedule_warning is None
     ):
-        lines.append("Trading posture: **ready-but-disabled** (no target can submit a new order).")
+        lines.append("🌙 Trading posture: **ready-but-disabled** (no target can submit a new order).")
     elif all_disabled:
-        lines.append("Trading posture: **disabled and fail-closed; readiness needs attention**.")
+        lines.append("🛡️ Trading posture: **disabled and fail-closed; readiness needs attention**.")
     await message.reply("\n".join(lines)[:1_990])
 
 
@@ -799,8 +1012,8 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
         rules, analysis, execution = await asyncio.to_thread(_load_live_state)
     except ConfigError as exc:
         await message.reply(
-            f"**DCA health: NOT READY**\n- State validation: FAILED (`{exc}`)\n"
-            "- New orders: blocked"
+            f"🛡️🩺 **DCA health: NOT READY**\n- State validation: FAILED (`{exc}`)\n"
+            "- 🛡️ New orders: blocked"
         )
         return
     now = datetime.now(timezone.utc)
@@ -852,17 +1065,22 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
         else "ACTIVE"
     )
     lines = [
-        f"**DCA health: {posture}**",
-        f"- Rules: valid ({len(rules)}/3 USD targets; GBP budgets)",
+        f"🩺🐙 **DCA health: {posture}**",
+        f"- 📜 Rules: valid ({len(rules)}/3 USD targets; GBP budgets)",
         (
-            "- Analysis: awaiting 04:00 start-day analysis"
+            "- 🔎 Analysis: awaiting 04:00 start-day analysis"
             if awaiting_start_analysis
-            else f"- Analysis: fresh READY {len(ready)}/3"
+            else f"- 🔎 Analysis: fresh READY {len(ready)}/3"
         ),
-        f"- Execution state: valid; pending intents {pending_count}",
-        f"- Scheduler: {'running' if DCA_CRON_ENABLED else 'paused'}; "
+        f"- 🧾 Execution state: valid; pending intents {pending_count}",
+        f"- ⏰ Scheduler: {'running' if DCA_CRON_ENABLED else 'paused'}; "
         f"active targets {len(_dca_schedule)}",
-        f"- Buy-enabled targets: {enabled_count}/3",
+        f"- 🔘 Buy-enabled targets: {enabled_count}/3",
+        (
+            f"- 💬 Gemini chat: configured (`{AI_MODEL_CANDIDATES[0]}` primary)"
+            if GEMINI_API_KEY
+            else "- 💬 Gemini chat: not configured; exact commands remain available"
+        ),
     ]
     if _schedule_start_date is not None:
         lines.append(
@@ -870,11 +1088,11 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
             f"{TIMEZONE.key}"
         )
     if errors and not awaiting_start_analysis:
-        lines.append("- Analysis ERROR: " + ", ".join(errors))
+        lines.append("- ⚠️ Analysis ERROR: " + ", ".join(errors))
     if stale and not awaiting_start_analysis:
-        lines.append("- Stale decisions: " + ", ".join(stale))
+        lines.append("- ⌛ Stale decisions: " + ", ".join(stale))
     if mismatched and not awaiting_start_analysis:
-        lines.append("- Rules mismatch: " + ", ".join(mismatched))
+        lines.append("- ⚠️ Rules mismatch: " + ", ".join(mismatched))
     if _schedule_error:
         lines.append(f"- Scheduler validation: FAILED (`{_schedule_error}`)")
     if _schedule_warning:
@@ -882,17 +1100,42 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     await message.reply("\n".join(lines))
 
 
-HELP_TEXT = """**Kraken USD-pair DCA controls (GBP budgets)**
+HELP_TEXT = """🐙✨ **Krakie's complete DCA command deck**
+GBP-funded Kraken markets: `BTC/USD`, `HYPE/USD`, and `SOL/USD`.
+Asset aliases: `BTC`/`bitcoin`, `HYPE`/`hype`/`hyperliquid`, and `SOL`/`solana`.
 
+📊 **Look without changing anything**
+`show status` or `!dca status` — regimes, amounts, times, and pending state
+`!dca health` — scheduler, analysis, and configuration health
+`show portfolio` or `!dca portfolio` — queue a read-only Kraken holdings check
+`help`, `!help`, or `!dca help` — show this complete list
+
+🔎 **Refresh deterministic analysis** *(allowlisted user)*
+`!dca analyze BTC` — replace BTC with `HYPE` or `SOL`
+`!dca analyze all` — analyze all three targets
+
+🧾 **Change lower/higher budgets** *(disable first)*
 `!dca set BTC amounts to 10 low and 20 high`
-`!dca disable BTC`
-`!dca enable BTC` (then send the exact confirmation returned)
-`!dca analyze BTC` or `!dca analyze all`
-`show status`
-`!dca health`
+Sideways is calculated automatically. Legacy `up` is accepted as an alias for `high`.
 
-Budget edits require the target to be disabled. Write and analysis commands
-require the exact lowercase `!dca ` prefix and an allowlisted Discord user.
+⏸️ **Pause one target**
+`!dca disable BTC`
+
+🧾🔐 **Review and enable one target**
+`!dca enable BTC` — review the live safety summary
+If you choose to continue, the same user must copy the bot's exact
+`!dca confirm enable BTC_USD` command within 5 minutes.
+
+💬 **Chat with Krakie** *(requires Gemini)*
+Talk normally for explanations or read-only requests. Natural language never
+changes rules, starts analysis, enables/disables trading, or places an order.
+Without Gemini, exact commands and common read-only keyword fallbacks still work.
+
+🛡️ A configured channel and allowlist gate all replies. Without a configured
+channel, use a DM or mention the bot. Writes/analysis always require an allowlisted
+user. Every `!dca` form requires exact lowercase words and internal spacing.
+Queued does not mean applied: run one command at a time and await each workflow.
+Regime labels are operational rules, not forecasts.
 """
 
 
@@ -1120,7 +1363,9 @@ async def _notify(content: str) -> None:
         channel = client.get_channel(int(CHANNEL_ID)) or await client.fetch_channel(
             int(CHANNEL_ID)
         )
-        await channel.send(content[:1_990])
+        await channel.send(
+            content[:1_990], allowed_mentions=discord.AllowedMentions.none()
+        )
     except Exception as exc:
         _log(f"WARN Discord scheduler alert failed: {type(exc).__name__}")
 
@@ -1138,14 +1383,17 @@ async def dca_schedule_refresh() -> None:
     )
     valid = refresh_dca_schedule(*values)
     if not valid:
-        alert = f"DCA scheduler blocked: {_schedule_error}"
+        alert = (
+            "🛡️ Scheduler blocked — new-order scheduling is fail-closed: "
+            f"{_schedule_error}"
+        )
         _log(f"ERROR {alert}")
         if alert != _last_schedule_alert:
             await _notify(alert)
             _last_schedule_alert = alert
         return
     if _schedule_warning:
-        alert = f"DCA scheduler skipped invalid target(s): {_schedule_warning}"
+        alert = f"⚠️ Scheduler attention — skipped invalid target(s): {_schedule_warning}"
         _log(f"WARN {alert}")
         if alert != _last_schedule_alert:
             await _notify(alert)
@@ -1183,12 +1431,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-ACTION_HANDLERS = {
+READ_ONLY_ACTION_HANDLERS = {
     "portfolio": handle_portfolio,
     "status": handle_status,
     "help": handle_help,
     "health": handle_health,
-    "analyze": handle_analyze,
 }
 
 
@@ -1199,6 +1446,10 @@ async def on_ready() -> None:
     _log(
         f"INFO access channel_restricted={bool(CHANNEL_ID)} "
         f"allowlisted_users={len(_allowed_user_ids())}"
+    )
+    _log(
+        f"INFO Gemini chat configured={bool(GEMINI_API_KEY)} "
+        f"primary_model={AI_MODEL_CANDIDATES[0]} read_only=true"
     )
     if not DCA_CRON_ENABLED:
         _log("INFO scheduler paused by DCA_CRON_ENABLED=false")
@@ -1218,10 +1469,15 @@ async def on_ready() -> None:
         _log(f"INFO scheduler posture={_format_cron_status()}")
         if _schedule_warning:
             _log(f"WARN scheduler skipped invalid target(s): {_schedule_warning}")
-            await _notify(f"DCA scheduler skipped invalid target(s): {_schedule_warning}")
+            await _notify(
+                f"⚠️ Scheduler attention — skipped invalid target(s): {_schedule_warning}"
+            )
     else:
         _log(f"ERROR scheduler initial readiness failed: {_schedule_error}")
-        await _notify(f"DCA scheduler blocked: {_schedule_error}")
+        await _notify(
+            "🛡️ Scheduler blocked — new-order scheduling is fail-closed: "
+            f"{_schedule_error}"
+        )
     if not dca_scheduler_tick.is_running():
         dca_scheduler_tick.start()
     if not dca_schedule_refresh.is_running():
@@ -1236,12 +1492,25 @@ _SET_AMOUNTS_RE = re.compile(
 _DISABLE_RE = re.compile(r"^!dca disable ([A-Za-z]+)$")
 _ENABLE_RE = re.compile(r"^!dca enable ([A-Za-z]+)$")
 _ANALYZE_RE = re.compile(r"^!dca analyze (all|[A-Za-z]+)$")
+_CONFIRM_ENABLE_RE = re.compile(
+    r"^!dca confirm enable (?:BTC_USD|HYPE_USD|SOL_USD)$"
+)
+_COMMAND_LIKE_RE = re.compile(r"(?<!\w)!dca\b", re.IGNORECASE)
 
 
 async def _handle_exact_dca_command(text: str, message: discord.Message) -> bool:
     """Handle exact safety-critical commands without AI interpretation."""
 
-    if text.startswith("!dca confirm"):
+    if text == "!dca help":
+        await handle_help({}, message)
+        return True
+    if text == "!dca status":
+        await handle_status({}, message)
+        return True
+    if text == "!dca portfolio":
+        await handle_portfolio({}, message)
+        return True
+    if _CONFIRM_ENABLE_RE.fullmatch(text):
         await _handle_enable_confirmation(message, text)
         return True
     match = _SET_AMOUNTS_RE.fullmatch(text)
@@ -1265,7 +1534,8 @@ async def _handle_exact_dca_command(text: str, message: discord.Message) -> bool
         return True
     if text.startswith(CONFIG_WRITE_PREFIX):
         await message.reply(
-            "Unrecognized exact DCA command. Use `help`; spelling and spacing are safety checks."
+            "🧭 Command not accepted; no changes were made. Type `help`; spelling "
+            "and internal spacing are safety checks."
         )
         return True
     return False
@@ -1285,29 +1555,60 @@ async def on_message(message: discord.Message) -> None:
     if not CHANNEL_ID and not is_dm and client.user not in mentions:
         return
 
-    text = str(message.content)
+    raw_text = str(message.content)
     for mention in mentions:
-        text = text.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
-    text = text.strip()
-    if not text:
-        await message.reply(HELP_TEXT)
+        for token in (f"<@{mention.id}>", f"<@!{mention.id}>"):
+            if raw_text.startswith(token):
+                raw_text = raw_text[len(token) :]
+                if raw_text.startswith(" "):
+                    raw_text = raw_text[1:]
+            else:
+                raw_text = raw_text.replace(token, "")
+    if not raw_text.strip():
+        await handle_help({}, message)
         return
-    if await _handle_exact_dca_command(text, message):
+    if await _handle_exact_dca_command(raw_text, message):
         return
+    if _COMMAND_LIKE_RE.search(raw_text):
+        await message.reply(
+            "🧭 Command not accepted; no changes were made. Type `help` and copy "
+            "an exact lowercase command."
+        )
+        return
+    text = raw_text.strip()
     if text.casefold() == "show status":
         await handle_status({}, message)
+        return
+    if text.casefold() == "show portfolio":
+        await handle_portfolio({}, message)
         return
     if text.casefold() in {"help", "!help"}:
         await handle_help({}, message)
         return
 
     async with message.channel.typing():
-        intent = await classify_intent(text)
-    handler = ACTION_HANDLERS.get(intent["action"])
+        intent = await classify_intent(
+            text,
+            history=_recent_chat_history(message),
+        )
+    handler = READ_ONLY_ACTION_HANDLERS.get(intent["action"])
     if handler:
         await handler(intent.get("params", {}), message)
+    elif intent["action"] == "chat" or intent.get("reply"):
+        reply = intent.get("reply") or (
+            "🤔 I can chat about the bot, DCA, and its safety rules. Type `help` "
+            "whenever you want the exact command deck."
+        )
+        reply = f"🐙 {reply}"[:1_990]
+        _remember_chat_turn(message, text, reply)
+        await message.reply(
+            reply, allowed_mentions=discord.AllowedMentions.none()
+        )
     else:
-        await message.reply("I did not understand that. Type `help` for exact commands.")
+        await message.reply(
+            "🤔 I didn't quite catch that. Ask me about the bot or type `help` "
+            "for every exact command."
+        )
 
 
 if __name__ == "__main__":
