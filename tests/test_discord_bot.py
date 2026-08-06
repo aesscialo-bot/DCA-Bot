@@ -101,6 +101,7 @@ class DiscordBotControlTests(unittest.TestCase):
         discord_bot._dca_dispatch_guard.clear()
         discord_bot._dca_schedule.clear()
         discord_bot._pending_recovery_symbols.clear()
+        discord_bot._awaiting_start_day_symbols.clear()
         discord_bot._schedule_error = None
         discord_bot._schedule_warning = None
         discord_bot._schedule_start_date = None
@@ -436,6 +437,65 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("fresh READY 3/3", health_message.replies[-1])
         self.assertIn("Buy-enabled targets: 0/3", health_message.replies[-1])
 
+    def test_health_reports_armed_while_waiting_for_start_day_analysis(self):
+        live_rules = rules(enabled=set(ALLOWED_TARGETS))
+        decisions = analysis_state(
+            live_rules,
+            status_overrides={symbol: "ERROR" for symbol in ALLOWED_TARGETS},
+        )
+        self.assertTrue(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules),
+                json.dumps(decisions),
+                "{}",
+                "2026-08-06",
+                now=NOW,
+            )
+        )
+        message = MessageStub()
+        with (
+            patch.object(
+                discord_bot,
+                "get_repo_variable",
+                side_effect=variable_reader(live_rules, decisions),
+            ),
+            patch.object(discord_bot, "datetime", FrozenDateTime),
+            patch.object(discord_bot, "DCA_CRON_ENABLED", True),
+        ):
+            asyncio.run(discord_bot.handle_health({}, message))
+
+        self.assertIn("DCA health: ARMED", message.replies[-1])
+        self.assertIn("awaiting 04:00 start-day analysis", message.replies[-1])
+        self.assertNotIn("ATTENTION REQUIRED", message.replies[-1])
+        self.assertNotIn("Analysis ERROR", message.replies[-1])
+
+    def test_health_reports_armed_for_ready_decisions_that_predate_start(self):
+        live_rules = rules(enabled=set(ALLOWED_TARGETS))
+        decisions = analysis_state(live_rules)
+        self.assertTrue(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules),
+                json.dumps(decisions),
+                "{}",
+                "2026-08-06",
+                now=NOW,
+            )
+        )
+        message = MessageStub()
+        with (
+            patch.object(
+                discord_bot,
+                "get_repo_variable",
+                side_effect=variable_reader(live_rules, decisions),
+            ),
+            patch.object(discord_bot, "datetime", FrozenDateTime),
+            patch.object(discord_bot, "DCA_CRON_ENABLED", True),
+        ):
+            asyncio.run(discord_bot.handle_health({}, message))
+
+        self.assertIn("DCA health: ARMED", message.replies[-1])
+        self.assertIn("active targets 0", message.replies[-1])
+
     def test_invalid_state_reports_not_ready_without_echoing_json(self):
         message = MessageStub()
         bad_rules = '{"BTC_THB":{"TOKEN":"do-not-echo"}}'
@@ -455,6 +515,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
     def setUp(self):
         discord_bot._dca_schedule.clear()
         discord_bot._pending_recovery_symbols.clear()
+        discord_bot._awaiting_start_day_symbols.clear()
         discord_bot._dca_dispatch_guard.clear()
         discord_bot._schedule_error = None
         discord_bot._schedule_warning = None
@@ -488,7 +549,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
             discord_bot._dca_schedule["SOL_USD"]["execute_at"],
         )
 
-    def test_scheduler_rejects_decisions_analyzed_before_start_date(self):
+    def test_scheduler_arms_without_warning_before_start_day_analysis(self):
         live_rules = rules(enabled={"BTC_USD"})
         decisions = analysis_state(live_rules)
 
@@ -502,7 +563,84 @@ class DiscordBotSchedulerTests(unittest.TestCase):
             )
         )
         self.assertEqual(discord_bot._dca_schedule, {})
-        self.assertIn("analysis predates start date", discord_bot._schedule_warning)
+        self.assertIsNone(discord_bot._schedule_warning)
+
+    def test_missing_start_day_analysis_alerts_after_bounded_grace(self):
+        live_rules = rules(enabled={"BTC_USD"})
+        decisions = analysis_state(
+            live_rules, status_overrides={"BTC_USD": "ERROR"}
+        )
+        before_deadline = datetime(2026, 8, 5, 21, 14, tzinfo=timezone.utc)
+        after_deadline = datetime(2026, 8, 5, 21, 15, tzinfo=timezone.utc)
+
+        self.assertTrue(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules),
+                json.dumps(decisions),
+                "{}",
+                "2026-08-06",
+                now=before_deadline,
+            )
+        )
+        self.assertIsNone(discord_bot._schedule_warning)
+
+        self.assertTrue(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules),
+                json.dumps(decisions),
+                "{}",
+                "2026-08-06",
+                now=after_deadline,
+            )
+        )
+        self.assertIn("BTC_USD: analysis ERROR", discord_bot._schedule_warning)
+
+    def test_fresh_start_day_analysis_schedules_during_grace(self):
+        live_rules = rules(enabled={"BTC_USD"})
+        analysis_time = datetime(2026, 8, 5, 21, 1, tzinfo=timezone.utc)
+        decisions = analysis_state(live_rules, generated_at=analysis_time)
+
+        self.assertTrue(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules),
+                json.dumps(decisions),
+                "{}",
+                "2026-08-06",
+                now=analysis_time,
+            )
+        )
+        self.assertEqual(set(discord_bot._dca_schedule), {"BTC_USD"})
+        self.assertIsNone(discord_bot._schedule_warning)
+
+        with patch.object(discord_bot, "datetime", FrozenDateTime):
+            FrozenDateTime.current = analysis_time
+            try:
+                self.assertNotIn(
+                    "awaiting 04:00", discord_bot._format_cron_status()
+                )
+            finally:
+                FrozenDateTime.current = NOW
+
+    def test_fresh_start_day_analysis_error_alerts_during_grace(self):
+        live_rules = rules(enabled={"BTC_USD"})
+        analysis_time = datetime(2026, 8, 5, 21, 1, tzinfo=timezone.utc)
+        decisions = analysis_state(
+            live_rules,
+            generated_at=analysis_time,
+            status_overrides={"BTC_USD": "ERROR"},
+        )
+
+        self.assertTrue(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules),
+                json.dumps(decisions),
+                "{}",
+                "2026-08-06",
+                now=analysis_time,
+            )
+        )
+        self.assertIn("BTC_USD: analysis ERROR", discord_bot._schedule_warning)
+        self.assertEqual(discord_bot._awaiting_start_day_symbols, set())
 
     def test_disabled_asset_rules_mismatch_does_not_block_enabled_asset(self):
         live_rules = rules(enabled={"HYPE_USD"})
