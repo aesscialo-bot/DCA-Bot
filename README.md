@@ -1,5 +1,10 @@
 # Kraken GBP-Funded USD DCA Bot
 
+> [!IMPORTANT]
+> **Start here:** [DCA Bot Operating and Configuration Guide](00_START_HERE.md)
+> contains the everyday Discord commands, direct app links, current GBP budgets,
+> JSON ownership rules, pair-change procedure, and troubleshooting steps.
+
 This repository is the production source for a fully automated Kraken spot DCA
 service. It tracks and buys exactly these USD markets:
 
@@ -17,9 +22,11 @@ means the Kraken portfolio was not saved.
 
 ## Production configuration
 
-Production begins on **2026-08-07 in Asia/Bangkok**. The repository variable
-`DCA_START_DATE` must contain the strict value `2026-08-07`. Before that local
-date, the trader fails closed without creating either Kraken order.
+The strict production trading gate is **2026-08-07 in Asia/Bangkok**. The
+repository variable `DCA_START_DATE` contains `2026-08-07`; before that local
+date, the trader fails closed without creating either Kraken order. Check live
+operation with `show status` and `!dca health` rather than treating this static
+baseline as current runtime state.
 
 The requested enabled rules are:
 
@@ -110,11 +117,12 @@ flowchart LR
 
 Railway runs `python3 -u discord_bot.py` continuously. It owns the five-minute
 scheduler and dispatches GitHub Actions at each asset's absolute decision time.
-GitHub Actions holds the Kraken credentials and performs authenticated analysis,
-configuration writes, read-only portfolio checks, and trading. Discord can be
-closed on every phone and computer without stopping automation.
+GitHub Actions performs public Kraken candle analysis, protected configuration
+writes, authenticated portfolio checks, and trading. Kraken credentials remain
+inside GitHub Actions. Discord can be closed on every phone and computer without
+stopping automation.
 
-## State and repository variables
+## State and runtime configuration
 
 `DCA_TARGET_MAP` contains only the three exact target keys, their `LOW`/`UP` GBP
 budgets, and `BUY_ENABLED` flags. Budget edits are atomic and permitted only
@@ -133,8 +141,26 @@ Required repository variables:
 - `DCA_ANALYSIS_STATE`
 - `DCA_EXECUTION_STATE`
 - `DCA_START_DATE` (`2026-08-07` for this rollout)
-- `DCA_CRON_ENABLED`
 - `TIMEZONE` (`Asia/Bangkok`)
+
+`DCA_CRON_ENABLED` is a Railway runtime variable, not a GitHub repository
+variable. It must be `true` for normal scheduling and should be set to `false`
+only during controlled maintenance. See the [operating guide](00_START_HERE.md) for
+the direct Railway variables link and the safe pause/resume procedure.
+
+Required Railway runtime variables:
+
+- `DISCORD_BOT_TOKEN` (secret)
+- `GH_PAT` (secret; Railway controller token, distinct from `GH_PAT_FOR_VARS`)
+- `GITHUB_REPO` (`aesscialo-bot/DCA-Bot`)
+- `GITHUB_WORKFLOW_REF` (`main`)
+- `DISCORD_CHANNEL_ID`
+- `DISCORD_ALLOWED_USERS`
+- `DCA_CRON_ENABLED` (`true` for normal operation)
+- `TIMEZONE` (`Asia/Bangkok`, matching the GitHub repository variable)
+
+Railway may also contain `GEMINI_API_KEY` for optional read-only conversational
+intent classification. Exact DCA control commands never depend on AI.
 
 Optional repository variables:
 
@@ -189,21 +215,23 @@ next execution time, decision age, and aggregate maximum daily exposure.
 | `update_dca_config.yml` | Manual/Discord dispatch | Serialize atomic GBP budget and enable-state updates. |
 | `ci.yml` | Pull request and `main` | Compile, test, validate workflows, and build the Railway image. |
 
-## Safe rollout and verification
+## Structural migration or recovery verification
 
-1. Keep all targets disabled while setting final rules and empty/fresh state.
-2. Set `DCA_START_DATE=2026-08-07` and confirm `TIMEZONE=Asia/Bangkok`.
-3. Run the read-only portfolio workflow and confirm BTC/USD, HYPE/USD, SOL/USD,
-   GBP cash, USD cash, and the live GBP/USD conversion appear.
-4. Run analysis and confirm three fresh decisions and three Discord summaries.
-5. Run the trader while disabled and verify no Kraken `AddOrder` call occurs.
-6. Enable each target with exact confirmation after Kraken minimum validation.
-7. Re-enable Railway scheduling and verify `show status` and `!dca health`.
-8. Confirm Railway reports the deployed `main` commit and its scheduler is on.
+Do not reuse a historical start date, clear execution state, or delete a target
+key as a shortcut. A structural migration or recovery must begin with every
+target disabled, Railway scheduling off, and an authenticated Kraken open/closed
+order audit confirming that no unresolved intent can be lost. Preserve valid
+buy dates and recovery records while migrating complete rules, analysis, and
+execution state.
 
-Acceptance requires no pending intents, no same-day duplicate orders, three
-fresh decisions, and no credential or complete production-state JSON in public
-logs. No manual intervention is required after activation.
+The guarded maintainer procedure is in
+[Adding or permanently removing a pair](00_START_HERE.md#adding-or-permanently-removing-a-pair).
+Use the everyday Discord procedure in that guide for routine budget or enable
+changes.
+
+Acceptance requires no pending intents, no same-day duplicate orders, a fresh
+decision for every canonical target, and no credential or complete production
+state JSON in public logs. No manual intervention is required after activation.
 
 ## Local verification
 
