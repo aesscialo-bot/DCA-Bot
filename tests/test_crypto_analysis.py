@@ -213,9 +213,13 @@ class TrendClassificationTests(unittest.TestCase):
         self.assertNotEqual(signals["WEEKLY_CLOSE"], 1)
 
     def test_insufficient_and_stale_market_data_fail_closed(self):
-        daily, weekly = trend_rows("up", count=219)
+        daily, weekly = trend_rows("up", count=169)
         with self.assertRaisesRegex(crypto_analysis.AnalysisError, "insufficient"):
             crypto_analysis.classify_trend(daily, weekly, now=NOW)
+
+        daily, weekly = trend_rows("up", count=170)
+        regime, _signals = crypto_analysis.classify_trend(daily, weekly, now=NOW)
+        self.assertEqual(regime, "UPTREND")
 
         daily, weekly = trend_rows("up")
         with self.assertRaisesRegex(crypto_analysis.AnalysisError, "stale"):
@@ -367,7 +371,9 @@ class DecisionAndNarrationTests(unittest.TestCase):
 
     def test_hype_analysis_uses_completed_kraken_hype_usd_history(self):
         rule = dca_config.default_rules_map()["HYPE_USD"]
-        daily, weekly = trend_rows("down")
+        # HYPE/USD is newer than BTC/USD and SOL/USD but has more than the
+        # exact 170 candles required by SMA150's 20-day slope.
+        daily, weekly = trend_rows("down", count=190)
         exchange = MagicMock()
         with (
             patch.object(

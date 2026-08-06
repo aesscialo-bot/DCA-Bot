@@ -50,7 +50,11 @@ PERIODS = (3, 5, 7)
 DAILY_TIMEFRAME_MS = 24 * 60 * 60 * 1000
 WEEKLY_TIMEFRAME_MS = 7 * DAILY_TIMEFRAME_MS
 QUARTER_HOUR_MS = 15 * 60 * 1000
-MIN_DAILY_CANDLES = 220
+# SMA150's 20-day slope needs the current SMA and the value 20 completed
+# candles earlier: 150 + 20 = 170 completed daily candles. Requiring more
+# would permanently exclude otherwise analyzable newer Kraken markets such as
+# HYPE/USD without adding another signal to the documented regime policy.
+MIN_DAILY_CANDLES = 170
 MIN_WEEKLY_CANDLES = 20
 KRAKEN_OHLCV_LIMIT = 720
 INTRADAY_CANDLES_PER_DAY = 96
