@@ -39,59 +39,59 @@ def resolved_activity_response(symbol="BTCUSD", data_source="YAHOO"):
     )
 
 
-class GhostfolioGbpTests(unittest.TestCase):
+class GhostfolioUsdMirrorTests(unittest.TestCase):
     def setUp(self):
         timestamp = datetime(2026, 8, 4, 10, 30, tzinfo=timezone.utc).timestamp()
         self.trade = {
             "ts": timestamp,
+            "quote_currency": "USD",
             "amount_crypto": 0.0002,
             "amount_gbp": 10.0,
             "cost_gbp": 9.95,
             "fee_gbp": 0.05,
-            "gbp_fee_debit": 0.05,
-            "fee_details": [
-                {
-                    "currency": "GBP",
-                    "amount": 0.05,
-                    "gbp_equivalent": 0.05,
-                }
-            ],
-            "gbp_price_per_unit": 50000.0,
+            "gbp_fee_debit": 0.0,
+            "gbp_usd_rate": 1.25,
+            "funded_usd": 12.48,
+            "funding_fee_usd": 0.02,
+            "cost_usd": 12.47,
+            "fee_usd": 0.03,
+            "usd_fee_debit": 0.0,
+            "usd_price_per_unit": 62_350.0,
+            "funding_order_id": "FX-123",
             "order_id": "KRAKEN-123",
         }
 
-    def test_resolves_kraken_gbp_pair_to_usd_provider_profile(self):
-        resolution = portfolio_logger.resolve_ghostfolio_asset("BTC", "BTC/GBP")
+    def test_resolves_kraken_usd_pair_to_usd_provider_profile(self):
+        resolution = portfolio_logger.resolve_ghostfolio_asset("BTC", "BTC/USD")
 
         self.assertEqual(resolution["dataSource"], "YAHOO")
         self.assertEqual(resolution["symbol"], "BTCUSD")
         self.assertFalse(resolution["usedExplicitMapping"])
 
-    def test_explicit_provider_override_is_preserved_for_gbp_pair(self):
-        resolution = portfolio_logger.resolve_ghostfolio_asset("HYPE", "HYPE/GBP")
+    def test_hype_uses_unambiguous_explicit_provider_override(self):
+        resolution = portfolio_logger.resolve_ghostfolio_asset("HYPE", "HYPE/USD")
 
         self.assertEqual(resolution["dataSource"], "COINGECKO")
         self.assertEqual(resolution["symbol"], "hyperliquid")
         self.assertTrue(resolution["usedExplicitMapping"])
 
-    def test_non_gbp_exchange_pair_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "Expected Kraken GBP pair BTC/GBP"):
-            portfolio_logger.resolve_ghostfolio_asset("BTC", "BTC/USD")
+    def test_non_usd_exchange_pair_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Expected Kraken USD pair BTC/USD"):
+            portfolio_logger.resolve_ghostfolio_asset("BTC", "BTC/GBP")
 
     def test_ambiguous_asset_without_override_fails_closed(self):
         with patch.dict(
             portfolio_logger.SYMBOL_DATASOURCE_OVERRIDES, {}, clear=True
         ):
             with self.assertRaisesRegex(ValueError, "Ambiguous Ghostfolio asset"):
-                portfolio_logger.resolve_ghostfolio_asset("HYPE", "HYPE/GBP")
+                portfolio_logger.resolve_ghostfolio_asset("HYPE", "HYPE/USD")
 
-    def test_activity_keeps_gbp_spend_and_converts_only_provider_price(self):
+    def test_activity_uses_direct_usd_fill_and_identifies_kraken_as_source(self):
         activity = portfolio_logger.build_ghostfolio_activity(
             self.trade,
             "BTC",
             "account-id",
-            exchange_pair="BTC/GBP",
-            gbp_usd_rate=1.25,
+            exchange_pair="BTC/USD",
         )
 
         self.assertEqual(activity["accountId"], "account-id")
@@ -100,14 +100,13 @@ class GhostfolioGbpTests(unittest.TestCase):
         self.assertEqual(activity["symbol"], "BTCUSD")
         self.assertEqual(activity["date"], "2026-08-04T10:30:00.000Z")
         self.assertEqual(activity["quantity"], 0.0002)
-        self.assertEqual(activity["unitPrice"], 62500.0)
-        self.assertEqual(
-            activity["comment"],
-            "GBP 10.00 total on Kraken "
-            "(cost 9.95 + GBP debit fee 0.05; fee equivalent 0.05) | "
-            "order KRAKEN-123",
-        )
-        self.assertEqual(activity["fee"], 0.0625)
+        self.assertEqual(activity["unitPrice"], 62_350.0)
+        self.assertEqual(activity["fee"], 0.03)
+        self.assertIn("Saved on Kraken", activity["comment"])
+        self.assertIn("GBP 10.00 funded USD 12.4800", activity["comment"])
+        self.assertIn("GBP/USD 1.250000", activity["comment"])
+        self.assertIn("funding order FX-123", activity["comment"])
+        self.assertIn("crypto order KRAKEN-123", activity["comment"])
         self.assertEqual(
             set(activity),
             {
@@ -124,41 +123,14 @@ class GhostfolioGbpTests(unittest.TestCase):
             },
         )
 
-    def test_base_asset_fee_is_reported_without_adding_to_gbp_cash_debit(self):
-        trade = {
-            **self.trade,
-            "amount_gbp": 9.95,
-            "fee_gbp": 0.05,
-            "gbp_fee_debit": 0.0,
-            "fee_details": [
-                {
-                    "currency": "BTC",
-                    "amount": 0.000001,
-                    "gbp_equivalent": 0.05,
-                }
-            ],
-        }
-
-        activity = portfolio_logger.build_ghostfolio_activity(
-            trade,
-            "BTC",
-            "account-id",
-            exchange_pair="BTC/GBP",
-            gbp_usd_rate=1.25,
-        )
-
-        self.assertEqual(activity["quantity"], 0.0002)
-        self.assertEqual(activity["fee"], 0.0625)
-        self.assertIn("GBP 9.95 total", activity["comment"])
-        self.assertIn("GBP debit fee 0.00", activity["comment"])
-        self.assertIn("fee equivalent 0.05", activity["comment"])
-
     def test_activity_rejects_invalid_trade_values(self):
         for field in (
             "amount_crypto",
             "amount_gbp",
-            "cost_gbp",
-            "gbp_price_per_unit",
+            "funded_usd",
+            "cost_usd",
+            "usd_price_per_unit",
+            "gbp_usd_rate",
         ):
             with self.subTest(field=field):
                 invalid_trade = {**self.trade, field: 0}
@@ -167,18 +139,24 @@ class GhostfolioGbpTests(unittest.TestCase):
                         invalid_trade,
                         "BTC",
                         "account-id",
-                        exchange_pair="BTC/GBP",
-                        gbp_usd_rate=1.25,
+                        exchange_pair="BTC/USD",
                     )
 
-    def test_activity_rejects_invalid_conversion_rate(self):
-        with self.assertRaisesRegex(ValueError, "GBP-to-USD rate"):
+    def test_activity_rejects_non_usd_trade_and_funding_overrun(self):
+        with self.assertRaisesRegex(ValueError, "USD-market trade"):
             portfolio_logger.build_ghostfolio_activity(
-                self.trade,
+                {**self.trade, "quote_currency": "GBP"},
                 "BTC",
                 "account-id",
-                exchange_pair="BTC/GBP",
-                gbp_usd_rate=0,
+                exchange_pair="BTC/USD",
+            )
+
+        with self.assertRaisesRegex(ValueError, "cannot exceed confirmed funded USD"):
+            portfolio_logger.build_ghostfolio_activity(
+                {**self.trade, "cost_usd": 12.48, "usd_fee_debit": 0.02},
+                "BTC",
+                "account-id",
+                exchange_pair="BTC/USD",
             )
 
     def test_account_mapping_prefers_symbol_then_default(self):
@@ -223,7 +201,7 @@ class GhostfolioGbpTests(unittest.TestCase):
             timeout=portfolio_logger.FX_LOOKUP_TIMEOUT_SECONDS,
         )
 
-    def test_gbp_usd_rate_falls_back_to_second_source(self):
+    def test_gbp_usd_rate_falls_back_then_returns_none_if_all_fail(self):
         with patch.object(
             portfolio_logger.requests,
             "get",
@@ -232,26 +210,17 @@ class GhostfolioGbpTests(unittest.TestCase):
                 MockResponse(body={"rates": {"USD": 1.26}}),
             ],
         ) as get:
-            rate = portfolio_logger.get_gbp_usd_rate()
-
-        self.assertEqual(rate, 1.26)
+            self.assertEqual(portfolio_logger.get_gbp_usd_rate(), 1.26)
         self.assertEqual(get.call_count, 2)
-        self.assertEqual(
-            get.call_args_list[1].args[0],
-            "https://open.er-api.com/v6/latest/GBP",
-        )
 
-    def test_gbp_usd_rate_returns_none_when_sources_fail(self):
         with patch.object(
             portfolio_logger.requests,
             "get",
             side_effect=[requests.Timeout("one"), requests.ConnectionError("two")],
         ):
-            rate = portfolio_logger.get_gbp_usd_rate()
+            self.assertIsNone(portfolio_logger.get_gbp_usd_rate())
 
-        self.assertIsNone(rate)
-
-    def test_asset_roi_uses_usd_provider_profile_for_gbp_pair(self):
+    def test_asset_roi_uses_usd_provider_profile(self):
         response = MockResponse(
             body={
                 "holdings": [
@@ -273,7 +242,7 @@ class GhostfolioGbpTests(unittest.TestCase):
             patch.object(portfolio_logger.requests, "get", return_value=response) as get,
         ):
             roi = portfolio_logger.get_asset_roi_percent(
-                "BTC", "btc-account", exchange_pair="BTC/GBP"
+                "BTC", "btc-account", exchange_pair="BTC/USD"
             )
 
         self.assertEqual(roi, 15.0)
@@ -287,91 +256,46 @@ class GhostfolioGbpTests(unittest.TestCase):
             },
         )
 
-    def test_asset_roi_rejects_non_positive_investment(self):
-        response = MockResponse(
-            body={
-                "holdings": [
-                    {
-                        "dataSource": "YAHOO",
-                        "symbol": "BTCUSD",
-                        "investment": 0,
-                        "netPerformanceWithCurrencyEffect": 1,
-                    }
-                ]
-            }
-        )
-        with (
-            patch.object(portfolio_logger, "GHOSTFOLIO_TOKEN", "access-token"),
-            patch.object(
-                portfolio_logger, "authenticate_ghostfolio", return_value="jwt"
-            ),
-            patch.object(portfolio_logger.requests, "get", return_value=response),
-        ):
-            roi = portfolio_logger.get_asset_roi_percent(
-                "BTC", "btc-account", exchange_pair="BTC/GBP"
-            )
-
-        self.assertIsNone(roi)
-
-    def test_missing_token_skips_logging_before_conversion_or_import(self):
+    def test_missing_token_skips_before_import(self):
         with (
             patch.object(portfolio_logger, "GHOSTFOLIO_TOKEN", None),
-            patch.object(portfolio_logger, "get_gbp_usd_rate") as fx,
             patch.object(portfolio_logger.requests, "post") as post,
         ):
             saved = portfolio_logger.log_to_ghostfolio(
-                self.trade, "BTC", "account-id", exchange_pair="BTC/GBP"
+                self.trade, "BTC", "account-id", exchange_pair="BTC/USD"
             )
 
         self.assertFalse(saved)
-        fx.assert_not_called()
         post.assert_not_called()
 
-    def test_successful_log_converts_price_inside_ghostfolio_boundary(self):
-        dry_run = resolved_activity_response()
-        imported = resolved_activity_response()
+    def test_successful_log_uses_direct_usd_price_without_fx_lookup(self):
+        valid = resolved_activity_response()
 
         with (
             patch.object(portfolio_logger, "GHOSTFOLIO_TOKEN", "access-token"),
             patch.object(
                 portfolio_logger, "authenticate_ghostfolio", return_value="jwt"
             ),
-            patch.object(portfolio_logger, "get_gbp_usd_rate", return_value=1.25) as fx,
+            patch.object(portfolio_logger, "get_gbp_usd_rate") as fx,
             patch.object(
                 portfolio_logger.requests,
                 "post",
-                side_effect=[dry_run, imported],
+                side_effect=[valid, valid],
             ) as post,
         ):
             saved = portfolio_logger.log_to_ghostfolio(
-                self.trade, "BTC", "account-id", exchange_pair="BTC/GBP"
+                self.trade, "BTC", "account-id", exchange_pair="BTC/USD"
             )
 
         self.assertTrue(saved)
-        fx.assert_called_once_with(self.trade["ts"])
+        fx.assert_not_called()
         self.assertEqual(post.call_count, 2)
         activity = post.call_args_list[0].kwargs["json"]["activities"][0]
-        self.assertEqual(activity["unitPrice"], 62500.0)
+        self.assertEqual(activity["unitPrice"], 62_350.0)
         self.assertEqual(activity["currency"], "USD")
-        self.assertIn("GBP 10.00", activity["comment"])
+        self.assertIn("Saved on Kraken", activity["comment"])
         self.assertIn("?dryRun=true", post.call_args_list[0].args[0])
         self.assertNotIn("?dryRun=true", post.call_args_list[1].args[0])
-
-    def test_conversion_outage_skips_optional_import(self):
-        with (
-            patch.object(portfolio_logger, "GHOSTFOLIO_TOKEN", "access-token"),
-            patch.object(
-                portfolio_logger, "authenticate_ghostfolio", return_value="jwt"
-            ),
-            patch.object(portfolio_logger, "get_gbp_usd_rate", return_value=None),
-            patch.object(portfolio_logger.requests, "post") as post,
-        ):
-            saved = portfolio_logger.log_to_ghostfolio(
-                self.trade, "BTC", "account-id", exchange_pair="BTC/GBP"
-            )
-
-        self.assertFalse(saved)
-        post.assert_not_called()
 
     def test_duplicate_dry_run_is_idempotent_success(self):
         duplicate = MockResponse(
@@ -383,13 +307,12 @@ class GhostfolioGbpTests(unittest.TestCase):
             patch.object(
                 portfolio_logger, "authenticate_ghostfolio", return_value="jwt"
             ),
-            patch.object(portfolio_logger, "get_gbp_usd_rate", return_value=1.25),
             patch.object(
                 portfolio_logger.requests, "post", return_value=duplicate
             ) as post,
         ):
             saved = portfolio_logger.log_to_ghostfolio(
-                self.trade, "BTC", "account-id", exchange_pair="BTC/GBP"
+                self.trade, "BTC", "account-id", exchange_pair="BTC/USD"
             )
 
         self.assertTrue(saved)
@@ -412,7 +335,6 @@ class GhostfolioGbpTests(unittest.TestCase):
             patch.object(
                 portfolio_logger, "authenticate_ghostfolio", return_value="jwt"
             ),
-            patch.object(portfolio_logger, "get_gbp_usd_rate", return_value=1.25),
             patch.object(
                 portfolio_logger.requests,
                 "post",
@@ -421,7 +343,7 @@ class GhostfolioGbpTests(unittest.TestCase):
             patch.object(portfolio_logger.time, "sleep") as sleep,
         ):
             saved = portfolio_logger.log_to_ghostfolio(
-                self.trade, "BTC", "account-id", exchange_pair="BTC/GBP"
+                self.trade, "BTC", "account-id", exchange_pair="BTC/USD"
             )
 
         self.assertTrue(saved)
@@ -436,13 +358,12 @@ class GhostfolioGbpTests(unittest.TestCase):
             patch.object(
                 portfolio_logger, "authenticate_ghostfolio", return_value="jwt"
             ),
-            patch.object(portfolio_logger, "get_gbp_usd_rate", return_value=1.25),
             patch.object(
                 portfolio_logger.requests, "post", return_value=mismatch
             ) as post,
         ):
             saved = portfolio_logger.log_to_ghostfolio(
-                self.trade, "BTC", "account-id", exchange_pair="BTC/GBP"
+                self.trade, "BTC", "account-id", exchange_pair="BTC/USD"
             )
 
         self.assertFalse(saved)

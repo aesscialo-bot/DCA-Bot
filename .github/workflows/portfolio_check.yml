@@ -31,6 +31,23 @@ jobs:
     - name: Install dependencies
       run: pip install --upgrade pip && pip install -r requirements.txt
 
+    - name: Load protected production rules
+      if: github.ref == 'refs/heads/main'
+      env:
+        GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! value="$(gh variable get DCA_TARGET_MAP --repo "$GITHUB_REPOSITORY" 2>/dev/null)"; then
+          echo "Could not load DCA_TARGET_MAP; refusing the report." >&2
+          exit 1
+        fi
+        while IFS= read -r line; do
+          [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+        done <<< "$value"
+        delimiter="DCA_${GITHUB_RUN_ID}_${RANDOM}"
+        printf 'DCA_TARGET_MAP<<%s\n%s\n%s\n' "$delimiter" "$value" "$delimiter" >> "$GITHUB_ENV"
+
     - name: Audit bot order state (non-production ref)
       if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
       env:
@@ -50,7 +67,6 @@ jobs:
         DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         
         # Configuration
-        DCA_TARGET_MAP: ${{ vars.DCA_TARGET_MAP }}
         TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Bangkok' }}
         
         # Manual short reports are opt-in; monthly reports include trade history.

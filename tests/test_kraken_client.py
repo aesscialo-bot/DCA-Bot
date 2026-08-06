@@ -38,6 +38,82 @@ def terminal_fill(
     }
 
 
+BUY_ID = "dca-1234567890abcd"
+FUNDING_ID = "dca-fedcba09876543"
+
+
+def configured_usd_exchange(target="BTC/USD"):
+    exchange = MagicMock()
+    exchange.markets = {target: {}, "GBP/USD": {}}
+    exchange.has = {"createMarketBuyOrderWithCost": True}
+    markets = {
+        target: {
+            "limits": {"cost": {"min": 0.5}, "amount": {"min": 0.00005}}
+        },
+        "GBP/USD": {
+            "limits": {"cost": {"min": 1.0}, "amount": {"min": 1.0}}
+        },
+    }
+    exchange.market.side_effect = lambda symbol: markets[symbol]
+    exchange.fetch_ticker.side_effect = lambda symbol: (
+        {"ask": 50_000.0} if symbol == target else
+        {"bid": 1.25, "last": 1.255, "ask": 1.26}
+    )
+    exchange.fetch_balance.return_value = {"free": {"GBP": 100.0, "USD": 999.0}}
+    exchange.amount_to_precision.side_effect = lambda _symbol, value: str(value)
+    exchange.cost_to_precision.side_effect = lambda _symbol, value: str(value)
+    exchange.fetch_open_orders.return_value = []
+    exchange.fetch_closed_orders.return_value = []
+    return exchange
+
+
+def funding_fill(
+    *,
+    order_id="funding-order",
+    client_order_id=FUNDING_ID,
+    filled=10.0,
+    cost=12.5,
+    fee=0.03,
+):
+    return {
+        "id": order_id,
+        "clientOrderId": client_order_id,
+        "symbol": "GBP/USD",
+        "side": "sell",
+        "status": "closed",
+        "filled": filled,
+        "cost": cost,
+        # CCXT's unified fee agrees here, while native fields are authoritative.
+        "fee": {"cost": fee, "currency": "USD"},
+        "info": {"fee": str(fee), "oflags": "fciq"},
+        "lastUpdateTimestamp": 1_700_000_001_000,
+    }
+
+
+def usd_buy_fill(
+    *,
+    target="BTC/USD",
+    order_id="target-order",
+    client_order_id=BUY_ID,
+    filled=0.00025,
+    cost=12.46,
+    fee=0.03,
+):
+    return {
+        "id": order_id,
+        "clientOrderId": client_order_id,
+        "symbol": target,
+        "side": "buy",
+        "status": "closed",
+        "filled": filled,
+        "cost": cost,
+        # Reproduces CCXT's fcib currency-label issue; native fee is quote-valued.
+        "fee": {"cost": fee, "currency": target.split("/")[0]},
+        "info": {"fee": str(fee), "oflags": "fcib"},
+        "lastUpdateTimestamp": 1_700_000_002_000,
+    }
+
+
 class KrakenClientTests(unittest.TestCase):
     def test_market_minimum_helper_is_read_only_and_uses_larger_limit(self):
         exchange = configured_exchange()
@@ -67,13 +143,15 @@ class KrakenClientTests(unittest.TestCase):
         exchange.fetch_ticker.assert_not_called()
         exchange.create_market_buy_order_with_cost.assert_not_called()
 
-    def test_symbol_accepts_only_gbp_pairs(self):
+    def test_symbol_accepts_only_supported_gbp_and_usd_pairs(self):
         self.assertEqual(kraken_client.to_kraken_symbol("BTC_GBP"), "BTC/GBP")
         self.assertEqual(kraken_client.to_kraken_symbol("eth/gbp"), "ETH/GBP")
+        self.assertEqual(kraken_client.to_kraken_symbol("HYPE_USD"), "HYPE/USD")
+        self.assertEqual(kraken_client.to_kraken_symbol("sol/usd"), "SOL/USD")
 
-        for foreign_pair in ("BTC_EUR", "BTC/USD", "BTC_JPY"):
+        for foreign_pair in ("BTC_EUR", "BTC_JPY", "BTC_USDT"):
             with self.subTest(pair=foreign_pair):
-                with self.assertRaisesRegex(ValueError, "Only GBP Kraken pairs"):
+                with self.assertRaisesRegex(ValueError, "Only GBP or USD Kraken pairs"):
                     kraken_client.to_kraken_symbol(foreign_pair)
 
     def test_client_order_id_is_deterministic_unique_and_kraken_sized(self):
@@ -87,6 +165,21 @@ class KrakenClientTests(unittest.TestCase):
         self.assertNotEqual(first, other_market)
         self.assertRegex(first, r"^dca-[0-9a-f]{14}$")
         self.assertLessEqual(len(first), 18)
+
+        funding = kraken_client.build_client_order_id(
+            "BTC_GBP", "2026-08-04", purpose="funding"
+        )
+        self.assertNotEqual(first, funding)
+        self.assertEqual(
+            funding,
+            kraken_client.build_client_order_id(
+                "btc/gbp", "2026-08-04", purpose="funding"
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "purpose"):
+            kraken_client.build_client_order_id(
+                "BTC_GBP", "2026-08-04", purpose="other"
+            )
 
     @patch.object(kraken_client.time, "sleep")
     @patch.object(kraken_client, "get_kraken_exchange")
@@ -557,6 +650,291 @@ class KrakenClientTests(unittest.TestCase):
             )
 
         exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    def test_usd_market_minimum_is_converted_to_gbp_with_funding_buffer(self):
+        exchange = configured_usd_exchange()
+
+        result = kraken_client.get_market_minimum_gbp(
+            "BTC_USD", exchange=exchange
+        )
+
+        self.assertEqual(result["pair"], "BTC/USD")
+        self.assertEqual(result["quote_currency"], "USD")
+        self.assertEqual(result["effective_minimum_quote"], 2.5)
+        self.assertEqual(result["gbp_usd_rate"], 1.25)
+        self.assertEqual(result["funding_minimum_gbp"], 1.0)
+        self.assertAlmostEqual(
+            result["effective_minimum_gbp"], 2.5 / (1.25 * 0.99)
+        )
+        exchange.create_market_sell_order.assert_not_called()
+        exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_direct_gbp_buy_rejects_usd_target(self, get_exchange):
+        exchange = configured_usd_exchange()
+        get_exchange.return_value = exchange
+
+        with self.assertRaisesRegex(
+            kraken_client.KrakenPreSubmissionError,
+            "place_gbp_funded_market_buy",
+        ):
+            kraken_client.place_market_buy("BTC_USD", 10)
+
+        exchange.fetch_open_orders.assert_not_called()
+        exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    @patch.object(kraken_client, "_submission_deadline", return_value="deadline")
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_gbp_funded_buy_executes_exact_two_leg_flow(
+        self, get_exchange, _deadline
+    ):
+        exchange = configured_usd_exchange()
+        exchange.create_market_sell_order.return_value = funding_fill()
+        exchange.create_market_buy_order_with_cost.return_value = usd_buy_fill()
+        get_exchange.return_value = exchange
+        final_check = MagicMock()
+
+        result = kraken_client.place_gbp_funded_market_buy(
+            "BTC_USD",
+            10,
+            BUY_ID,
+            FUNDING_ID,
+            pre_submit_check=final_check,
+        )
+
+        exchange.create_market_sell_order.assert_called_once_with(
+            "GBP/USD",
+            10.0,
+            {
+                "clientOrderId": FUNDING_ID,
+                "deadline": "deadline",
+                "oflags": "fciq",
+            },
+        )
+        exchange.create_market_buy_order_with_cost.assert_called_once_with(
+            "BTC/USD",
+            12.47,
+            {
+                "clientOrderId": BUY_ID,
+                "deadline": "deadline",
+                "oflags": "fcib",
+            },
+        )
+        self.assertEqual(final_check.call_count, 2)
+        self.assertEqual(result["funding_order_id"], "funding-order")
+        self.assertEqual(result["order_id"], "target-order")
+        self.assertEqual(result["spent_gbp"], 10)
+        self.assertAlmostEqual(result["cost_gbp"], 12.46 / 1.25)
+        self.assertEqual(result["gbp_fee_debit"], 0)
+        self.assertEqual(result["funded_usd"], 12.47)
+        self.assertEqual(result["usd_received"], 12.47)
+        self.assertEqual(result["cost_usd"], 12.46)
+        self.assertEqual(result["funding_fee_usd"], 0.03)
+        self.assertEqual(result["crypto_fee_usd"], 0.03)
+        self.assertEqual(result["fee_usd"], 0.03)
+        self.assertEqual(result["combined_fee_usd"], 0.06)
+        self.assertEqual(result["usd_fee_debit"], 0)
+        self.assertAlmostEqual(result["unused_usd"], 0.01)
+        self.assertEqual(result["gbp_usd_rate"], 1.25)
+        self.assertAlmostEqual(result["fee_gbp"], 0.06 / 1.25)
+        self.assertEqual(
+            {detail["leg"] for detail in result["fee_details"]},
+            {"funding", "buy"},
+        )
+        self.assertLess(result["received"], 0.00025)
+
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_gbp_funded_buy_checks_free_gbp_before_funding(self, get_exchange):
+        exchange = configured_usd_exchange()
+        exchange.fetch_balance.return_value = {"free": {"GBP": 9.99}}
+        get_exchange.return_value = exchange
+
+        with self.assertRaisesRegex(
+            kraken_client.KrakenPreSubmissionError, "Insufficient free GBP"
+        ):
+            kraken_client.place_gbp_funded_market_buy(
+                "BTC_USD", 10, BUY_ID, FUNDING_ID
+            )
+
+        exchange.create_market_sell_order.assert_not_called()
+        exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_gbp_funded_buy_requires_exact_gbp_precision(self, get_exchange):
+        exchange = configured_usd_exchange()
+        exchange.amount_to_precision.side_effect = None
+        exchange.amount_to_precision.return_value = "9.99"
+        get_exchange.return_value = exchange
+
+        with self.assertRaisesRegex(
+            kraken_client.KrakenPreSubmissionError,
+            "cannot represent the exact",
+        ):
+            kraken_client.place_gbp_funded_market_buy(
+                "BTC_USD", 10, BUY_ID, FUNDING_ID
+            )
+
+        exchange.create_market_sell_order.assert_not_called()
+
+    @patch.object(kraken_client, "get_market_minimum_gbp")
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_net_funding_below_fresh_target_minimum_never_buys(
+        self, get_exchange, get_minimum
+    ):
+        exchange = configured_usd_exchange()
+        exchange.create_market_sell_order.return_value = funding_fill()
+        get_exchange.return_value = exchange
+        get_minimum.side_effect = [
+            {"effective_minimum_gbp": 1.0, "effective_minimum_quote": 0.5},
+            {"effective_minimum_gbp": 20.0, "effective_minimum_quote": 20.0},
+        ]
+
+        with self.assertRaisesRegex(
+            kraken_client.KrakenOrderStateUnknown,
+            "funding is complete.*below Kraken's current",
+        ):
+            kraken_client.place_gbp_funded_market_buy(
+                "BTC_USD", 10, BUY_ID, FUNDING_ID
+            )
+
+        exchange.create_market_sell_order.assert_called_once()
+        exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_reconcile_only_never_submits_missing_crypto_leg(self, get_exchange):
+        exchange = configured_usd_exchange()
+        exchange.fetch_closed_orders.side_effect = lambda symbol, params: (
+            [funding_fill()] if symbol == "GBP/USD" else []
+        )
+        get_exchange.return_value = exchange
+
+        with self.assertRaisesRegex(
+            kraken_client.KrakenOrderStateUnknown,
+            "funding order is confirmed.*will not submit",
+        ):
+            kraken_client.place_gbp_funded_market_buy(
+                "BTC_USD",
+                10,
+                BUY_ID,
+                FUNDING_ID,
+                reconcile_only=True,
+            )
+
+        exchange.create_market_sell_order.assert_not_called()
+        exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_reconciles_both_closed_legs_without_duplicate(self, get_exchange):
+        exchange = configured_usd_exchange()
+        exchange.fetch_closed_orders.side_effect = lambda symbol, params: (
+            [funding_fill()] if symbol == "GBP/USD" else [usd_buy_fill()]
+        )
+        get_exchange.return_value = exchange
+
+        result = kraken_client.place_gbp_funded_market_buy(
+            "BTC_USD",
+            10,
+            BUY_ID,
+            FUNDING_ID,
+            reconcile_only=True,
+        )
+
+        self.assertEqual(result["order_id"], "target-order")
+        exchange.fetch_balance.assert_not_called()
+        exchange.create_market_sell_order.assert_not_called()
+        exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    @patch.object(kraken_client, "_submission_deadline", return_value="deadline")
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_ambiguous_funding_submission_reconciles_without_duplicate_sell(
+        self, get_exchange, _deadline
+    ):
+        exchange = configured_usd_exchange()
+        funding_closed_calls = 0
+
+        def closed_orders(symbol, params):
+            nonlocal funding_closed_calls
+            if symbol != "GBP/USD":
+                return []
+            funding_closed_calls += 1
+            return [] if funding_closed_calls == 1 else [funding_fill()]
+
+        exchange.fetch_closed_orders.side_effect = closed_orders
+        exchange.create_market_sell_order.side_effect = TimeoutError("lost")
+        exchange.create_market_buy_order_with_cost.return_value = usd_buy_fill()
+        get_exchange.return_value = exchange
+
+        result = kraken_client.place_gbp_funded_market_buy(
+            "BTC_USD", 10, BUY_ID, FUNDING_ID
+        )
+
+        self.assertEqual(result["order_id"], "target-order")
+        exchange.create_market_sell_order.assert_called_once()
+        exchange.create_market_buy_order_with_cost.assert_called_once()
+
+    @patch.object(kraken_client, "_submission_deadline", return_value="deadline")
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_ambiguous_crypto_submission_reconciles_without_second_buy(
+        self, get_exchange, _deadline
+    ):
+        exchange = configured_usd_exchange()
+        target_closed_calls = 0
+
+        def closed_orders(symbol, params):
+            nonlocal target_closed_calls
+            if symbol == "GBP/USD":
+                return []
+            target_closed_calls += 1
+            return [usd_buy_fill()] if target_closed_calls >= 3 else []
+
+        exchange.fetch_closed_orders.side_effect = closed_orders
+        exchange.create_market_sell_order.return_value = funding_fill()
+        exchange.create_market_buy_order_with_cost.side_effect = TimeoutError("lost")
+        get_exchange.return_value = exchange
+
+        result = kraken_client.place_gbp_funded_market_buy(
+            "BTC_USD", 10, BUY_ID, FUNDING_ID
+        )
+
+        self.assertEqual(result["order_id"], "target-order")
+        exchange.create_market_buy_order_with_cost.assert_called_once()
+
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_nonexact_funding_fill_retains_intent_and_never_buys(self, get_exchange):
+        exchange = configured_usd_exchange()
+        exchange.create_market_sell_order.return_value = funding_fill(filled=9.99)
+        get_exchange.return_value = exchange
+
+        with self.assertRaisesRegex(
+            kraken_client.KrakenOrderStateUnknown, "exact configured GBP budget"
+        ):
+            kraken_client.place_gbp_funded_market_buy(
+                "BTC_USD", 10, BUY_ID, FUNDING_ID
+            )
+
+        exchange.create_market_sell_order.assert_called_once()
+        exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    def test_usd_fee_normalisation_uses_pair_quote_currency(self):
+        sell = kraken_client._normalise_terminal_fill(
+            funding_fill(),
+            "GBP/USD",
+            FUNDING_ID,
+            expected_side="sell",
+        )
+        buy = kraken_client._normalise_terminal_fill(
+            usd_buy_fill(),
+            "BTC/USD",
+            BUY_ID,
+        )
+
+        self.assertEqual(sell["received"], 12.47)
+        self.assertEqual(sell["spent"], 10)
+        self.assertEqual(sell["quote_fee_debit"], 0.03)
+        self.assertEqual(sell["fee_details"][0]["currency"], "USD")
+        self.assertEqual(buy["quote_fee_debit"], 0)
+        self.assertEqual(buy["fee_quote"], 0.03)
+        self.assertEqual(buy["fee_details"][0]["currency"], "BTC")
 
 
 if __name__ == "__main__":

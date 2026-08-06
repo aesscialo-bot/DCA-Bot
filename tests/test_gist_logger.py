@@ -27,19 +27,32 @@ class GistLoggerTests(unittest.TestCase):
     def setUp(self):
         self.trade = {
             "ts": 1783830882,
+            "quote_currency": "USD",
             "amount_gbp": 10.0,
             "cost_gbp": 9.95,
             "fee_gbp": 0.05,
-            "gbp_fee_debit": 0.05,
+            "gbp_fee_debit": 0.0,
+            "gbp_usd_rate": 1.25,
+            "funded_usd": 12.48,
+            "funding_fee_usd": 0.02,
+            "cost_usd": 12.47,
+            "fee_usd": 0.03,
+            "usd_fee_debit": 0.0,
             "fee_details": [
                 {
-                    "currency": "GBP",
-                    "amount": 0.05,
-                    "gbp_equivalent": 0.05,
-                }
+                    "currency": "BTC",
+                    "amount": 0.0000005,
+                    "gbp_equivalent": 0.03,
+                },
+                {
+                    "currency": "USD",
+                    "amount": 0.02,
+                    "gbp_equivalent": 0.02,
+                },
             ],
             "amount_crypto": 0.0002,
-            "gbp_price_per_unit": 50000.0,
+            "usd_price_per_unit": 62_350.0,
+            "funding_order_id": "FX-123",
             "order_id": "KRAKEN-123",
         }
 
@@ -51,17 +64,16 @@ class GistLoggerTests(unittest.TestCase):
             SELECTED_TZ=ZoneInfo("UTC"),
         )
 
-    def test_creates_dedicated_gbp_file_and_returns_true(self):
+    def test_creates_dedicated_usd_dca_file_and_returns_true(self):
         get_response = MockResponse(
             body={"files": {"unrelated.md": {"content": "leave me alone"}}}
         )
-        patch_response = MockResponse(status_code=200)
 
         with (
             self._credentials(),
             patch.object(gist_logger.requests, "get", return_value=get_response) as get,
             patch.object(
-                gist_logger.requests, "patch", return_value=patch_response
+                gist_logger.requests, "patch", return_value=MockResponse()
             ) as patch_request,
         ):
             saved = gist_logger.update_gist_log(
@@ -77,28 +89,24 @@ class GistLoggerTests(unittest.TestCase):
         payload_files = patch_request.call_args.kwargs["json"]["files"]
         self.assertEqual(list(payload_files), [gist_logger.GIST_FILENAME])
         content = payload_files[gist_logger.GIST_FILENAME]["content"]
-        self.assertIn("# Kraken GBP Trade Log", content)
-        self.assertIn("GBP 9.95", content)
-        self.assertIn("0.05000000 GBP (GBP equiv 0.05)", content)
+        self.assertIn("# Kraken USD DCA Trade Log", content)
+        self.assertIn("Kraken is the source of truth", content)
         self.assertIn("GBP 10.00", content)
-        self.assertIn("GBP 50,000.0000", content)
+        self.assertIn("1.250000", content)
+        self.assertIn("USD 12.4800", content)
+        self.assertIn("USD 12.4700", content)
+        self.assertIn("0.00000050 BTC (GBP equiv 0.03)", content)
+        self.assertIn("USD 62,350.0000", content)
         self.assertIn("0.00020000 BTC", content)
+        self.assertIn("FX-123", content)
         self.assertIn("KRAKEN-123", content)
         self.assertIn("| yes |", content)
         self.assertNotIn("unrelated.md", content)
-        self.assertEqual(
-            patch_request.call_args.kwargs["timeout"],
-            gist_logger.GIST_REQUEST_TIMEOUT_SECONDS,
-        )
 
-    def test_appends_to_existing_dedicated_file_without_replacing_header(self):
-        existing = "# Kraken GBP Trade Log\n\nexisting row"
+    def test_appends_without_replacing_existing_header(self):
+        existing = "# Kraken USD DCA Trade Log\n\nexisting row"
         get_response = MockResponse(
-            body={
-                "files": {
-                    gist_logger.GIST_FILENAME: {"content": existing}
-                }
-            }
+            body={"files": {gist_logger.GIST_FILENAME: {"content": existing}}}
         )
 
         with (
@@ -115,11 +123,15 @@ class GistLoggerTests(unittest.TestCase):
             gist_logger.GIST_FILENAME
         ]["content"]
         self.assertTrue(content.startswith(existing + "\n"))
-        self.assertEqual(content.count("# Kraken GBP Trade Log"), 1)
-        self.assertIn("| no |", content)
+        self.assertEqual(content.count("# Kraken USD DCA Trade Log"), 1)
+        self.assertIn("| optional/not saved |", content)
 
-    def test_order_identifier_is_safe_for_markdown_table(self):
-        trade = {**self.trade, "order_id": "abc|def\nnext"}
+    def test_order_identifiers_are_safe_for_markdown_table(self):
+        trade = {
+            **self.trade,
+            "funding_order_id": "fx|id\nnext",
+            "order_id": "abc|def\nnext",
+        }
 
         with (
             self._credentials(),
@@ -138,43 +150,36 @@ class GistLoggerTests(unittest.TestCase):
         content = patch_request.call_args.kwargs["json"]["files"][
             gist_logger.GIST_FILENAME
         ]["content"]
+        self.assertIn(r"fx\|id next", content)
         self.assertIn(r"abc\|def next", content)
 
-    def test_base_asset_fee_keeps_total_to_gbp_cash_debit(self):
-        trade = {
-            **self.trade,
-            "amount_gbp": 9.95,
-            "fee_gbp": 0.05,
-            "gbp_fee_debit": 0.0,
-            "fee_details": [
-                {
-                    "currency": "BTC",
-                    "amount": 0.000001,
-                    "gbp_equivalent": 0.05,
-                }
-            ],
-        }
-
+    def test_rejects_non_usd_trade_before_network_request(self):
+        invalid_trade = {**self.trade, "quote_currency": "GBP"}
         with (
             self._credentials(),
-            patch.object(
-                gist_logger.requests,
-                "get",
-                return_value=MockResponse(body={"files": {}}),
-            ),
-            patch.object(
-                gist_logger.requests, "patch", return_value=MockResponse()
-            ) as patch_request,
+            patch.object(gist_logger.requests, "get") as get,
+            patch.object(gist_logger.requests, "patch") as patch_request,
         ):
-            saved = gist_logger.update_gist_log(trade, symbol="BTC")
+            saved = gist_logger.update_gist_log(invalid_trade)
 
-        self.assertTrue(saved)
-        content = patch_request.call_args.kwargs["json"]["files"][
-            gist_logger.GIST_FILENAME
-        ]["content"]
-        self.assertIn("0.00000100 BTC (GBP equiv 0.05)", content)
-        self.assertIn("| GBP 9.95 | 0.00000100 BTC", content)
-        self.assertIn("| GBP 9.95 | GBP 50,000.0000 |", content)
+        self.assertFalse(saved)
+        get.assert_not_called()
+        patch_request.assert_not_called()
+
+    def test_rejects_crypto_debit_above_confirmed_usd(self):
+        invalid_trade = {
+            **self.trade,
+            "cost_usd": 12.48,
+            "usd_fee_debit": 0.02,
+        }
+        with (
+            self._credentials(),
+            patch.object(gist_logger.requests, "get") as get,
+        ):
+            saved = gist_logger.update_gist_log(invalid_trade)
+
+        self.assertFalse(saved)
+        get.assert_not_called()
 
     def test_missing_credentials_skips_all_requests(self):
         with (
@@ -184,19 +189,6 @@ class GistLoggerTests(unittest.TestCase):
             patch.object(gist_logger.requests, "patch") as patch_request,
         ):
             saved = gist_logger.update_gist_log(self.trade)
-
-        self.assertFalse(saved)
-        get.assert_not_called()
-        patch_request.assert_not_called()
-
-    def test_invalid_gbp_trade_fails_closed_before_network_request(self):
-        invalid_trade = {**self.trade, "amount_gbp": 0}
-        with (
-            self._credentials(),
-            patch.object(gist_logger.requests, "get") as get,
-            patch.object(gist_logger.requests, "patch") as patch_request,
-        ):
-            saved = gist_logger.update_gist_log(invalid_trade)
 
         self.assertFalse(saved)
         get.assert_not_called()

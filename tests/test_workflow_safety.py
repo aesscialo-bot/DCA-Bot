@@ -48,12 +48,53 @@ class WorkflowSafetyTests(unittest.TestCase):
             'echo "$DCA_EXECUTION_STATE"',
             "print(os.environ['DCA_TARGET_MAP'])",
             'print(os.environ["DCA_TARGET_MAP"])',
+            "DCA_TARGET_MAP: ${{ vars.DCA_TARGET_MAP }}",
+            "DCA_ANALYSIS_STATE: ${{ vars.DCA_ANALYSIS_STATE",
+            "DCA_EXECUTION_STATE: ${{ vars.DCA_EXECUTION_STATE",
         )
         for path in WORKFLOWS.glob("*.yml"):
             text = path.read_text(encoding="utf-8")
             for value in forbidden:
                 with self.subTest(workflow=path.name, forbidden=value):
                     self.assertNotIn(value, text)
+
+    def test_production_json_is_loaded_and_masked_inside_workflows(self):
+        required_variables = {
+            "crypto_analysis.yml": ("DCA_TARGET_MAP", "DCA_ANALYSIS_STATE"),
+            "daily_dca.yml": (
+                "DCA_TARGET_MAP",
+                "DCA_ANALYSIS_STATE",
+                "DCA_EXECUTION_STATE",
+            ),
+            "portfolio_check.yml": ("DCA_TARGET_MAP",),
+        }
+        for name, variables in required_variables.items():
+            text = self._read(name)
+            with self.subTest(workflow=name):
+                self.assertIn("::add-mask::%s", text)
+                self.assertIn("$GITHUB_ENV", text)
+                for variable in variables:
+                    self.assertTrue(
+                        f"gh variable get {variable}" in text
+                        or f"load_variable {variable}" in text,
+                        f"{name} does not load {variable}",
+                    )
+
+    def test_workflow_inputs_and_steps_describe_usd_targets_only(self):
+        analysis = self._read("crypto_analysis.yml")
+        writer = self._read("update_dca_config.yml")
+        self.assertIn("BTC, HYPE, SOL, a canonical USD pair, or all", analysis)
+        self.assertIn("Analyze Kraken USD markets", analysis)
+        self.assertNotIn("ETH", analysis)
+        self.assertNotIn("ADA", analysis)
+        self.assertIn("BTC_USD, HYPE_USD, or SOL_USD", writer)
+        self.assertNotIn("Canonical Kraken GBP key", writer)
+
+    def test_start_date_gate_is_passed_to_analysis_and_trader(self):
+        for name in ("crypto_analysis.yml", "daily_dca.yml"):
+            text = self._read(name)
+            with self.subTest(workflow=name):
+                self.assertIn("DCA_START_DATE: ${{ vars.DCA_START_DATE }}", text)
 
     def test_enable_writer_receives_global_pre_state_and_execution_state(self):
         text = self._read("update_dca_config.yml")

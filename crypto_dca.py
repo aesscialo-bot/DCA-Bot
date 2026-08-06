@@ -1,4 +1,4 @@
-"""Fail-closed execution of analysis-bound GBP spot purchases on Kraken."""
+"""Fail-closed execution of GBP-budgeted USD spot purchases on Kraken."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import requests
 from dca_config import (
     ALLOWED_TARGETS,
     ConfigError,
+    decision_analyzed_on_or_after,
     decision_age_minutes,
     effective_amount,
     is_execution_window,
@@ -29,7 +30,7 @@ from kraken_client import (
     KrakenPreSubmissionError,
     KrakenOrderStateUnknown,
     build_client_order_id,
-    place_market_buy,
+    place_gbp_funded_market_buy,
 )
 
 
@@ -37,10 +38,11 @@ TIMEZONE_NAME = os.environ.get("TIMEZONE", "Asia/Bangkok")
 SELECTED_TZ = ZoneInfo(TIMEZONE_NAME)
 MIN_DCA_GBP = 5.0
 MAX_DCA_GBP = 1000.0
-DCA_TARGET_MAP_JSON = os.environ.get("DCA_TARGET_MAP", "{}")
-DCA_ANALYSIS_STATE_JSON = os.environ.get("DCA_ANALYSIS_STATE", "{}")
-DCA_EXECUTION_STATE_JSON = os.environ.get("DCA_EXECUTION_STATE", "{}")
+DCA_TARGET_MAP_JSON = os.environ.get("DCA_TARGET_MAP", "")
+DCA_ANALYSIS_STATE_JSON = os.environ.get("DCA_ANALYSIS_STATE", "")
+DCA_EXECUTION_STATE_JSON = os.environ.get("DCA_EXECUTION_STATE", "")
 DCA_SYMBOLS_JSON = os.environ.get("DCA_SYMBOLS_JSON", "")
+DCA_START_DATE = os.environ.get("DCA_START_DATE", "").strip()
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 RULES_VARIABLE = "DCA_TARGET_MAP"
@@ -66,7 +68,7 @@ def send_discord_alert(message, is_error=False):
     payload = {
         "embeds": [
             {
-                "title": "Kraken GBP DCA Execution",
+                "title": "Kraken Automated DCA Execution",
                 "description": message,
                 "color": 16711680 if is_error else 65280,
                 "timestamp": datetime.now(SELECTED_TZ).isoformat(),
@@ -102,6 +104,32 @@ def _parse_trade_date(value, target: str) -> str:
     if parsed.isoformat() != value:
         raise ValueError(f"{target}.trade_date must be YYYY-MM-DD")
     return value
+
+
+def _configured_start_date() -> date | None:
+    """Return the optional local first trading date, failing closed if malformed."""
+
+    if not DCA_START_DATE:
+        return None
+    try:
+        parsed = date.fromisoformat(DCA_START_DATE)
+    except ValueError as error:
+        raise ValueError("DCA_START_DATE must be YYYY-MM-DD") from error
+    if parsed.isoformat() != DCA_START_DATE:
+        raise ValueError("DCA_START_DATE must be YYYY-MM-DD")
+    return parsed
+
+
+def _assert_start_date_reached(now: datetime) -> None:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("start-date check requires a timezone-aware timestamp")
+    start_date = _configured_start_date()
+    local_date = now.astimezone(SELECTED_TZ).date()
+    if start_date is not None and local_date < start_date:
+        raise KrakenPreSubmissionError(
+            f"Automated trading starts on {start_date.isoformat()} "
+            f"{SELECTED_TZ.key}; today is {local_date.isoformat()}"
+        )
 
 
 def _parse_symbol_filter(value) -> tuple[str, ...]:
@@ -141,6 +169,7 @@ def _normalise_pending_order(pending, target: str) -> dict:
         raise ValueError(f"{target}.PENDING_ORDER must be an object")
     expected_fields = {
         "client_order_id",
+        "funding_client_order_id",
         "trade_date",
         "amount_gbp",
         "decision_id",
@@ -152,6 +181,7 @@ def _normalise_pending_order(pending, target: str) -> dict:
             + ", ".join(sorted(expected_fields))
         )
     client_order_id = pending["client_order_id"]
+    funding_client_order_id = pending["funding_client_order_id"]
     trade_date = pending["trade_date"]
     amount_gbp = pending["amount_gbp"]
     decision_id = pending["decision_id"]
@@ -160,12 +190,19 @@ def _normalise_pending_order(pending, target: str) -> dict:
         or not _CLIENT_ORDER_ID_PATTERN.fullmatch(client_order_id)
     ):
         raise ValueError(f"{target} has an invalid pending client order ID")
+    if (
+        not isinstance(funding_client_order_id, str)
+        or not _CLIENT_ORDER_ID_PATTERN.fullmatch(funding_client_order_id)
+        or funding_client_order_id == client_order_id
+    ):
+        raise ValueError(f"{target} has an invalid pending funding client order ID")
     _parse_trade_date(trade_date, target)
     amount_gbp = _parse_amount_gbp(amount_gbp)
     if not isinstance(decision_id, str) or not decision_id.strip():
         raise ValueError(f"{target}.PENDING_ORDER requires decision_id")
     normalized = {
         "client_order_id": client_order_id,
+        "funding_client_order_id": funding_client_order_id,
         "trade_date": trade_date,
         "amount_gbp": amount_gbp,
         "decision_id": decision_id,
@@ -182,16 +219,16 @@ def _pending_order_for_symbol(execution_state, symbol_key):
     return _normalise_pending_order(pending, symbol_key) if pending else None
 
 
-def get_config_for_symbol(symbol_gbp, target_map, execution_state=None):
+def get_config_for_symbol(symbol_key, target_map, execution_state=None):
     """Return one normalized final-schema rule plus its trader-owned state."""
     rules = validate_rules_map(target_map, require_all=False)
-    if symbol_gbp not in rules:
-        raise ValueError(f"No DCA configuration exists for {symbol_gbp}")
+    if symbol_key not in rules:
+        raise ValueError(f"No DCA configuration exists for {symbol_key}")
     state = validate_execution_state(execution_state or {})
-    state_entry = state.get(symbol_gbp, {"LAST_BUY_DATE": ""})
+    state_entry = state.get(symbol_key, {"LAST_BUY_DATE": ""})
     return {
-        "KEY": symbol_gbp,
-        **rules[symbol_gbp],
+        "KEY": symbol_key,
+        **rules[symbol_key],
         "LAST_BUY_DATE": state_entry.get("LAST_BUY_DATE", ""),
         "PENDING_ORDER": state_entry.get(PENDING_ORDER_FIELD),
     }
@@ -274,8 +311,33 @@ def fetch_live_execution_state():
     return validate_execution_state(state)
 
 
+def _initial_rules_map():
+    """Load rules without exposing complete production JSON in workflow env logs."""
+
+    if DCA_TARGET_MAP_JSON.strip():
+        return validate_rules_map(json.loads(DCA_TARGET_MAP_JSON))
+    return fetch_live_target_map()
+
+
+def _initial_analysis_state():
+    if DCA_ANALYSIS_STATE_JSON.strip():
+        return validate_analysis_state(json.loads(DCA_ANALYSIS_STATE_JSON))
+    return fetch_live_analysis_state()
+
+
+def _initial_execution_state():
+    if DCA_EXECUTION_STATE_JSON.strip():
+        return validate_execution_state(json.loads(DCA_EXECUTION_STATE_JSON))
+    return fetch_live_execution_state()
+
+
 def prepare_order_intent(
-    symbol_key, client_order_id, trade_date, amount_gbp, decision_id
+    symbol_key,
+    client_order_id,
+    funding_client_order_id,
+    trade_date,
+    amount_gbp,
+    decision_id,
 ):
     """Persist an analysis-bound intent before Kraken can receive AddOrder."""
     if symbol_key not in ALLOWED_TARGETS:
@@ -284,6 +346,11 @@ def prepare_order_intent(
     amount_gbp = _parse_amount_gbp(amount_gbp)
     if not _CLIENT_ORDER_ID_PATTERN.fullmatch(client_order_id):
         raise ValueError("Invalid deterministic client order ID")
+    if (
+        not _CLIENT_ORDER_ID_PATTERN.fullmatch(funding_client_order_id)
+        or funding_client_order_id == client_order_id
+    ):
+        raise ValueError("Invalid deterministic funding client order ID")
     if not isinstance(decision_id, str) or not decision_id.strip():
         raise ValueError("decision_id is required for a durable order intent")
 
@@ -300,6 +367,7 @@ def prepare_order_intent(
 
     pending = {
         "client_order_id": client_order_id,
+        "funding_client_order_id": funding_client_order_id,
         "trade_date": trade_date,
         "amount_gbp": amount_gbp,
         "decision_id": decision_id,
@@ -310,7 +378,7 @@ def prepare_order_intent(
     _gha_mask(client_order_id)
     print(
         f"Persisted durable Kraken order intent for {symbol_key} "
-        f"({client_order_id}).",
+        f"(buy={client_order_id}, funding={funding_client_order_id}).",
         flush=True,
     )
     return pending, False
@@ -376,8 +444,14 @@ def _decision_gate(symbol, rule, decision, now):
         execute_at = parse_utc_iso(decision["EXECUTE_AT"])
         valid_until = parse_utc_iso(decision["VALID_UNTIL"])
         age_minutes = decision_age_minutes(decision, now)
+        start_date = _configured_start_date()
+        analyzed_after_start = decision_analyzed_on_or_after(
+            decision, start_date, SELECTED_TZ
+        )
     except (ConfigError, TypeError, ValueError) as error:
         return "ERROR", f"analysis timestamps are invalid: {error}", None
+    if not analyzed_after_start:
+        return "ERROR", "analysis decision predates the automated trading start date", None
     if age_minutes < -1:
         return "ERROR", "analysis decision timestamp is in the future", None
     if now < execute_at - timedelta(minutes=5):
@@ -403,6 +477,7 @@ def _revalidate_trade_intent(
 ):
     """Re-fetch every live state and fail if any spend-affecting value changed."""
     current_time = now or _utc_now()
+    _assert_start_date_reached(current_time)
     live_rules = fetch_live_target_map()
     # Validate analysis structure globally, then bind only this asset's decision
     # below.  A disabled asset with newly edited budgets must not block an
@@ -449,7 +524,7 @@ def _post_trade_logs(trade_data, base_symbol, exchange_pair):
     try:
         from portfolio_logger import get_account_id, log_to_ghostfolio
 
-        portfolio_map = json.loads(os.environ.get("PORTFOLIO_ACCOUNT_MAP", "{}"))
+        portfolio_map = json.loads(os.environ.get("PORTFOLIO_ACCOUNT_MAP") or "{}")
         account_id = get_account_id(base_symbol, portfolio_map)
         if account_id:
             ghostfolio_saved = bool(
@@ -498,9 +573,11 @@ def execute_trade(
             intent_was_existing = True
             amount_gbp = intent["amount_gbp"]
             _gha_mask(intent["client_order_id"])
+            _gha_mask(intent["funding_client_order_id"])
             print(
                 f"Reconciling durable Kraken order intent for {key} "
-                f"({intent['client_order_id']}).",
+                f"(buy={intent['client_order_id']}, "
+                f"funding={intent['funding_client_order_id']}).",
                 flush=True,
             )
         else:
@@ -519,9 +596,17 @@ def execute_trade(
                     f"{key} requested amount does not match the live decision tier"
                 )
             decision_id = expected_decision["DECISION_ID"]
-            client_order_id = build_client_order_id(key, today)
+            client_order_id = build_client_order_id(key, today, purpose="buy")
+            funding_client_order_id = build_client_order_id(
+                key, today, purpose="funding"
+            )
             intent, intent_was_existing = prepare_order_intent(
-                key, client_order_id, today, amount_gbp, decision_id
+                key,
+                client_order_id,
+                funding_client_order_id,
+                today,
+                amount_gbp,
+                decision_id,
             )
             if not intent_was_existing:
                 try:
@@ -539,6 +624,7 @@ def execute_trade(
                     ) from validation_error
 
         client_order_id = intent["client_order_id"]
+        funding_client_order_id = intent["funding_client_order_id"]
         amount_gbp = _parse_amount_gbp(intent["amount_gbp"])
         _gha_mask(str(amount_gbp))
         _gha_mask(f"{amount_gbp:.2f}")
@@ -556,10 +642,11 @@ def execute_trade(
                     expected_pending=intent,
                 )
 
-        order_data = place_market_buy(
+        order_data = place_gbp_funded_market_buy(
             key,
             amount_gbp,
             client_order_id=client_order_id,
+            funding_client_order_id=funding_client_order_id,
             reconcile_only=intent_was_existing,
             pre_submit_check=final_live_state_check,
         )
@@ -599,15 +686,24 @@ def execute_trade(
 
     try:
         order_id = order_data["order_id"]
+        funding_order_id = order_data["funding_order_id"]
         exchange_pair = order_data["pair"]
         cost_gbp = float(order_data["cost_gbp"])
         fee_gbp = float(order_data["fee_gbp"])
         gbp_fee_debit = float(order_data["gbp_fee_debit"])
         fee_details = order_data["fee_details"]
         spent_gbp = float(order_data["spent_gbp"])
+        funded_usd = float(order_data["funded_usd"])
+        cost_usd = float(order_data["cost_usd"])
+        fee_usd = float(order_data["fee_usd"])
+        funding_fee_usd = float(order_data["funding_fee_usd"])
+        usd_fee_debit = float(order_data["usd_fee_debit"])
+        gbp_usd_rate = float(order_data["gbp_usd_rate"])
         received_amount = float(order_data["received"])
         market_price = float(order_data["market_gbp_price_per_unit"])
         effective_price = float(order_data["effective_gbp_price_per_unit"])
+        market_usd_price = float(order_data["market_usd_price_per_unit"])
+        effective_usd_price = float(order_data["effective_usd_price_per_unit"])
         execution_timestamp = int(order_data["timestamp"])
     except (KeyError, TypeError, ValueError) as error:
         message = (
@@ -619,6 +715,7 @@ def execute_trade(
         return False
 
     _gha_mask(str(order_id))
+    _gha_mask(str(funding_order_id))
     _gha_mask(f"{cost_gbp:.2f}")
     _gha_mask(f"{fee_gbp:.2f}")
     _gha_mask(f"{spent_gbp:.2f}")
@@ -657,38 +754,50 @@ def execute_trade(
         "effective_gbp_price_per_unit": effective_price,
         "exchange_pair": exchange_pair,
         "decision_id": intent["decision_id"],
+        "quote_currency": "USD",
+        "cost_usd": cost_usd,
+        "fee_usd": fee_usd,
+        "funding_fee_usd": funding_fee_usd,
+        "usd_fee_debit": usd_fee_debit,
+        "funded_usd": funded_usd,
+        "gbp_usd_rate": gbp_usd_rate,
+        "usd_price_per_unit": market_usd_price,
+        "effective_usd_price_per_unit": effective_usd_price,
+        "funding_order_id": funding_order_id,
     }
-    ghostfolio_saved = _post_trade_logs(trade_data, base_symbol, exchange_pair)
+    _post_trade_logs(trade_data, base_symbol, exchange_pair)
     execution_time = datetime.fromtimestamp(
         execution_timestamp, tz=SELECTED_TZ
     ).strftime("%Y-%m-%d %H:%M:%S")
     message = (
         "DCA buy executed and confirmed.\n"
         f"**Pair:** {exchange_pair}\n"
-        f"**Order cost:** £{cost_gbp:,.2f}\n"
-        f"**Kraken fee (GBP equivalent):** £{fee_gbp:,.2f}\n"
-        f"**Fee charged from GBP:** £{gbp_fee_debit:,.2f}\n"
+        f"**GBP budget/debit:** £{spent_gbp:,.2f}\n"
+        f"**USD funded:** ${funded_usd:,.2f}\n"
+        f"**Crypto order cost:** ${cost_usd:,.2f}\n"
+        f"**FX fee:** ${funding_fee_usd:,.4f}\n"
+        f"**Crypto fee (USD equivalent):** ${fee_usd:,.4f}\n"
+        f"**GBP/USD execution rate:** ${gbp_usd_rate:,.5f} per £1\n"
         f"**Total GBP debit:** £{spent_gbp:,.2f}\n"
         f"**Received:** {received_amount:.8f} {base_symbol}\n"
-        f"**Market rate:** £{market_price:,.2f}\n"
-        f"**Effective rate:** £{effective_price:,.2f}\n"
+        f"**Market rate:** ${market_usd_price:,.2f} / £{market_price:,.2f}\n"
+        f"**Effective rate:** ${effective_usd_price:,.2f} / £{effective_price:,.2f}\n"
         f"**Regime:** {expected_decision.get('REGIME') if expected_decision else 'recovery'}\n"
         f"**Decision ID:** {intent['decision_id']}\n"
-        f"**Portfolio:** {'Saved' if ghostfolio_saved else 'Not saved'}\n"
+        "**Portfolio:** Saved on Kraken\n"
         f"**Time:** {execution_time}\n"
-        f"**Order ID:** {order_id}"
+        f"**Funding order ID:** {funding_order_id}\n"
+        f"**Crypto order ID:** {order_id}"
     )
     send_discord_alert(message, is_error=False)
     return True
 
 
 def main():
-    print("--- Starting Kraken GBP DCA execution ---", flush=True)
+    print("--- Starting Kraken GBP-budgeted USD DCA execution ---", flush=True)
     try:
-        execution_state = validate_execution_state(
-            json.loads(DCA_EXECUTION_STATE_JSON or "{}")
-        )
-    except (json.JSONDecodeError, ConfigError, ValueError) as error:
+        execution_state = _initial_execution_state()
+    except (json.JSONDecodeError, ConfigError, RuntimeError, ValueError) as error:
         message = f"Invalid DCA execution state: {error}"
         print(message, flush=True)
         send_discord_alert(message, is_error=True)
@@ -709,9 +818,9 @@ def main():
         all_succeeded = all_succeeded and succeeded
 
     try:
-        rules = validate_rules_map(json.loads(DCA_TARGET_MAP_JSON))
+        rules = _initial_rules_map()
         selected_symbols = _parse_symbol_filter(DCA_SYMBOLS_JSON)
-    except (json.JSONDecodeError, ConfigError, ValueError) as error:
+    except (json.JSONDecodeError, ConfigError, RuntimeError, ValueError) as error:
         message = (
             "Pending-order reconciliation completed, but new DCA orders are "
             f"blocked by invalid rules or target selection: {error}"
@@ -720,15 +829,30 @@ def main():
         send_discord_alert(message, is_error=True)
         return False
 
+    now = _utc_now()
+    today = now.astimezone(SELECTED_TZ).date().isoformat()
+    try:
+        start_date = _configured_start_date()
+    except ValueError as error:
+        message = f"New DCA orders are blocked by invalid start date: {error}"
+        print(message, flush=True)
+        send_discord_alert(message, is_error=True)
+        return False
+    if start_date is not None and date.fromisoformat(today) < start_date:
+        print(
+            f"Automated trading starts on {start_date.isoformat()} "
+            f"{SELECTED_TZ.key}; no new orders are permitted today ({today}).",
+            flush=True,
+        )
+        return all_succeeded
+
     analysis = None
     analysis_error = None
     try:
-        analysis = validate_analysis_state(json.loads(DCA_ANALYSIS_STATE_JSON))
-    except (json.JSONDecodeError, ConfigError, ValueError) as error:
+        analysis = _initial_analysis_state()
+    except (json.JSONDecodeError, ConfigError, RuntimeError, ValueError) as error:
         analysis_error = str(error)
 
-    now = _utc_now()
-    today = now.astimezone(SELECTED_TZ).date().isoformat()
     for symbol in selected_symbols:
         if _pending_order_for_symbol(execution_state, symbol) is not None:
             continue

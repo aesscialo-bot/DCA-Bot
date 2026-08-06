@@ -1,8 +1,8 @@
-"""Best-effort Ghostfolio logging for Kraken trades settled in GBP.
+"""Best-effort Ghostfolio mirroring for Kraken USD-market purchases.
 
-Kraken remains the source of truth for the GBP trade. Ghostfolio's crypto
-profiles are USD-denominated, so this module alone converts the GBP unit price
-to USD immediately before importing an optional portfolio activity.
+Kraken remains the source of truth. The bot funds each purchase from GBP and
+then buys the configured USD market. Ghostfolio is an optional mirror of the
+confirmed crypto leg and can never change the Kraken trade outcome.
 """
 
 import math
@@ -91,23 +91,23 @@ def authenticate_ghostfolio(base_url, access_token, timeout=30, retries=3, delay
     return None
 
 
-def _validate_gbp_pair(symbol, exchange_pair):
-    """Reject a non-GBP exchange pair before portfolio data can be written."""
+def _validate_usd_pair(symbol, exchange_pair):
+    """Reject a non-USD exchange pair before optional data can be written."""
     if not exchange_pair:
         return
 
     normalized_pair = exchange_pair.strip().upper().replace("_", "/")
-    expected_pair = f"{symbol.strip().upper()}/GBP"
+    expected_pair = f"{symbol.strip().upper()}/USD"
     if normalized_pair != expected_pair:
         raise ValueError(
-            f"Expected Kraken GBP pair {expected_pair}, got {exchange_pair}"
+            f"Expected Kraken USD pair {expected_pair}, got {exchange_pair}"
         )
 
 
 def resolve_ghostfolio_asset(symbol, exchange_pair=None):
     """Resolve a Kraken base ticker to Ghostfolio's USD provider profile."""
     base_symbol = symbol.strip().upper()
-    _validate_gbp_pair(base_symbol, exchange_pair)
+    _validate_usd_pair(base_symbol, exchange_pair)
     override = SYMBOL_DATASOURCE_OVERRIDES.get(base_symbol)
 
     if override:
@@ -290,49 +290,62 @@ def build_ghostfolio_activity(
     exchange_pair=None,
     gbp_usd_rate=None,
 ):
-    """Build a USD-provider activity from an authoritative GBP Kraken trade."""
+    """Build a USD activity from an authoritative Kraken USD-market fill."""
     timestamp = _finite_number(trade_data["ts"], "trade timestamp")
     quantity = _positive_finite_number(
         trade_data["amount_crypto"], "crypto amount"
     )
-    amount_gbp = _positive_finite_number(trade_data["amount_gbp"], "GBP spend")
-    cost_gbp = _positive_finite_number(trade_data["cost_gbp"], "GBP order cost")
-    fee_gbp = _finite_number(trade_data["fee_gbp"], "GBP fee")
-    gbp_fee_debit = _finite_number(
-        trade_data["gbp_fee_debit"], "GBP fee debit"
+    if str(trade_data.get("quote_currency", "")).upper() != "USD":
+        raise ValueError("Ghostfolio mirror requires a Kraken USD-market trade")
+    amount_gbp = _positive_finite_number(
+        trade_data["amount_gbp"], "GBP funding debit"
     )
-    if fee_gbp < 0 or gbp_fee_debit < 0:
-        raise ValueError("GBP fee cannot be negative")
-    if abs(amount_gbp - (cost_gbp + gbp_fee_debit)) > 0.01:
-        raise ValueError("GBP spend must equal order cost plus GBP fee debit")
-    gbp_price = _positive_finite_number(
-        trade_data["gbp_price_per_unit"], "GBP unit price"
+    funded_usd = _positive_finite_number(
+        trade_data["funded_usd"], "confirmed funded USD"
     )
-    fx_rate = _positive_finite_number(gbp_usd_rate, "GBP-to-USD rate")
+    cost_usd = _positive_finite_number(trade_data["cost_usd"], "USD order cost")
+    fee_usd = _finite_number(trade_data.get("fee_usd", 0), "USD fee")
+    usd_fee_debit = _finite_number(
+        trade_data.get("usd_fee_debit", 0), "USD fee debit"
+    )
+    fee_gbp = _finite_number(trade_data.get("fee_gbp", 0), "GBP fee equivalent")
+    if fee_usd < 0 or usd_fee_debit < 0 or fee_gbp < 0:
+        raise ValueError("Kraken fees cannot be negative")
+    if cost_usd + usd_fee_debit > funded_usd + 0.01:
+        raise ValueError("USD crypto debit cannot exceed confirmed funded USD")
+    usd_price = _positive_finite_number(
+        trade_data["usd_price_per_unit"], "USD unit price"
+    )
+    fx_rate = _positive_finite_number(
+        trade_data.get("gbp_usd_rate", gbp_usd_rate), "GBP-to-USD rate"
+    )
     resolution = resolve_ghostfolio_asset(symbol, exchange_pair=exchange_pair)
 
     date = datetime.fromtimestamp(timestamp, tz=SELECTED_TZ)
     date_text = date.astimezone(dt_timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     order_id = str(trade_data.get("order_id", "unknown")).replace("\n", " ")
+    funding_order_id = str(
+        trade_data.get("funding_order_id", "unknown")
+    ).replace("\n", " ")
 
     return {
         "accountId": account_id,
         "comment": (
-            f"GBP {amount_gbp:.2f} total on Kraken "
-            f"(cost {cost_gbp:.2f} + GBP debit fee {gbp_fee_debit:.2f}; "
-            f"fee equivalent {fee_gbp:.2f}) | order {order_id}"
+            f"Saved on Kraken: GBP {amount_gbp:.2f} funded USD {funded_usd:.4f} "
+            f"at GBP/USD {fx_rate:.6f}; crypto cost USD {cost_usd:.4f}; "
+            f"Kraken fee GBP equivalent {fee_gbp:.2f} | "
+            f"funding order {funding_order_id} | crypto order {order_id}"
         ),
         "currency": "USD",
         "dataSource": resolution["dataSource"],
         "date": date_text,
-        # Ghostfolio's fee is an economic cost. For a base-asset fee, quantity
-        # is already net of that fee, so adding its GBP equivalent reconstructs
-        # the confirmed gross order cost without claiming an extra GBP cash debit.
-        "fee": round(fee_gbp * fx_rate, 4),
+        # Mirror only the crypto leg's economic fee. The GBP/USD funding trade
+        # is preserved in the comment and Kraken remains authoritative for it.
+        "fee": round(fee_usd, 4),
         "quantity": float(f"{quantity:.8f}"),
         "symbol": resolution["symbol"],
         "type": "BUY",
-        "unitPrice": round(gbp_price * fx_rate, 4),
+        "unitPrice": round(usd_price, 4),
     }
 
 
@@ -444,13 +457,12 @@ def validate_ghostfolio_resolution(activity, dry_run_response):
 def log_to_ghostfolio(
     trade_data, symbol, account_id, exchange_pair=None, bearer_token=None
 ):
-    """Optionally mirror one completed Kraken GBP purchase into Ghostfolio.
+    """Optionally mirror one completed Kraken USD-market buy into Ghostfolio.
 
-    Expected trade fields are ``ts``, ``amount_crypto``, ``cost_gbp``,
-    ``fee_gbp`` (economic GBP equivalent), ``gbp_fee_debit``, ``amount_gbp``
-    (total GBP cash debit), ``gbp_price_per_unit``, and ``order_id``. Every
-    failure returns ``False``;
-    portfolio logging never changes the outcome of the Kraken trade.
+    The authoritative trade includes the GBP funding debit, confirmed USD
+    proceeds, GBP/USD rate, USD crypto fill, both Kraken order IDs, and fee
+    equivalents. Every failure returns ``False`` and never changes the outcome
+    of the already completed Kraken trade.
     """
     if not GHOSTFOLIO_TOKEN and not bearer_token:
         print("GHOSTFOLIO_TOKEN not set. Skipping Ghostfolio logging.")
@@ -467,16 +479,11 @@ def log_to_ghostfolio(
             if not bearer_token:
                 return False
 
-        fx_rate = get_gbp_usd_rate(trade_data["ts"])
-        if fx_rate is None:
-            return False
-
         activity = build_ghostfolio_activity(
             trade_data,
             symbol,
             account_id,
             exchange_pair=exchange_pair,
-            gbp_usd_rate=fx_rate,
         )
         quantity = activity["quantity"]
         url = f"{GHOSTFOLIO_URL}/api/v1/import"
@@ -507,9 +514,9 @@ def log_to_ghostfolio(
             return False
 
         print(
-            "Successfully logged to Ghostfolio: "
+            "Optional Ghostfolio mirror saved: "
             f"{quantity:.8f} {symbol.upper()} at USD {activity['unitPrice']:.4f} "
-            f"(source spend GBP {float(trade_data['amount_gbp']):.2f})."
+            f"(authoritative Kraken funding GBP {float(trade_data['amount_gbp']):.2f})."
         )
         return True
     except Exception as error:

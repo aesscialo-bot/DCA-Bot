@@ -1,4 +1,4 @@
-"""Deterministic Kraken GBP regime and daily execution-time analysis.
+"""Deterministic Kraken USD-market regime and execution-time analysis.
 
 Gemini is an optional narrator only.  All spend-affecting outputs (regime,
 amount tier, and execution time) are calculated locally from completed Kraken
@@ -77,17 +77,17 @@ def _iso_utc(value: datetime) -> str:
 def _target_from_symbol(value: str) -> str:
     candidate = value.strip().strip("\"'").upper().replace("_", "/")
     if "/" not in candidate:
-        candidate = f"{candidate}/GBP"
+        candidate = f"{candidate}/USD"
     target = candidate.replace("/", "_")
     if target not in TARGET_KEYS:
         raise ValueError(
-            f"Only BTC/GBP, ETH/GBP, SOL/GBP, and ADA/GBP are supported: {value}"
+            f"Only BTC/USD, HYPE/USD, and SOL/USD are supported: {value}"
         )
     return target
 
 
 def _parse_symbols(symbols_env: str, dca_map_env: str) -> list[str]:
-    """Return a deterministic list of supported Kraken GBP pair strings."""
+    """Return a deterministic list of supported Kraken USD pair strings."""
 
     if symbols_env.strip() and symbols_env.strip().lower() != "all":
         try:
@@ -103,7 +103,7 @@ def _parse_symbols(symbols_env: str, dca_map_env: str) -> list[str]:
             if target not in targets:
                 targets.append(target)
         if not targets:
-            raise ValueError("SYMBOL did not contain a supported Kraken GBP pair")
+            raise ValueError("SYMBOL did not contain a supported Kraken USD pair")
         return [TARGET_SYMBOLS[target] for target in targets]
 
     try:
@@ -117,7 +117,7 @@ def get_analysis_exchange(exchange_id: str = EXCHANGE_ID):
     """Create the one supported public market-data client."""
 
     if str(exchange_id).strip().lower() != "kraken":
-        raise ValueError("Crypto analysis supports Kraken GBP markets only")
+        raise ValueError("Crypto analysis supports Kraken USD markets only")
     return ccxt.kraken({"enableRateLimit": True})
 
 
@@ -790,7 +790,7 @@ def _existing_or_empty_state(rules: Mapping[str, Any], now: datetime) -> dict[st
 
 
 def main() -> int:
-    """Analyze selected targets, persist four decisions, and alert per asset."""
+    """Analyze selected targets, persist three decisions, and alert per asset."""
 
     generated = _utc_now()
     try:
