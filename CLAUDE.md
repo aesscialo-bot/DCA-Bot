@@ -1,17 +1,19 @@
 # Repository operating rules
 
-This is the production Kraken GBP-funded USD-market DCA bot. Read `README.md`
-before changing schemas, trading behavior, workflows, or release configuration.
+This is the production Kraken GBP-funded USD-market DCA bot. Read
+`00_START_HERE.md` and `README.md` before changing schemas, trading behavior,
+workflows, or release configuration.
 
-## Fixed production invariants
+## Production invariants and current defaults
 
 - Supported targets are exactly `BTC_USD`, `HYPE_USD`, and `SOL_USD`.
 - `DCA_TARGET_MAP` contains only `REGIME_AMOUNTS_GBP` (`LOW` and `UP`) and
   `BUY_ENABLED` for each exact target.
-- Production starts at `DCA_START_DATE=2026-08-07`, interpreted as a strict
-  `YYYY-MM-DD` date in `Asia/Bangkok`; all earlier trading fails closed.
+- The current release gate is `DCA_START_DATE=2026-08-07`, interpreted as a
+  strict `YYYY-MM-DD` date in `Asia/Bangkok`; all earlier trading fails closed.
 - Downtrend and sideways select `LOW`; uptrend selects `UP`.
-- Requested budgets are BTC £10/£20, HYPE £10/£15, and SOL £5/£15.
+- The current approved baseline budgets are BTC £10/£20, HYPE £10/£15, and SOL
+  £5/£15. Budget changes must use the guarded configuration flow.
 - Each buy is two reconciled Kraken orders: sell the exact GBP budget on
   `GBP/USD` with `fciq`, then spend confirmed net USD on the target with `fcib`.
 - One purchase per enabled asset per Bangkok calendar day is permitted.
