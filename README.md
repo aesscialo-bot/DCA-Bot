@@ -47,10 +47,15 @@ The requested enabled rules are:
 }
 ```
 
-Downtrends and sideways markets use `LOW`; uptrends use `UP`. Aggregate daily
-exposure is £25 when all three targets select `LOW`, and at most £50 when all
-three select `UP`. Each enabled asset can buy at most once per Bangkok calendar
-day.
+The stored `LOW` and `UP` fields are the lower and upper budget endpoints; the
+`UP` field name is retained for configuration compatibility and no longer means
+"use this in an uptrend." The counter-cyclical policy is:
+
+- `DOWNTREND` → higher endpoint: BTC £20, HYPE £15, SOL £15; £50 aggregate.
+- `SIDEWAYS` → midpoint: BTC £15, HYPE £12.50, SOL £10; £37.50 aggregate.
+- `UPTREND` → lower endpoint: BTC £10, HYPE £10, SOL £5; £25 aggregate.
+
+Each enabled asset can buy at most once per Bangkok calendar day.
 
 ## Automated daily flow
 
@@ -89,7 +94,12 @@ Analysis runs daily at 04:00 Bangkok time and uses completed Kraken candles only
   completed weekly close above weekly EMA20, and a positive 20-day SMA150 slope.
 - `DOWNTREND`: the inverse conditions.
 - `SIDEWAYS`: every other valid result.
-- `UPTREND` selects `UP`; `DOWNTREND` and `SIDEWAYS` select `LOW`.
+- `DOWNTREND` selects `HIGH`, `SIDEWAYS` selects `MID`, and `UPTREND`
+  selects `LOW`.
+
+`MID` is derived from the two configured endpoints as `(LOW + UP) / 2` and is
+rounded to the nearest penny using half-up currency rounding. The configured
+lower endpoint cannot exceed the upper endpoint.
 
 The execution-time engine deterministically evaluates completed 15-minute data
 over 3-, 5-, and 7-day windows. A decision contains an absolute `EXECUTE_AT`, is
@@ -124,9 +134,10 @@ stopping automation.
 
 ## State and runtime configuration
 
-`DCA_TARGET_MAP` contains only the three exact target keys, their `LOW`/`UP` GBP
-budgets, and `BUY_ENABLED` flags. Budget edits are atomic and permitted only
-while the selected asset is disabled.
+`DCA_TARGET_MAP` contains only the three exact target keys, their lower `LOW`
+and upper `UP` GBP endpoints, and `BUY_ENABLED` flags. Budget edits are atomic
+and permitted only while the selected asset is disabled. `MID` and `HIGH` are
+derived analysis tiers, not extra fields in this user-owned JSON.
 
 `DCA_ANALYSIS_STATE` stores each asset's status, regime, selected tier,
 `EXECUTE_AT`, `VALID_UNTIL`, `DECISION_ID`, `RULES_HASH`, signal metrics, and
@@ -191,7 +202,7 @@ must never print a complete rules, analysis, or execution-state document.
 Examples use canonical USD targets:
 
 ```text
-!dca set BTC amounts to 10 low and 20 up
+!dca set BTC amounts to 10 low and 20 high
 !dca disable BTC
 !dca enable BTC
 !dca confirm enable BTC_USD
@@ -202,8 +213,9 @@ show status
 ```
 
 Budget changes require the target to be disabled. Enabling requires exact
-confirmation and displays both budgets, the latest regime, effective amount,
-next execution time, decision age, and aggregate maximum daily exposure.
+confirmation and displays the lower, midpoint, and higher amounts, the latest
+regime, effective amount, next execution time, decision age, and aggregate
+maximum daily exposure.
 
 ## Workflows
 

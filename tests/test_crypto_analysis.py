@@ -350,7 +350,26 @@ class TimingPolicyTests(unittest.TestCase):
 
 
 class DecisionAndNarrationTests(unittest.TestCase):
-    def test_downtrend_and_sideways_select_low_uptrend_selects_up(self):
+    def test_v1_state_is_replaced_with_fail_closed_v2_before_fresh_analysis(self):
+        rules = dca_config.default_rules_map()
+        old_state = dca_config.empty_analysis_state(rules, now=NOW)
+        old_state["VERSION"] = 1
+        with patch.object(
+            crypto_analysis,
+            "DCA_ANALYSIS_STATE_ENV",
+            json.dumps(old_state),
+        ):
+            replacement = crypto_analysis._existing_or_empty_state(rules, NOW)
+
+        self.assertEqual(replacement["VERSION"], dca_config.ANALYSIS_STATE_VERSION)
+        self.assertTrue(
+            all(
+                decision["STATUS"] == "ERROR"
+                for decision in replacement["TARGETS"].values()
+            )
+        )
+
+    def test_uptrend_selects_lower_budget_tier(self):
         rules = dca_config.default_rules_map()["BTC_USD"]
         daily, weekly = trend_rows("up")
         with (
@@ -361,7 +380,7 @@ class DecisionAndNarrationTests(unittest.TestCase):
                 MagicMock(), "BTC_USD", rules, now=NOW
             )
         self.assertEqual(decision["REGIME"], "UPTREND")
-        self.assertEqual(decision["AMOUNT_TIER"], "UP")
+        self.assertEqual(decision["AMOUNT_TIER"], "LOW")
         self.assertEqual(decision["STATUS"], "READY")
         self.assertEqual(
             datetime.fromisoformat(decision["VALID_UNTIL"].replace("Z", "+00:00"))
@@ -389,8 +408,35 @@ class DecisionAndNarrationTests(unittest.TestCase):
 
         fetch_rows.assert_called_once_with(exchange, "HYPE/USD")
         self.assertEqual(decision["REGIME"], "DOWNTREND")
-        self.assertEqual(decision["AMOUNT_TIER"], "LOW")
+        self.assertEqual(decision["AMOUNT_TIER"], "HIGH")
         self.assertEqual(decision["TIMING"]["HISTORY_CANDLES"], 672)
+
+    def test_sideways_selects_and_reports_derived_midpoint(self):
+        rule = {
+            "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 15},
+            "BUY_ENABLED": True,
+        }
+        daily, weekly = trend_rows("up")
+        with (
+            patch.object(
+                crypto_analysis,
+                "_fetch_asset_rows",
+                return_value=(daily, weekly, intraday_rows()),
+            ),
+            patch.object(
+                crypto_analysis,
+                "classify_trend",
+                return_value=("SIDEWAYS", {"SOURCE": "test"}),
+            ),
+            patch.object(crypto_analysis, "LOCAL_TZ", "Asia/Bangkok"),
+        ):
+            decision = crypto_analysis.analyze_asset(
+                MagicMock(), "HYPE_USD", rule, now=NOW
+            )
+
+        self.assertEqual(decision["AMOUNT_TIER"], "MID")
+        report = crypto_analysis._decision_report("HYPE_USD", decision, rule)
+        self.assertIn("`MID` tier (`£12.5` configured)", report)
 
     def test_analysis_failure_creates_fresh_non_executable_error(self):
         rule = dca_config.default_rules_map()["BTC_USD"]

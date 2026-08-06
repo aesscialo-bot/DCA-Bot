@@ -8,6 +8,7 @@ configuration before performing any side effect.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
 import json
 import math
@@ -34,13 +35,19 @@ ANALYSIS_DECISION_FIELDS = frozenset(
         "TIMING",
     }
 )
-ANALYSIS_STATE_VERSION = 1
+ANALYSIS_STATE_VERSION = 2
+AMOUNT_POLICY_VERSION = 2
 MIN_ENABLED_AMOUNT_GBP = 5.0
 MAX_AMOUNT_GBP = 1_000.0
 READY_STATUS = "READY"
 ERROR_STATUS = "ERROR"
 REGIMES = frozenset({"UPTREND", "DOWNTREND", "SIDEWAYS"})
-AMOUNT_TIERS = frozenset({"LOW", "UP"})
+AMOUNT_TIERS = frozenset({"LOW", "MID", "HIGH"})
+REGIME_AMOUNT_TIERS = {
+    "DOWNTREND": "HIGH",
+    "SIDEWAYS": "MID",
+    "UPTREND": "LOW",
+}
 
 
 class ConfigError(ValueError):
@@ -76,6 +83,9 @@ def _amount(value: Any, label: str) -> int | float:
         raise ConfigError(f"{label} must be a finite number")
     if number < 0 or number > MAX_AMOUNT_GBP:
         raise ConfigError(f"{label} must be between £0 and £{MAX_AMOUNT_GBP:,.0f}")
+    decimal_value = Decimal(str(value))
+    if decimal_value != decimal_value.quantize(Decimal("0.01")):
+        raise ConfigError(f"{label} must have no more than two decimal places")
     return int(number) if number.is_integer() else number
 
 
@@ -104,7 +114,7 @@ def validate_target_map(
     """Validate and normalize user-owned DCA rules.
 
     Disabled targets may use zero as an explicit unconfigured placeholder.
-    Enabled targets require both tiers to be within £5–£1,000 and not below a
+    Enabled targets require both endpoints to be within £5–£1,000 and not below a
     supplied live Kraken market minimum. Only the three production USD market
     keys and the final two-field rule schema are accepted. Budget policy values
     remain GBP-denominated even though Kraken executes the target pairs in USD.
@@ -150,6 +160,11 @@ def validate_target_map(
         )
         low = _amount(amounts["LOW"], f"{target}.REGIME_AMOUNTS_GBP.LOW")
         up = _amount(amounts["UP"], f"{target}.REGIME_AMOUNTS_GBP.UP")
+        if low > up:
+            raise ConfigError(
+                f"{target}.REGIME_AMOUNTS_GBP.LOW must not exceed UP; "
+                "LOW is the lower endpoint and UP is the upper endpoint"
+            )
         for tier, amount in (("LOW", low), ("UP", up)):
             if 0 < amount < MIN_ENABLED_AMOUNT_GBP:
                 raise ConfigError(
@@ -189,7 +204,8 @@ def rules_hash(target: str, rule: Mapping[str, Any]) -> str:
     """Return a stable fingerprint of spend-affecting rules.
 
     ``BUY_ENABLED`` is intentionally excluded: toggling execution does not alter
-    the analysis decision.  Changing either amount invalidates that decision.
+    the analysis decision. Changing either endpoint or the amount-policy version
+    invalidates that decision.
     """
 
     if target not in TARGET_KEYS:
@@ -197,6 +213,7 @@ def rules_hash(target: str, rule: Mapping[str, Any]) -> str:
     normalized = validate_target_map({target: rule}, require_all=False)[target]
     payload = {
         "TARGET": target,
+        "AMOUNT_POLICY_VERSION": AMOUNT_POLICY_VERSION,
         "REGIME_AMOUNTS_GBP": normalized["REGIME_AMOUNTS_GBP"],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -216,17 +233,46 @@ def global_rules_hash(value: str | Mapping[str, Any]) -> str:
     return sha256(encoded).hexdigest()
 
 
-def effective_amount_gbp(rule: Mapping[str, Any], regime: str) -> int | float:
-    """Select the deterministic user budget for a classified market regime."""
+def amount_tier_for_regime(regime: str) -> str:
+    """Return the counter-cyclical amount tier for a market regime."""
 
     if regime not in REGIMES:
         raise ConfigError(f"Unsupported market regime: {regime}")
+    return REGIME_AMOUNT_TIERS[regime]
+
+
+def amount_for_tier_gbp(rule: Mapping[str, Any], tier: str) -> int | float:
+    """Return a lower, midpoint, or higher GBP budget.
+
+    The persisted ``UP`` field is retained as the upper configured endpoint for
+    backwards compatibility; it no longer means that an uptrend selects it.
+    ``MID`` is the arithmetic midpoint rounded to the nearest penny with
+    conventional half-up currency rounding.
+    """
+
+    if tier not in AMOUNT_TIERS:
+        raise ConfigError(f"Unsupported amount tier: {tier}")
     entry = dict(rule)
     normalized = validate_target_map(
         {TARGET_KEYS[0]: entry}, require_all=False
     )[TARGET_KEYS[0]]
-    tier = "UP" if regime == "UPTREND" else "LOW"
-    return normalized["REGIME_AMOUNTS_GBP"][tier]
+    amounts = normalized["REGIME_AMOUNTS_GBP"]
+    if tier == "LOW":
+        return amounts["LOW"]
+    if tier == "HIGH":
+        return amounts["UP"]
+    midpoint = (
+        (Decimal(str(amounts["LOW"])) + Decimal(str(amounts["UP"])))
+        / Decimal("2")
+    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    number = float(midpoint)
+    return int(number) if number.is_integer() else number
+
+
+def effective_amount_gbp(rule: Mapping[str, Any], regime: str) -> int | float:
+    """Select the deterministic counter-cyclical budget for a market regime."""
+
+    return amount_for_tier_gbp(rule, amount_tier_for_regime(regime))
 
 
 def effective_amount(rule: Mapping[str, Any], decision: Mapping[str, Any] | str) -> float:
@@ -235,7 +281,7 @@ def effective_amount(rule: Mapping[str, Any], decision: Mapping[str, Any] | str)
     if isinstance(decision, Mapping):
         regime = decision.get("REGIME")
         tier = decision.get("AMOUNT_TIER")
-        expected_tier = "UP" if regime == "UPTREND" else "LOW"
+        expected_tier = REGIME_AMOUNT_TIERS.get(regime)
         if regime not in REGIMES or tier != expected_tier:
             raise ConfigError("Analysis decision does not contain a valid regime/tier pair")
     else:
@@ -310,8 +356,8 @@ def validate_analysis_decision(target: str, value: Mapping[str, Any]) -> dict[st
         if decision["REGIME"] not in REGIMES:
             raise ConfigError(f"{label}.REGIME is invalid")
         if decision["AMOUNT_TIER"] not in AMOUNT_TIERS:
-            raise ConfigError(f"{label}.AMOUNT_TIER must be LOW or UP")
-        expected_tier = "UP" if decision["REGIME"] == "UPTREND" else "LOW"
+            raise ConfigError(f"{label}.AMOUNT_TIER must be LOW, MID, or HIGH")
+        expected_tier = amount_tier_for_regime(decision["REGIME"])
         if decision["AMOUNT_TIER"] != expected_tier:
             raise ConfigError(f"{label}.AMOUNT_TIER does not match REGIME")
         execute_at = parse_iso_datetime(decision["EXECUTE_AT"], f"{label}.EXECUTE_AT")
@@ -663,6 +709,7 @@ def empty_analysis_state(
 
 __all__ = [
     "ALLOWED_TARGETS",
+    "AMOUNT_POLICY_VERSION",
     "AMOUNT_TIERS",
     "ANALYSIS_STATE_VERSION",
     "ConfigError",
@@ -673,6 +720,8 @@ __all__ = [
     "REGIMES",
     "TARGET_KEYS",
     "TARGET_SYMBOLS",
+    "amount_for_tier_gbp",
+    "amount_tier_for_regime",
     "decision_is_usable",
     "decision_age_minutes",
     "decision_analyzed_on_or_after",

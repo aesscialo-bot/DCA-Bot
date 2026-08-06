@@ -17,7 +17,7 @@ class DcaConfigWriterTests(unittest.TestCase):
             {
                 "STATUS": "READY",
                 "REGIME": "SIDEWAYS",
-                "AMOUNT_TIER": "LOW",
+                "AMOUNT_TIER": "MID",
                 "EXECUTE_AT": (self.now + timedelta(hours=1)).isoformat(),
                 "VALID_UNTIL": (self.now + timedelta(hours=2)).isoformat(),
                 "SIGNALS": {"source": "test"},
@@ -50,6 +50,24 @@ class DcaConfigWriterTests(unittest.TestCase):
                 up_amount_gbp_json="21",
             )
 
+    def test_budget_update_rejects_inverted_or_overprecise_endpoints(self):
+        with self.assertRaisesRegex(ValueError, "LOW must not exceed UP"):
+            apply_change(
+                self.rules,
+                action="set_amounts",
+                symbol="BTC_USD",
+                low_amount_gbp_json="20",
+                up_amount_gbp_json="10",
+            )
+        with self.assertRaisesRegex(ValueError, "no more than two decimal places"):
+            apply_change(
+                self.rules,
+                action="set_amounts",
+                symbol="BTC_USD",
+                low_amount_gbp_json="10.001",
+                up_amount_gbp_json="20",
+            )
+
     def test_dry_run_validates_without_requesting_a_write(self):
         updated, should_write = apply_change(
             self.rules,
@@ -72,7 +90,7 @@ class DcaConfigWriterTests(unittest.TestCase):
             {
                 "STATUS": "READY",
                 "REGIME": "SIDEWAYS",
-                "AMOUNT_TIER": "LOW",
+                "AMOUNT_TIER": "MID",
                 "EXECUTE_AT": (self.now + timedelta(hours=1)).isoformat(),
                 "VALID_UNTIL": (self.now + timedelta(hours=2)).isoformat(),
                 "RULES_HASH": "0" * 64,
@@ -138,7 +156,7 @@ class DcaConfigWriterTests(unittest.TestCase):
                 {
                     "STATUS": "READY",
                     "REGIME": "SIDEWAYS",
-                    "AMOUNT_TIER": "LOW",
+                    "AMOUNT_TIER": "MID",
                     "EXECUTE_AT": (self.now + timedelta(hours=1)).isoformat(),
                     "VALID_UNTIL": (self.now + timedelta(hours=2)).isoformat(),
                     "RULES_HASH": rules_hash(symbol, self.rules[symbol]),

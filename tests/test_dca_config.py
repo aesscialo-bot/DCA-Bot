@@ -1,6 +1,7 @@
 import copy
 from datetime import datetime, timedelta, timezone
 import unittest
+from unittest.mock import patch
 
 import dca_config
 
@@ -15,7 +16,7 @@ def ready_state(rules=None):
         state["TARGETS"][target] = {
             "STATUS": "READY",
             "REGIME": "SIDEWAYS",
-            "AMOUNT_TIER": "LOW",
+            "AMOUNT_TIER": "MID",
             "EXECUTE_AT": "2026-08-06T01:00:00Z",
             "VALID_UNTIL": "2026-08-06T02:00:00Z",
             "DECISION_ID": f"decision-{target.lower()}",
@@ -92,7 +93,10 @@ class RulesSchemaTests(unittest.TestCase):
         for amount in (0.01, 1, 4.99):
             with self.subTest(amount=amount):
                 invalid = dca_config.default_rules_map()
-                invalid["BTC_USD"]["REGIME_AMOUNTS_GBP"]["LOW"] = amount
+                invalid["BTC_USD"]["REGIME_AMOUNTS_GBP"] = {
+                    "LOW": amount,
+                    "UP": amount,
+                }
                 with self.assertRaisesRegex(ValueError, "£0.*or at least £5"):
                     dca_config.validate_rules_map(invalid)
         rules["BTC_USD"]["BUY_ENABLED"] = True
@@ -117,6 +121,26 @@ class RulesSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "between £0 and £1,000"):
             dca_config.validate_rules_map(rules)
 
+    def test_budget_endpoints_are_ordered_and_currency_precision_is_bounded(self):
+        rules = dca_config.default_rules_map()
+        rules["BTC_USD"] = {
+            "REGIME_AMOUNTS_GBP": {"LOW": 20, "UP": 10},
+            "BUY_ENABLED": False,
+        }
+        with self.assertRaisesRegex(ValueError, "LOW must not exceed UP"):
+            dca_config.validate_rules_map(rules)
+
+        rules["BTC_USD"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10.001, "UP": 20}
+        with self.assertRaisesRegex(ValueError, "no more than two decimal places"):
+            dca_config.validate_rules_map(rules)
+
+        rules["BTC_USD"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 10}
+        validated = dca_config.validate_rules_map(rules)
+        self.assertEqual(
+            dca_config.effective_amount_gbp(validated["BTC_USD"], "SIDEWAYS"),
+            10,
+        )
+
     def test_rule_hash_is_stable_and_excludes_buy_enabled(self):
         disabled = {
             "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 20.0},
@@ -124,8 +148,9 @@ class RulesSchemaTests(unittest.TestCase):
         }
         enabled = copy.deepcopy(disabled)
         enabled["BUY_ENABLED"] = True
+        baseline_hash = dca_config.rules_hash("BTC_USD", disabled)
         self.assertEqual(
-            dca_config.rules_hash("BTC_USD", disabled),
+            baseline_hash,
             dca_config.rules_hash("BTC_USD", enabled),
         )
         changed = copy.deepcopy(disabled)
@@ -134,14 +159,27 @@ class RulesSchemaTests(unittest.TestCase):
             dca_config.rules_hash("BTC_USD", disabled),
             dca_config.rules_hash("BTC_USD", changed),
         )
+        with patch.object(
+            dca_config,
+            "AMOUNT_POLICY_VERSION",
+            dca_config.AMOUNT_POLICY_VERSION + 1,
+        ):
+            self.assertNotEqual(
+                baseline_hash,
+                dca_config.rules_hash("BTC_USD", disabled),
+            )
 
     def test_effective_amount_and_aggregate_exposure(self):
         rule = {
             "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 20},
             "BUY_ENABLED": False,
         }
-        self.assertEqual(dca_config.effective_amount(rule, "UPTREND"), 20.0)
-        self.assertEqual(dca_config.effective_amount(rule, "SIDEWAYS"), 10.0)
+        self.assertEqual(dca_config.effective_amount(rule, "UPTREND"), 10.0)
+        self.assertEqual(dca_config.effective_amount(rule, "SIDEWAYS"), 15.0)
+        self.assertEqual(dca_config.effective_amount(rule, "DOWNTREND"), 20.0)
+        self.assertEqual(dca_config.amount_tier_for_regime("UPTREND"), "LOW")
+        self.assertEqual(dca_config.amount_tier_for_regime("SIDEWAYS"), "MID")
+        self.assertEqual(dca_config.amount_tier_for_regime("DOWNTREND"), "HIGH")
         rules = dca_config.default_rules_map()
         rules["BTC_USD"] = {**rule, "BUY_ENABLED": True}
         rules["HYPE_USD"] = {
@@ -172,16 +210,23 @@ class RulesSchemaTests(unittest.TestCase):
         validated = dca_config.validate_rules_map(rules)
         self.assertEqual(
             [dca_config.effective_amount_gbp(rule, "DOWNTREND") for rule in validated.values()],
-            [10, 10, 5],
+            [20, 15, 15],
         )
         self.assertEqual(
             [dca_config.effective_amount_gbp(rule, "SIDEWAYS") for rule in validated.values()],
-            [10, 10, 5],
+            [15, 12.5, 10],
         )
         self.assertEqual(
             [dca_config.effective_amount_gbp(rule, "UPTREND") for rule in validated.values()],
-            [20, 15, 15],
+            [10, 10, 5],
         )
+
+    def test_sideways_midpoint_uses_half_up_penny_rounding(self):
+        rule = {
+            "REGIME_AMOUNTS_GBP": {"LOW": 10.01, "UP": 10.02},
+            "BUY_ENABLED": False,
+        }
+        self.assertEqual(dca_config.effective_amount_gbp(rule, "SIDEWAYS"), 10.02)
 
 
 class StateSchemaTests(unittest.TestCase):
@@ -192,7 +237,7 @@ class StateSchemaTests(unittest.TestCase):
         self.assertEqual(set(validated["TARGETS"]), set(dca_config.ALLOWED_TARGETS))
 
         changed = copy.deepcopy(rules)
-        changed["BTC_USD"]["REGIME_AMOUNTS_GBP"]["LOW"] = 10
+        changed["BTC_USD"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
         with self.assertRaisesRegex(ValueError, "does not match the live budgets"):
             dca_config.validate_analysis_state(state, changed)
 
@@ -211,6 +256,18 @@ class StateSchemaTests(unittest.TestCase):
                     ValueError, f"unsupported targets.*{legacy_target}"
                 ):
                     dca_config.validate_analysis_state(state)
+
+        state = ready_state()
+        state["VERSION"] = 1
+        with self.assertRaisesRegex(ValueError, "VERSION must be 2"):
+            dca_config.validate_analysis_state(state)
+
+        state = ready_state()
+        state["TARGETS"]["BTC_USD"].update(
+            {"REGIME": "UPTREND", "AMOUNT_TIER": "UP"}
+        )
+        with self.assertRaisesRegex(ValueError, "AMOUNT_TIER must be LOW, MID, or HIGH"):
+            dca_config.validate_analysis_state(state)
 
         state = ready_state()
         state["TARGETS"]["BTC_USD"]["VALID_UNTIL"] = "2026-08-06T02:01:00Z"
