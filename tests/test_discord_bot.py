@@ -667,7 +667,7 @@ class DiscordBotControlTests(unittest.TestCase):
             asyncio.run(discord_bot.handle_health({}, message))
 
         self.assertIn("DCA health: ARMED", message.replies[-1])
-        self.assertIn("awaiting 04:00 start-day analysis", message.replies[-1])
+        self.assertIn("awaiting 04:07 start-day analysis", message.replies[-1])
         self.assertNotIn("ATTENTION REQUIRED", message.replies[-1])
         self.assertNotIn("Analysis ERROR", message.replies[-1])
 
@@ -837,7 +837,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
             FrozenDateTime.current = analysis_time
             try:
                 self.assertNotIn(
-                    "awaiting 04:00", discord_bot._format_cron_status()
+                    "awaiting 04:07", discord_bot._format_cron_status()
                 )
             finally:
                 FrozenDateTime.current = NOW
