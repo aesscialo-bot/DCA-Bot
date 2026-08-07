@@ -22,8 +22,14 @@ EVENT_FILE = "kraken_usd_dca_ghostfolio_events.jsonl"
 RECEIPT_FILE = "ghostfolio_sync_receipts.jsonl"
 HOLDINGS_SNAPSHOT_FILE = "kraken_holdings_snapshot_v1.json"
 HOLDINGS_RECEIPT_FILE = "ghostfolio_holdings_receipts.jsonl"
+PROVENANCE_RECLASSIFICATION_RECEIPT_FILE = (
+    "ghostfolio_provenance_reclassification_receipts.jsonl"
+)
 STATE_PATH = Path("/receipts/state.json")
 HOLDINGS_INTENT_PATH = Path("/receipts/holdings-intent.json")
+PROVENANCE_RECLASSIFICATION_INTENT_PATH = Path(
+    "/receipts/hype-provenance-reclassification-intent.json"
+)
 ASSET_PROFILES = {
     "BTC_GBP": {"symbol": "bitcoin", "data_source": "COINGECKO"},
     # Ghostfolio 3.43.0 returns Hyperliquid in lookup results for both
@@ -101,9 +107,57 @@ HOLDINGS_SNAPSHOT_MAX_AGE_SECONDS = 7200
 HOLDINGS_SNAPSHOT_MAX_FUTURE_SECONDS = 300
 BANGKOK = ZoneInfo("Asia/Bangkok")
 
+# One narrow migration for the private, hash-allowlisted HYPE fill.
+HYPE_RECOVERY_TARGET = "HYPE_USD"
+HYPE_RECOVERY_EVENT_ID_ENV = "GHOSTFOLIO_RECOVERY_CRYPTO_ORDER_ID"
+HYPE_RECOVERY_FUNDING_ORDER_ID_ENV = "GHOSTFOLIO_RECOVERY_FUNDING_ORDER_ID"
+HYPE_RECOVERY_EVENT_HASH_ENV = "GHOSTFOLIO_RECOVERY_EVENT_HASH"
+HYPE_OPENING_COMMENT_PATTERN = re.compile(
+    r"^Kraken opening-balance reconciliation; "
+    r"snapshot=([0-9a-f]{64}); target=HYPE_USD$"
+)
+PROVENANCE_RECLASSIFICATION_PHASES = {
+    "PREPARED",
+    "OPENING_REDUCED",
+    "EVENT_IMPORTED",
+    "RECEIPTS_PUBLISHED",
+}
+
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _recovery_evidence(*, required):
+    evidence = {
+        "event_id": os.environ.get(HYPE_RECOVERY_EVENT_ID_ENV),
+        "funding_order_id": os.environ.get(HYPE_RECOVERY_FUNDING_ORDER_ID_ENV),
+        "event_hash": os.environ.get(HYPE_RECOVERY_EVENT_HASH_ENV),
+    }
+    if not any(evidence.values()) and not required:
+        return None
+    if (
+        not _safe_order_id(evidence["event_id"])
+        or not _safe_order_id(evidence["funding_order_id"])
+        or evidence["event_id"] == evidence["funding_order_id"]
+        or not isinstance(evidence["event_hash"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", evidence["event_hash"]) is None
+    ):
+        raise RuntimeError("local HYPE recovery evidence is missing or invalid")
+    return evidence
+
+
+def _recovery_residual_comment(snapshot_hash, event_id):
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", str(snapshot_hash)) is None
+        or not _safe_order_id(event_id)
+    ):
+        raise RuntimeError("HYPE recovery event ID is invalid")
+    return (
+        "Kraken opening-balance residual after PortfolioEvent recovery; "
+        f"snapshot={snapshot_hash}; target=HYPE_USD; "
+        f"event={event_id}"
+    )
 
 
 def request_json(url, *, method="GET", token=None, payload=None):
@@ -206,6 +260,24 @@ def _event_decimal(event, field, number):
     return value
 
 
+def _strict_decimal(value, label, *, positive=False):
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        raise RuntimeError(f"{label} is not a decimal value")
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation as error:
+        raise RuntimeError(f"{label} is not a decimal value") from error
+    if not number.is_finite() or number < 0 or (positive and number <= 0):
+        raise RuntimeError(f"{label} is invalid")
+    return number
+
+
+def _decimal_text(value):
+    number = _strict_decimal(value, "decimal")
+    rendered = format(number.normalize(), "f")
+    return "0" if rendered in {"", "-0"} else rendered
+
+
 def _validate_portfolio_event(event, number):
     if not isinstance(event, dict) or set(event) != PORTFOLIO_EVENT_FIELDS:
         raise RuntimeError(f"event line {number} does not match PortfolioEventV3")
@@ -258,35 +330,107 @@ def _validate_portfolio_event(event, number):
         raise RuntimeError(f"event line {number} direct GBP funding values must be zero")
 
 
-def parse_event_receipts(content, events):
-    event_by_id = {event["event_id"]: event for event in events}
-    receipts = set()
-    expected_fields = {
-        "order_id",
-        "event_hash",
-        "ghostfolio_activity_id",
-        "imported_at",
-    }
-    for line in content.splitlines():
-        if not line.strip():
-            continue
-        try:
-            receipt = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise RuntimeError("Ghostfolio event receipt ledger is malformed") from error
-        if not isinstance(receipt, dict) or set(receipt) != expected_fields:
-            raise RuntimeError("Ghostfolio event receipt ledger is malformed")
-        order_id = receipt.get("order_id")
-        event = event_by_id.get(order_id)
+def _jsonl_rows(content, label):
+    rows = []
+    try:
+        rows = [json.loads(line) for line in content.splitlines() if line.strip()]
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{label} is malformed") from error
+    return rows
+
+
+def _event_receipt_rows(content, events):
+    event_by_id, receipts = {row["event_id"]: row for row in events}, {}
+    fields = {"order_id", "event_hash", "ghostfolio_activity_id", "imported_at"}
+    for receipt in _jsonl_rows(content, "Ghostfolio event receipt ledger"):
+        event = event_by_id.get(receipt.get("order_id")) if isinstance(receipt, dict) else None
         if event is None or receipt.get("event_hash") != event["canonical_hash"]:
             raise RuntimeError("Ghostfolio event receipt does not match its event")
-        if order_id in receipts:
-            raise RuntimeError("Ghostfolio event receipt ledger has duplicates")
-        activity_id = receipt.get("ghostfolio_activity_id")
-        if not isinstance(activity_id, str) or not activity_id:
+        if (
+            not isinstance(receipt, dict) or set(receipt) != fields
+            or not isinstance(receipt["ghostfolio_activity_id"], str)
+            or not receipt["ghostfolio_activity_id"]
+            or receipt["order_id"] in receipts
+        ):
             raise RuntimeError("Ghostfolio event receipt ledger is malformed")
-        _parse_timestamp(receipt.get("imported_at"), "Ghostfolio event receipt")
-        receipts.add(order_id)
+        _parse_timestamp(receipt["imported_at"], "Ghostfolio event receipt")
+        receipts[receipt["order_id"]] = receipt
+    return receipts
+
+
+def parse_event_receipts(content, events):
+    return set(_event_receipt_rows(content, events))
+
+
+def _validate_hype_recovery_event(event, evidence=None):
+    if any((
+        event.get("target") != HYPE_RECOVERY_TARGET,
+        event.get("base_currency") != "HYPE",
+        event.get("quote_currency") != "USD",
+        event.get("budget_currency") != "GBP",
+        event.get("route") != "GBP_TO_USD",
+    )):
+        raise RuntimeError("HYPE recovery event has the wrong contract")
+    if evidence and any((
+        event.get("event_id") != evidence["event_id"],
+        event.get("crypto_order_id") != evidence["event_id"],
+        event.get("funding_order_id") != evidence["funding_order_id"],
+        event.get("canonical_hash") != evidence["event_hash"],
+    )):
+        raise RuntimeError("HYPE recovery event does not match local evidence")
+    return event
+
+
+def _validate_provenance_reclassification_receipt(receipt, events, label):
+    fields = {
+        "version", "event_id", "event_hash", "opening_snapshot_hash",
+        "opening_activity_id", "original_quantity", "residual_quantity",
+        "reclassified_quantity", "completed_at",
+    }
+    event = next((
+        row for row in events
+        if isinstance(receipt, dict) and row["event_id"] == receipt.get("event_id")
+    ), None)
+    if (
+        not isinstance(receipt, dict) or set(receipt) != fields
+        or receipt.get("version") != 1 or isinstance(receipt.get("version"), bool)
+        or event is None or receipt.get("event_hash") != event["canonical_hash"]
+        or re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("opening_snapshot_hash"))) is None
+        or not _safe_order_id(receipt.get("opening_activity_id"))
+        or re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+            str(receipt.get("completed_at")),
+        )
+        is None
+    ):
+        raise RuntimeError(f"{label} is malformed")
+    _validate_hype_recovery_event(event)
+    quantities = [
+        _strict_decimal(receipt[field], f"{label} {field}")
+        for field in ("original_quantity", "residual_quantity", "reclassified_quantity")
+        if isinstance(receipt[field], str)
+    ]
+    if (
+        len(quantities) != 3 or quantities[0] <= 0 or quantities[1] <= 0
+        or quantities[2] != _event_decimal(event, "crypto_quantity", 1)
+        or quantities[1] + quantities[2] != quantities[0]
+    ):
+        raise RuntimeError(f"{label} quantities do not reconcile")
+    _parse_timestamp(receipt["completed_at"], label)
+    return receipt
+
+
+def parse_provenance_reclassification_receipts(content, events):
+    receipts = {}
+    for number, receipt in enumerate(
+        _jsonl_rows(content, "provenance receipt ledger"), start=1
+    ):
+        _validate_provenance_reclassification_receipt(
+            receipt, events, f"provenance receipt line {number}"
+        )
+        if receipt["event_id"] in receipts:
+            raise RuntimeError("provenance receipt ledger has duplicates")
+        receipts[receipt["event_id"]] = receipt
     return receipts
 
 
@@ -792,6 +936,142 @@ def import_payload(event):
     }
 
 
+def _canonical_utc_timestamp(value, label):
+    return _parse_timestamp(value, label).isoformat(
+        timespec="microseconds"
+    ).replace("+00:00", "Z")
+
+
+def ghostfolio_hype_activities(token, account_id):
+    query = urlencode({
+        "accounts": account_id,
+        "dataSource": ASSET_PROFILES[HYPE_RECOVERY_TARGET]["data_source"],
+        "symbol": ASSET_PROFILES[HYPE_RECOVERY_TARGET]["symbol"],
+        "take": 100, "sortColumn": "date", "sortDirection": "asc",
+    })
+    status, payload = request_json(
+        _ghostfolio_url("/api/v1/activities") + "?" + query, token=token
+    )
+    activities = payload.get("activities") if isinstance(payload, dict) else None
+    count = payload.get("count") if isinstance(payload, dict) else None
+    if status != 200 or not isinstance(activities, list) or (
+        not isinstance(count, int) or isinstance(count, bool)
+        or count != len(activities) or count > 100
+        or not all(isinstance(row, dict) for row in activities)
+    ):
+        raise RuntimeError("Ghostfolio HYPE activity response is incomplete")
+    return activities
+
+
+def _stable_hype_activity(activity, account_id):
+    profile, tags = activity.get("assetProfile"), activity.get("tags", [])
+    if not isinstance(profile, dict) or not isinstance(tags, list):
+        raise RuntimeError("Ghostfolio HYPE activity identity is malformed")
+    tag_ids = [tag.get("id") if isinstance(tag, dict) else None for tag in tags]
+    if any(not isinstance(tag, str) or not tag for tag in tag_ids) or (
+        len(tag_ids) != len(set(tag_ids))
+    ):
+        raise RuntimeError("Ghostfolio HYPE activity tags are malformed")
+    if (
+        not _safe_order_id(activity.get("id"))
+        or activity.get("accountId") != account_id
+        or not isinstance(activity.get("comment"), str)
+        or activity.get("currency") != "USD" or activity.get("type") != "BUY"
+        or profile.get("dataSource") != ASSET_PROFILES[HYPE_RECOVERY_TARGET]["data_source"]
+        or profile.get("symbol") != ASSET_PROFILES[HYPE_RECOVERY_TARGET]["symbol"]
+    ):
+        raise RuntimeError("Ghostfolio HYPE activity identity is malformed")
+    decimal_fields = {
+        "fee": (activity.get("fee"), False),
+        "quantity": (activity.get("quantity"), True),
+        "unit_price": (activity.get("unitPrice"), True),
+    }
+    result = {
+        "id": activity["id"], "account_id": account_id,
+        "comment": activity["comment"], "currency": "USD",
+        "data_source": profile["dataSource"],
+        "date": _canonical_utc_timestamp(activity.get("date"), "HYPE activity"),
+        "symbol": profile["symbol"], "tags": sorted(tag_ids), "type": "BUY",
+    }
+    result.update({
+        field: _decimal_text(_strict_decimal(value, f"HYPE activity {field}", positive=positive))
+        for field, (value, positive) in decimal_fields.items()
+    })
+    return result
+
+
+def _opening_marker(identity, event_id):
+    original = HYPE_OPENING_COMMENT_PATTERN.fullmatch(identity.get("comment", ""))
+    if original:
+        return original.group(1), False
+    residual = re.fullmatch(
+        r"Kraken opening-balance residual after PortfolioEvent recovery; "
+        r"snapshot=([0-9a-f]{64}); target=HYPE_USD; event=" + re.escape(event_id),
+        identity.get("comment", ""),
+    )
+    return (residual.group(1), True) if residual else None
+
+
+def _opening_activity_matches(
+    identity, event, snapshot_hash, quantity, *, residual, original=None
+):
+    if (
+        _opening_marker(identity, event["event_id"]) != (snapshot_hash, residual)
+        or identity.get("fee") != "0" or identity.get("tags") != []
+        or _strict_decimal(identity.get("quantity"), "HYPE opening") != quantity
+        or _parse_timestamp(identity["date"], "HYPE opening")
+        <= _parse_timestamp(event["occurred_at"], "HYPE event")
+    ):
+        return False
+    if original is None:
+        return True
+    expected = {
+        **original,
+        "comment": (
+            _recovery_residual_comment(snapshot_hash, event["event_id"])
+            if residual else original["comment"]
+        ),
+        "quantity": _decimal_text(quantity),
+    }
+    return identity == expected
+
+
+def _event_activity_matches(identity, event):
+    activity = import_payload(event)["activities"][0]
+    return all((
+        identity.get("comment") == activity["comment"],
+        identity.get("date") == _canonical_utc_timestamp(activity["date"], "HYPE event"),
+        identity.get("fee") == _decimal_text(activity["fee"]),
+        identity.get("quantity") == _decimal_text(activity["quantity"]),
+        identity.get("unit_price") == _decimal_text(activity["unitPrice"]),
+        identity.get("tags") == [],
+    ))
+
+
+def _hype_activity_topology(activities, account_id, event, *, allow_other=False):
+    identities = [_stable_hype_activity(row, account_id) for row in activities]
+    opening = [row for row in identities if _opening_marker(row, event["event_id"])]
+    recovered = [row for row in identities if _event_activity_matches(row, event)]
+    if (
+        (not allow_other and len(opening) + len(recovered) != len(identities))
+        or len(opening) != 1 or len(recovered) > 1
+    ):
+        raise RuntimeError("Ghostfolio HYPE recovery activity topology is ambiguous")
+    return opening[0], recovered[0] if recovered else None
+
+
+def _opening_update_payload(identity, residual, event, snapshot_hash):
+    return {
+        "accountId": identity["account_id"],
+        "comment": _recovery_residual_comment(snapshot_hash, event["event_id"]),
+        "currency": identity["currency"], "dataSource": identity["data_source"],
+        "date": identity["date"], "fee": float(Decimal(identity["fee"])),
+        "id": identity["id"], "quantity": float(residual),
+        "symbol": identity["symbol"], "tags": identity["tags"],
+        "type": identity["type"], "unitPrice": float(Decimal(identity["unit_price"])),
+    }
+
+
 def ghostfolio_quantities(token, kraken_account_id):
     if not isinstance(kraken_account_id, str) or not kraken_account_id:
         raise RuntimeError("Kraken DCA account ID is invalid")
@@ -1010,6 +1290,444 @@ def _validate_holdings_receipt(receipt, label):
     return receipt
 
 
+def _intent_economics(intent):
+    event, opening = intent["event"], intent["opening_original"]
+    snapshot_hash = intent["opening_snapshot_hash"]
+    fields = {"id", "account_id", "comment", "currency", "data_source", "date",
+              "fee", "quantity", "symbol", "tags", "type", "unit_price"}
+    if not isinstance(opening, dict):
+        raise RuntimeError("local provenance opening identity is malformed")
+    profile = ASSET_PROFILES[HYPE_RECOVERY_TARGET]
+    original = _strict_decimal(opening.get("quantity"), "HYPE opening", positive=True)
+    if (
+        set(opening) != fields or not _safe_order_id(opening.get("id"))
+        or not _safe_order_id(opening.get("account_id"))
+        or (opening.get("currency"), opening.get("data_source"), opening.get("symbol"))
+        != ("USD", profile["data_source"], profile["symbol"])
+        or opening.get("type") != "BUY"
+        or not _opening_activity_matches(
+            opening, event, snapshot_hash, original, residual=False
+        )
+    ):
+        raise RuntimeError("local provenance opening identity is malformed")
+    reclassified = _event_decimal(event, "crypto_quantity", 1)
+    residual = original - reclassified
+    snapshot = parse_holdings_snapshot(canonical(intent["snapshot"]))
+    if snapshot is None:
+        raise RuntimeError("local provenance snapshot is missing")
+    if residual <= 0:
+        raise RuntimeError("HYPE recovery residual is not positive")
+    signed = _strict_decimal(
+        snapshot["holdings"][HYPE_RECOVERY_TARGET]["quantity"], "signed HYPE"
+    )
+    if signed != original:
+        raise RuntimeError("HYPE recovery economics do not reconcile")
+    return snapshot, original, residual, reclassified
+
+
+def _validate_provenance_reclassification_intent(intent):
+    fields = {"version", "phase", "event", "snapshot", "baseline_event_ids",
+              "opening_snapshot_hash", "opening_original", "event_activity_id",
+              "completed_at"}
+    valid_header = (
+        isinstance(intent, dict) and set(intent) == fields
+        and intent.get("version") == 1 and not isinstance(intent.get("version"), bool)
+        and intent.get("phase") in PROVENANCE_RECLASSIFICATION_PHASES
+        and re.fullmatch(r"[0-9a-f]{64}", str(intent.get("opening_snapshot_hash")))
+    )
+    if not valid_header:
+        raise RuntimeError("local provenance reclassification intent is malformed")
+    parsed, baseline = parse_events(canonical(intent["event"])), intent["baseline_event_ids"]
+    if (
+        len(parsed) != 1 or not isinstance(baseline, list)
+        or any(not _safe_order_id(event_id) for event_id in baseline)
+        or baseline != sorted(set(baseline)) or parsed[0]["event_id"] not in baseline
+    ):
+        raise RuntimeError("local provenance reclassification intent is malformed")
+    _validate_hype_recovery_event(parsed[0])
+    _intent_economics(intent)
+    completed = intent["phase"] in {"EVENT_IMPORTED", "RECEIPTS_PUBLISHED"}
+    if completed:
+        if not _safe_order_id(intent["event_activity_id"]):
+            raise RuntimeError("local provenance reclassification intent is malformed")
+        _parse_timestamp(intent["completed_at"], "local provenance intent")
+    elif intent["event_activity_id"] is not None or intent["completed_at"] is not None:
+        raise RuntimeError("local provenance reclassification intent is malformed")
+    return intent
+
+
+def load_provenance_reclassification_intent():
+    if not PROVENANCE_RECLASSIFICATION_INTENT_PATH.is_file():
+        return None
+    try:
+        return _validate_provenance_reclassification_intent(json.loads(
+            PROVENANCE_RECLASSIFICATION_INTENT_PATH.read_text(encoding="utf-8")
+        ))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("local provenance intent is unreadable") from error
+
+
+def save_provenance_reclassification_intent(intent):
+    _validate_provenance_reclassification_intent(intent)
+    path = PROVENANCE_RECLASSIFICATION_INTENT_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".new")
+    temporary.write_text(canonical(intent), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def clear_provenance_reclassification_intent():
+    try:
+        PROVENANCE_RECLASSIFICATION_INTENT_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _set_provenance_phase(intent, phase, **changes):
+    updated = {**intent, **changes, "phase": phase}
+    save_provenance_reclassification_intent(updated)
+    return updated
+
+
+def _require_hype_source_receipt(payload, snapshot_hash, quantity):
+    receipt = holdings_receipt_for_snapshot(payload, snapshot_hash)
+    matches = [] if receipt is None else [
+        row for row in receipt["adjustments"] if row["target"] == HYPE_RECOVERY_TARGET
+    ]
+    if len(matches) != 1 or _strict_decimal(
+        matches[0]["quantity_delta"], "HYPE source adjustment"
+    ) != quantity:
+        raise RuntimeError("HYPE recovery source holdings receipt does not match")
+
+
+def _recovery_snapshot(payload, events, event, opening, *, now=None):
+    marker = _opening_marker(opening, event["event_id"])
+    if marker is None or marker[1]:
+        raise RuntimeError("HYPE opening activity is not an original reconciliation")
+    provisional = {
+        "event": event,
+        "opening_original": opening,
+        "opening_snapshot_hash": marker[0],
+        "snapshot": parse_holdings_snapshot(file_content(payload, HOLDINGS_SNAPSHOT_FILE)),
+    }
+    if provisional["snapshot"] is None:
+        raise RuntimeError("HYPE recovery requires a signed Kraken snapshot")
+    snapshot, original, residual, _ = _intent_economics(provisional)
+    _require_hype_source_receipt(payload, marker[0], original)
+    validate_snapshot_freshness(snapshot, now=now)
+    validate_snapshot_monotonicity(snapshot)
+    validate_snapshot_event_order(snapshot, events)
+    return snapshot, original, residual, marker[0]
+
+
+def _require_recovery_quantities(snapshot, actual, hype_quantity):
+    for target in SYMBOLS:
+        expected = hype_quantity if target == HYPE_RECOVERY_TARGET else _strict_decimal(
+            snapshot["holdings"][target]["quantity"], f"signed {target}"
+        )
+        observed = _strict_decimal(actual.get(target), f"Ghostfolio {target}")
+        if abs(float(expected - observed)) > QUANTITY_TOLERANCE[target]:
+            raise RuntimeError(f"Ghostfolio holdings drift during HYPE recovery for {target}")
+
+
+def _preflight_recovery_event(event, token):
+    status, result = request_json(
+        _ghostfolio_url("/api/v1/import") + "?dryRun=true",
+        method="POST", token=token, payload=import_payload(event),
+    )
+    if status in {200, 201}:
+        return "missing"
+    if status == 400 and is_exact_duplicate(result):
+        return "duplicate"
+    raise RuntimeError("Ghostfolio HYPE recovery dry-run conflict")
+
+
+def _put_residual_opening_activity(identity, residual, event, snapshot_hash, token):
+    status, _ = request_json(
+        _ghostfolio_url("/api/v1/activities/") + quote(identity["id"], safe=""),
+        method="PUT", token=token,
+        payload=_opening_update_payload(identity, residual, event, snapshot_hash),
+    )
+    if status not in {200, 201}:
+        raise RuntimeError(f"Ghostfolio HYPE opening update failed with HTTP {status}")
+
+
+def _post_recovery_event(event, token):
+    status, result = request_json(
+        _ghostfolio_url("/api/v1/import"),
+        method="POST", token=token, payload=import_payload(event),
+    )
+    activities = result.get("activities") if isinstance(result, dict) else None
+    activity_id = (
+        activities[0].get("id") if status in {200, 201}
+        and isinstance(activities, list) and len(activities) == 1
+        and isinstance(activities[0], dict) else None
+    )
+    if not _safe_order_id(activity_id):
+        raise RuntimeError("Ghostfolio HYPE recovery acknowledgement is incomplete")
+    return activity_id
+
+
+def _migration_receipts(event, intent):
+    _, original, residual, reclassified = _intent_economics(intent)
+    common = {"event_id": event["event_id"], "event_hash": event["canonical_hash"]}
+    return (
+        {
+            "order_id": event["event_id"], "event_hash": event["canonical_hash"],
+            "ghostfolio_activity_id": intent["event_activity_id"],
+            "imported_at": intent["completed_at"],
+        },
+        {
+            "version": 1, **common,
+            "opening_snapshot_hash": intent["opening_snapshot_hash"],
+            "opening_activity_id": intent["opening_original"]["id"],
+            "original_quantity": _decimal_text(original),
+            "residual_quantity": _decimal_text(residual),
+            "reclassified_quantity": _decimal_text(reclassified),
+            "completed_at": intent["completed_at"],
+        },
+    )
+
+
+def _receipt_pair(payload, events, event_id):
+    return (
+        _event_receipt_rows(file_content(payload, RECEIPT_FILE), events).get(event_id),
+        parse_provenance_reclassification_receipts(
+            file_content(payload, PROVENANCE_RECLASSIFICATION_RECEIPT_FILE), events
+        ).get(event_id),
+    )
+
+
+def _publish_recovery_receipts(intent):
+    event, event_id = intent["event"], intent["event"]["event_id"]
+    wanted = _migration_receipts(event, intent)
+    fresh = gist()
+    fresh_events = parse_events(file_content(fresh, EVENT_FILE))
+    if sorted(row["event_id"] for row in fresh_events) != intent["baseline_event_ids"]:
+        raise RuntimeError("newer PortfolioEvents appeared during HYPE recovery")
+    existing = _receipt_pair(fresh, fresh_events, event_id)
+    if any(old is not None and old != new for old, new in zip(existing, wanted)):
+        raise RuntimeError("HYPE recovery receipt conflict")
+    files = {}
+    for filename, old, receipt in zip(
+        (RECEIPT_FILE, PROVENANCE_RECLASSIFICATION_RECEIPT_FILE), existing, wanted
+    ):
+        if old is None:
+            content = file_content(fresh, filename)
+            separator = "" if not content or content.endswith("\n") else "\n"
+            files[filename] = {"content": content + separator + canonical(receipt) + "\n"}
+    if files:
+        status, _ = request_json(
+            f"https://api.github.com/gists/{os.environ['GIST_ID']}",
+            method="PATCH", token=os.environ["GIST_TOKEN"], payload={"files": files},
+        )
+        if status != 200:
+            raise RuntimeError(f"HYPE recovery receipt publish failed with HTTP {status}")
+    verified = gist()
+    verified_events = parse_events(file_content(verified, EVENT_FILE))
+    if (
+        sorted(row["event_id"] for row in verified_events) != intent["baseline_event_ids"]
+        or _receipt_pair(verified, verified_events, event_id) != wanted
+    ):
+        raise RuntimeError("HYPE recovery receipts were not durably verified")
+
+
+def _migration_status(event, snapshot_hash, *, clear_intent, complete):
+    return {
+        "status": "COMPLETE" if complete else "NOT_REQUIRED",
+        "event_id": event["event_id"] if event else None,
+        "event_hash": event["canonical_hash"] if event else None,
+        "opening_snapshot_hash": snapshot_hash,
+        "receipt_present": complete,
+        "clear_intent_after_state": clear_intent,
+    }
+
+
+def _completed_reclassification_status(
+    payload, events, event_receipts, provenance, token, account_id
+):
+    event = next(row for row in events if row["event_id"] == provenance["event_id"])
+    event_receipt, _ = _receipt_pair(payload, events, event["event_id"])
+    original = _strict_decimal(provenance["original_quantity"], "HYPE original")
+    residual = _strict_decimal(provenance["residual_quantity"], "HYPE residual")
+    snapshot_hash = provenance["opening_snapshot_hash"]
+    _require_hype_source_receipt(payload, snapshot_hash, original)
+    opening, recovered = _hype_activity_topology(
+        ghostfolio_hype_activities(token, account_id), account_id, event, allow_other=True
+    )
+    if (
+        event["event_id"] not in event_receipts or event_receipt is None
+        or not _opening_activity_matches(
+            opening, event, snapshot_hash, residual, residual=True
+        )
+        or recovered is None or recovered["id"] != event_receipt["ghostfolio_activity_id"]
+        or provenance["opening_activity_id"] != opening["id"]
+    ):
+        raise RuntimeError("completed HYPE provenance topology is invalid")
+    return _migration_status(event, snapshot_hash, clear_intent=False, complete=True)
+
+
+def process_hype_provenance_reclassification(
+    payload, events, event_receipts, token, account_id, *, now=None
+):
+    provenance_rows = parse_provenance_reclassification_receipts(
+        file_content(payload, PROVENANCE_RECLASSIFICATION_RECEIPT_FILE), events
+    )
+    intent = load_provenance_reclassification_intent()
+    if len(provenance_rows) > 1:
+        raise RuntimeError("HYPE provenance receipt ledger is ambiguous")
+    completed_id = next(iter(provenance_rows), None)
+    if completed_id:
+        event_id, evidence = completed_id, None
+    elif intent:
+        event_id, evidence = intent["event"]["event_id"], _recovery_evidence(required=True)
+    else:
+        evidence = _recovery_evidence(required=False)
+        pending_hype = [
+            row for row in events if row["target"] == HYPE_RECOVERY_TARGET
+            and row["event_id"] not in event_receipts
+        ]
+        if evidence is None:
+            if pending_hype:
+                raise RuntimeError("local HYPE recovery evidence is required")
+            return _migration_status(None, None, clear_intent=False, complete=False)
+        event_id = evidence["event_id"]
+    matches = [row for row in events if row["event_id"] == event_id]
+    if not matches:
+        if intent or provenance_rows or any(
+            row["target"] == HYPE_RECOVERY_TARGET for row in events
+        ):
+            raise RuntimeError("configured HYPE recovery event is not in the outbox")
+        return _migration_status(None, None, clear_intent=False, complete=False)
+    event = _validate_hype_recovery_event(matches[0], evidence)
+    completed = provenance_rows.get(event_id)
+    if completed and not intent:
+        return _completed_reclassification_status(
+            payload, events, event_receipts, completed, token, account_id
+        )
+    if event_id in event_receipts and not intent:
+        raise RuntimeError("HYPE event was imported without a reclassification intent")
+
+    if not intent:
+        if any(row["target"] == HYPE_RECOVERY_TARGET and row["event_id"] != event_id
+               for row in events):
+            raise RuntimeError("another HYPE PortfolioEvent makes recovery ambiguous")
+        if any(row["event_id"] != event_id and row["event_id"] not in event_receipts
+               for row in events):
+            raise RuntimeError("an unreceipted PortfolioEvent blocks HYPE recovery")
+        opening, recovered = _hype_activity_topology(
+            ghostfolio_hype_activities(token, account_id), account_id, event
+        )
+        if recovered:
+            raise RuntimeError("HYPE recovery event exists before reclassification")
+        snapshot, original, residual, snapshot_hash = _recovery_snapshot(
+            payload, events, event, opening, now=now
+        )
+        _require_recovery_quantities(
+            snapshot, ghostfolio_quantities(token, account_id), original
+        )
+        if _preflight_recovery_event(event, token) != "missing":
+            raise RuntimeError("HYPE recovery event already exists")
+        intent = {
+            "version": 1, "phase": "PREPARED", "event": event, "snapshot": snapshot,
+            "baseline_event_ids": sorted(row["event_id"] for row in events),
+            "opening_snapshot_hash": snapshot_hash, "opening_original": opening,
+            "event_activity_id": None, "completed_at": None,
+        }
+        save_provenance_reclassification_intent(intent)
+    else:
+        if (
+            canonical(intent["event"]) != canonical(event)
+            or sorted(row["event_id"] for row in events) != intent["baseline_event_ids"]
+        ):
+            raise RuntimeError("newer or changed PortfolioEvents block HYPE recovery")
+        snapshot, original, residual, _ = _intent_economics(intent)
+        snapshot_hash = intent["opening_snapshot_hash"]
+        _require_hype_source_receipt(payload, snapshot_hash, original)
+
+    opening, recovered = _hype_activity_topology(
+        ghostfolio_hype_activities(token, account_id), account_id, event
+    )
+    original_match = _opening_activity_matches(
+        opening, event, snapshot_hash, original, residual=False,
+        original=intent["opening_original"],
+    )
+    residual_match = _opening_activity_matches(
+        opening, event, snapshot_hash, residual, residual=True,
+        original=intent["opening_original"],
+    )
+    if not original_match and not residual_match:
+        raise RuntimeError("HYPE opening activity changed during recovery")
+    event_receipt, _ = _receipt_pair(payload, events, event_id)
+    actual = ghostfolio_quantities(token, account_id)
+    if original_match:
+        if recovered or event_receipt or _preflight_recovery_event(event, token) != "missing":
+            raise RuntimeError("HYPE event appeared before the opening was reduced")
+        _require_recovery_quantities(snapshot, actual, original)
+        _put_residual_opening_activity(opening, residual, event, snapshot_hash, token)
+        opening, recovered = _hype_activity_topology(
+            ghostfolio_hype_activities(token, account_id), account_id, event
+        )
+        if recovered or not _opening_activity_matches(
+            opening, event, snapshot_hash, residual, residual=True,
+            original=intent["opening_original"],
+        ):
+            raise RuntimeError("Ghostfolio did not persist the HYPE residual opening")
+        intent = _set_provenance_phase(intent, "OPENING_REDUCED")
+        flush_ghostfolio_cache(token)
+        _require_recovery_quantities(
+            snapshot, ghostfolio_quantities(token, account_id), residual
+        )
+    elif not recovered:
+        _require_recovery_quantities(snapshot, actual, residual)
+
+    if event_receipt:
+        if recovered is None or recovered["id"] != event_receipt["ghostfolio_activity_id"]:
+            raise RuntimeError("HYPE event receipt does not match Ghostfolio")
+        activity_id, completed_at = recovered["id"], event_receipt["imported_at"]
+    else:
+        preflight = _preflight_recovery_event(event, token)
+        if recovered is None:
+            if preflight != "missing":
+                raise RuntimeError("HYPE recovery duplicate could not be identified")
+            activity_id = _post_recovery_event(event, token)
+            opening, recovered = _hype_activity_topology(
+                ghostfolio_hype_activities(token, account_id), account_id, event
+            )
+            if recovered is None or recovered["id"] != activity_id:
+                raise RuntimeError("HYPE recovery import identity did not persist")
+        elif preflight == "duplicate":
+            activity_id = recovered["id"]
+        else:
+            raise RuntimeError("HYPE recovery activity conflicts with its dry-run")
+        completed_at = intent["completed_at"] or time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        )
+    if (
+        intent["phase"] not in {"EVENT_IMPORTED", "RECEIPTS_PUBLISHED"}
+        or (intent["event_activity_id"], intent["completed_at"])
+        != (activity_id, completed_at)
+    ):
+        intent = _set_provenance_phase(
+            intent, "EVENT_IMPORTED",
+            event_activity_id=activity_id, completed_at=completed_at,
+        )
+    flush_ghostfolio_cache(token)
+    _require_recovery_quantities(
+        snapshot, ghostfolio_quantities(token, account_id), original
+    )
+    calculation = ghostfolio_portfolio_calculation_with_fx_repair(
+        token, {"kraken_account_id": account_id}, now=now
+    )
+    if calculation["portfolio_calculation_has_error"]:
+        raise RuntimeError("Ghostfolio calculation failed during HYPE recovery")
+    _publish_recovery_receipts(intent)
+    event_receipts.add(event_id)
+    if intent["phase"] != "RECEIPTS_PUBLISHED":
+        _set_provenance_phase(intent, "RECEIPTS_PUBLISHED")
+    return _migration_status(event, snapshot_hash, clear_intent=True, complete=True)
+
+
 def load_holdings_intent():
     if not HOLDINGS_INTENT_PATH.is_file():
         return None
@@ -1077,8 +1795,20 @@ def _finalize_holdings_intent(intent, token, reporting, *, now=None):
 
 
 def reconcile_holdings_snapshot(
-    *, commit=False, token=None, now=None, gist_payload=None
+    *,
+    commit=False,
+    token=None,
+    now=None,
+    gist_payload=None,
+    allow_provenance_intent=False,
 ):
+    if (
+        PROVENANCE_RECLASSIFICATION_INTENT_PATH.is_file()
+        and not allow_provenance_intent
+    ):
+        raise RuntimeError(
+            "pending HYPE provenance reclassification blocks holdings reconciliation"
+        )
     # One sync cycle must use one immutable outbox view. Receipt publication
     # deliberately rereads only at the append boundary to preserve concurrent
     # append-only records.
@@ -1323,11 +2053,27 @@ def sync_once():
         file_content(payload, RECEIPT_FILE), events
     )
     token = ghostfolio_token()
+    if (
+        HOLDINGS_INTENT_PATH.is_file()
+        and PROVENANCE_RECLASSIFICATION_INTENT_PATH.is_file()
+    ):
+        raise RuntimeError(
+            "holdings and HYPE provenance intents cannot be recovered concurrently"
+        )
     recover_holdings_intent_before_events(payload, events, receipts, token)
     reporting_accounts = verify_ghostfolio_reporting_accounts(
         token, require_bitkub=False
     )
-    verify_ghostfolio_account_map(reporting_accounts, require_bitkub=False)
+    kraken_account_id = verify_ghostfolio_account_map(
+        reporting_accounts, require_bitkub=False
+    )
+    provenance = process_hype_provenance_reclassification(
+        payload,
+        events,
+        receipts,
+        token,
+        kraken_account_id,
+    )
     for event in events:
         if event["event_id"] in receipts:
             continue
@@ -1372,9 +2118,23 @@ def sync_once():
         if not append_receipt(gist(), receipt):
             raise RuntimeError(f"receipt conflict for {event['event_id']}")
         receipts.add(event["event_id"])
-    holdings = reconcile_holdings_snapshot(
-        commit=True, token=token, gist_payload=payload
-    )
+    holdings_kwargs = {
+        # While the provenance intent still exists, the final holdings pass is
+        # a read-only convergence check.  Creating a holdings intent here
+        # could leave both durable intents after a crash and require manual
+        # recovery.  Normal mutation resumes on the next cycle, after the
+        # provenance state is durable and its intent has been cleared.
+        "commit": not provenance["clear_intent_after_state"],
+        "token": token,
+        "gist_payload": payload,
+    }
+    if provenance["clear_intent_after_state"]:
+        holdings_kwargs["allow_provenance_intent"] = True
+    holdings = reconcile_holdings_snapshot(**holdings_kwargs)
+    if provenance["clear_intent_after_state"] and holdings["drift"]:
+        raise RuntimeError(
+            "holdings drift blocks completion of HYPE provenance reclassification"
+        )
     STATE_PATH.write_text(
         canonical({
             "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1390,9 +2150,20 @@ def sync_once():
             "portfolio_calculation_has_error": holdings[
                 "portfolio_calculation_has_error"
             ],
+            "provenance_reclassification_status": provenance["status"],
+            "provenance_reclassification_event_id": provenance["event_id"],
+            "provenance_reclassification_event_hash": provenance["event_hash"],
+            "provenance_reclassification_opening_snapshot_hash": provenance[
+                "opening_snapshot_hash"
+            ],
+            "provenance_reclassification_receipt_present": provenance[
+                "receipt_present"
+            ],
         }),
         encoding="utf-8",
     )
+    if provenance["clear_intent_after_state"]:
+        clear_provenance_reclassification_intent()
 
 
 def main():
@@ -1400,7 +2171,10 @@ def main():
     if command == "health":
         if not STATE_PATH.is_file():
             return 1
-        if HOLDINGS_INTENT_PATH.is_file():
+        if (
+            HOLDINGS_INTENT_PATH.is_file()
+            or PROVENANCE_RECLASSIFICATION_INTENT_PATH.is_file()
+        ):
             return 1
         maximum_age = max(900, int(os.environ.get("SYNC_INTERVAL_SECONDS", "300")) * 3)
         if time.time() - STATE_PATH.stat().st_mtime > maximum_age:
@@ -1412,6 +2186,40 @@ def main():
         if state.get("holdings_status") not in {"IN_SYNC", "RECONCILED"}:
             return 1
         if state.get("portfolio_calculation_has_error") is not False:
+            return 1
+        provenance_status = state.get("provenance_reclassification_status")
+        if provenance_status == "COMPLETE":
+            if (
+                not _safe_order_id(
+                    state.get("provenance_reclassification_event_id")
+                )
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(state.get("provenance_reclassification_event_hash", "")),
+                )
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(
+                        state.get(
+                            "provenance_reclassification_opening_snapshot_hash"
+                        )
+                    ),
+                )
+                or state.get("provenance_reclassification_receipt_present") is not True
+            ):
+                return 1
+        elif provenance_status == "NOT_REQUIRED":
+            if (
+                state.get("provenance_reclassification_event_id") is not None
+                or state.get("provenance_reclassification_event_hash") is not None
+                or state.get(
+                    "provenance_reclassification_opening_snapshot_hash"
+                )
+                is not None
+                or state.get("provenance_reclassification_receipt_present") is not False
+            ):
+                return 1
+        else:
             return 1
         snapshot_hash = state.get("holdings_snapshot_hash")
         if not isinstance(snapshot_hash, str) or len(snapshot_hash) != 64:

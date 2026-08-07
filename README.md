@@ -310,7 +310,6 @@ credentials it needs; the reporting sidecar receives no database, Redis, JWT,
 or Kraken credentials.
 
 ```powershell
-$env:DCA_GHOSTFOLIO_SECRETS_FILE="$env:LOCALAPPDATA\dca-ghostfolio\secrets.env"
 docker compose -f .\ghostfolio\compose.yml ps
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ghostfolio\backup-and-restore-test.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ghostfolio\install-backup-task.ps1 -RetentionCount 14
@@ -351,6 +350,33 @@ quantity checks are scoped explicitly to the `Kraken DCA` account; activities
 in `Bitkub Legacy` are excluded and cannot be changed by Kraken reconciliation.
 If a DCA fill is newer than the latest holdings snapshot, reconciliation waits
 for a fresh snapshot instead of creating a compensating sale.
+
+The manual `Recover Confirmed Ghostfolio Event` workflow is restricted to the
+confirmed 7 August 2026 HYPE/USD incident. Store the exact Kraken crypto and
+funding order IDs temporarily in the Actions secrets
+`GHOSTFOLIO_RECOVERY_CRYPTO_ORDER_ID` and
+`GHOSTFOLIO_RECOVERY_FUNDING_ORDER_ID`; they are deliberately not public
+workflow inputs. Run `preview`, review both the canonical event hash and exact
+Markdown-row hash, then run `publish` with both hashes. The command derives the
+original deterministic client IDs and uses Kraken reconciliation-only calls;
+it cannot submit either order leg. Publication also fails unless the
+reconstructed Kraken evidence reproduces the existing Markdown ledger row
+exactly. A repeat run is an idempotent exact-duplicate check.
+
+Before `publish`, put the same two order IDs and the preview's canonical event
+hash in the user-only `%LOCALAPPDATA%\dca-ghostfolio\secrets.env` as
+`GHOSTFOLIO_RECOVERY_CRYPTO_ORDER_ID`,
+`GHOSTFOLIO_RECOVERY_FUNDING_ORDER_ID`, and
+`GHOSTFOLIO_RECOVERY_EVENT_HASH`. Run
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+.\ghostfolio\write-service-env.ps1`, then rebuild and force-recreate only the
+`sync` service. The sidecar durably reduces the historical HYPE opening balance
+to its residual quantity before importing the real order, so it never invents
+a compensating sale or double-counts HYPE. Wait for sidecar health and the
+provenance state to report `COMPLETE`, then remove all three temporary local
+keys and both temporary Actions secrets, regenerate `sync.env`, and recreate
+`sync` once more. The completed receipt remains sufficient for future runs;
+the temporary evidence is not retained in Git or required at runtime.
 
 The snapshot workflow shares the durable DCA state-writer lock and refuses to
 publish while an order intent or PortfolioEvent delivery is unresolved. Local

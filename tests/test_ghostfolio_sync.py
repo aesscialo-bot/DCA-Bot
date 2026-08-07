@@ -13,6 +13,13 @@ SPEC = importlib.util.spec_from_file_location("ghostfolio_sync", PATH)
 ghostfolio_sync = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ghostfolio_sync)
 
+SYNTHETIC_RECOVERY_EVENT_ID = "OTEST1-CRYPTO-ORDER"
+SYNTHETIC_RECOVERY_FUNDING_ID = "OTEST1-FUNDING-ORDER"
+SYNTHETIC_OPENING_HASH = "b" * 64
+SYNTHETIC_OPENING_QUANTITY = 1.25
+SYNTHETIC_EVENT_QUANTITY = 0.25
+SYNTHETIC_RESIDUAL_QUANTITY = 1.0
+
 
 def event(identifier="ORDER-1"):
     value = {
@@ -99,6 +106,142 @@ def resign_snapshot(snapshot):
     return snapshot
 
 
+def confirmed_hype_event():
+    value = {
+        "event_version": 3,
+        "event_id": SYNTHETIC_RECOVERY_EVENT_ID,
+        "occurred_at": "2026-08-07T06:02:03Z",
+        "target": "HYPE_USD",
+        "base_currency": "HYPE",
+        "quote_currency": "USD",
+        "budget_currency": "GBP",
+        "funding_order_id": SYNTHETIC_RECOVERY_FUNDING_ID,
+        "crypto_order_id": SYNTHETIC_RECOVERY_EVENT_ID,
+        "gbp_debit": "9",
+        "gbp_usd_rate": "1.25",
+        "funded_usd": "11.25",
+        "route": "GBP_TO_USD",
+        "crypto_cost_quote": "11",
+        "crypto_quantity": "0.25",
+        "unit_price_quote": "44",
+        "funding_fee_quote": "0.02",
+        "crypto_fee_quote": "0.03",
+    }
+    return resign_event(value)
+
+
+def synthetic_recovery_snapshot():
+    snapshot = {
+        "version": 1,
+        "as_of": "2026-08-07T08:00:00Z",
+        "holdings": {
+            "BTC_GBP": {
+                "asset": "BTC",
+                "pair": "BTC/GBP",
+                "quantity": "0.01",
+                "quote_currency": "GBP",
+                "unit_price_quote": "50000",
+            },
+            "HYPE_USD": {
+                "asset": "HYPE",
+                "pair": "HYPE/USD",
+                "quantity": "1.25",
+                "quote_currency": "USD",
+                "unit_price_quote": "40",
+            },
+            "SOL_GBP": {
+                "asset": "SOL",
+                "pair": "SOL/GBP",
+                "quantity": "2",
+                "quote_currency": "GBP",
+                "unit_price_quote": "50",
+            },
+        },
+        "unsupported_nonzero_assets": [],
+    }
+    return resign_snapshot(snapshot)
+
+
+def hype_opening_activity(*, residual=False):
+    return {
+        "id": "hype-opening-activity",
+        "accountId": "kraken",
+        "comment": (
+            ghostfolio_sync._recovery_residual_comment(
+                SYNTHETIC_OPENING_HASH, SYNTHETIC_RECOVERY_EVENT_ID
+            )
+            if residual
+            else (
+                "Kraken opening-balance reconciliation; "
+                f"snapshot={SYNTHETIC_OPENING_HASH}; target=HYPE_USD"
+            )
+        ),
+        "currency": "USD",
+        "date": "2026-08-07T06:30:00Z",
+        "fee": 0,
+        "quantity": (
+            SYNTHETIC_RESIDUAL_QUANTITY
+            if residual
+            else SYNTHETIC_OPENING_QUANTITY
+        ),
+        "type": "BUY",
+        "unitPrice": 40,
+        "tags": [],
+        "assetProfile": {"dataSource": "YAHOO", "symbol": "HYPE32196USD"},
+    }
+
+
+def hype_event_activity(item=None):
+    item = item or confirmed_hype_event()
+    return {
+        "id": "hype-recovery-activity",
+        "accountId": "kraken",
+        "comment": (
+            f"Kraken orders funding={item['funding_order_id']} "
+            f"crypto={item['crypto_order_id']}; route={item['route']}; "
+            f"funding fee {item['quote_currency']} {item['funding_fee_quote']}; "
+            f"crypto fee {item['quote_currency']} {item['crypto_fee_quote']}"
+        ),
+        "currency": "USD",
+        "date": item["occurred_at"],
+        "fee": float(item["crypto_fee_quote"]),
+        "quantity": float(item["crypto_quantity"]),
+        "type": "BUY",
+        "unitPrice": float(item["unit_price_quote"]),
+        "tags": [],
+        "assetProfile": {
+            "dataSource": "YAHOO",
+            "symbol": "HYPE32196USD",
+        },
+    }
+
+
+def hype_recovery_payload():
+    item = confirmed_hype_event()
+    snapshot = synthetic_recovery_snapshot()
+    source_receipt = {
+        "snapshot_hash": SYNTHETIC_OPENING_HASH,
+        "reconciled_at": "2026-08-07T06:35:00Z",
+        "adjustments": [
+            {"target": "HYPE_USD", "quantity_delta": "1.25"},
+            {"target": "SOL_GBP", "quantity_delta": "0.5"},
+        ],
+    }
+    return {
+        "files": {
+            ghostfolio_sync.EVENT_FILE: {
+                "content": ghostfolio_sync.canonical(item) + "\n"
+            },
+            ghostfolio_sync.HOLDINGS_SNAPSHOT_FILE: {
+                "content": ghostfolio_sync.canonical(snapshot)
+            },
+            ghostfolio_sync.HOLDINGS_RECEIPT_FILE: {
+                "content": ghostfolio_sync.canonical(source_receipt) + "\n"
+            },
+        }
+    }
+
+
 REPORTING_CONTEXT = {"kraken_account_id": "kraken"}
 SNAPSHOT_NOW = datetime(2026, 8, 7, 4, 30, tzinfo=timezone.utc)
 
@@ -106,14 +249,37 @@ SNAPSHOT_NOW = datetime(2026, 8, 7, 4, 30, tzinfo=timezone.utc)
 class GhostfolioSyncTests(unittest.TestCase):
     def setUp(self):
         self._intent_directory = tempfile.TemporaryDirectory()
+        self._recovery_env_patch = patch.dict(
+            ghostfolio_sync.os.environ,
+            {
+                ghostfolio_sync.HYPE_RECOVERY_EVENT_ID_ENV: (
+                    SYNTHETIC_RECOVERY_EVENT_ID
+                ),
+                ghostfolio_sync.HYPE_RECOVERY_FUNDING_ORDER_ID_ENV: (
+                    SYNTHETIC_RECOVERY_FUNDING_ID
+                ),
+                ghostfolio_sync.HYPE_RECOVERY_EVENT_HASH_ENV: (
+                    confirmed_hype_event()["canonical_hash"]
+                ),
+            },
+        )
         self._intent_patch = patch.object(
             ghostfolio_sync,
             "HOLDINGS_INTENT_PATH",
             Path(self._intent_directory.name) / "holdings-intent.json",
         )
+        self._provenance_intent_patch = patch.object(
+            ghostfolio_sync,
+            "PROVENANCE_RECLASSIFICATION_INTENT_PATH",
+            Path(self._intent_directory.name) / "provenance-intent.json",
+        )
         self._intent_patch.start()
+        self._provenance_intent_patch.start()
+        self._recovery_env_patch.start()
 
     def tearDown(self):
+        self._recovery_env_patch.stop()
+        self._provenance_intent_patch.stop()
         self._intent_patch.stop()
         self._intent_directory.cleanup()
 
@@ -134,6 +300,16 @@ class GhostfolioSyncTests(unittest.TestCase):
             "sync python /opt/sync/ghostfolio_sync.py once", configuration
         )
         self.assertIn("up -d --build --force-recreate sync", configuration)
+
+        scoped_env = (root / "ghostfolio" / "write-service-env.ps1").read_text(
+            encoding="utf-8"
+        )
+        for key in (
+            "GHOSTFOLIO_RECOVERY_CRYPTO_ORDER_ID",
+            "GHOSTFOLIO_RECOVERY_FUNDING_ORDER_ID",
+            "GHOSTFOLIO_RECOVERY_EVENT_HASH",
+        ):
+            self.assertIn(key, scoped_env)
 
         key_sync = (
             root / "ghostfolio" / "sync-canonical-key.ps1"
@@ -653,6 +829,571 @@ class GhostfolioSyncTests(unittest.TestCase):
         )
         self.assertIs(reconcile.call_args.kwargs["gist_payload"], payload)
 
+    def test_confirmed_hype_reclassification_is_durable_and_quantity_neutral(self):
+        payload = hype_recovery_payload()
+        remote = json.loads(ghostfolio_sync.canonical(payload))
+        item = confirmed_hype_event()
+        events = ghostfolio_sync.parse_events(
+            ghostfolio_sync.file_content(payload, ghostfolio_sync.EVENT_FILE)
+        )
+        receipts = set()
+        original = [hype_opening_activity()]
+        residual = [hype_opening_activity(residual=True)]
+        completed = residual + [hype_event_activity(item)]
+        quantities = {
+            "BTC_GBP": 0.01,
+            "SOL_GBP": 2,
+        }
+        gist_updates = []
+
+        def update_opening(_identity, amount, _event, snapshot_hash, _token):
+            self.assertTrue(
+                ghostfolio_sync.PROVENANCE_RECLASSIFICATION_INTENT_PATH.is_file()
+            )
+            self.assertEqual(
+                ghostfolio_sync.load_provenance_reclassification_intent()["phase"],
+                "PREPARED",
+            )
+            self.assertEqual(amount, ghostfolio_sync.Decimal("1"))
+            self.assertEqual(snapshot_hash, SYNTHETIC_OPENING_HASH)
+
+        def publish_gist(_url, **kwargs):
+            self.assertEqual(kwargs["method"], "PATCH")
+            files = kwargs["payload"]["files"]
+            self.assertEqual(
+                set(files),
+                {
+                    ghostfolio_sync.RECEIPT_FILE,
+                    ghostfolio_sync.PROVENANCE_RECLASSIFICATION_RECEIPT_FILE,
+                },
+            )
+            gist_updates.append(files)
+            remote["files"].update(json.loads(ghostfolio_sync.canonical(files)))
+            return 200, {}
+
+        with (
+            patch.dict(
+                ghostfolio_sync.os.environ,
+                {
+                    "GHOSTFOLIO_ACCOUNT_MAP": json.dumps(
+                        {"HYPE_USD": "kraken"}
+                    ),
+                    "GIST_ID": "gist",
+                    "GIST_TOKEN": "token",
+                },
+            ),
+            patch.object(
+                ghostfolio_sync,
+                "ghostfolio_hype_activities",
+                side_effect=[original, original, residual, completed],
+            ),
+            patch.object(
+                ghostfolio_sync,
+                "ghostfolio_quantities",
+                side_effect=[
+                    {**quantities, "HYPE_USD": 1.25},
+                    {**quantities, "HYPE_USD": 1.25},
+                    {**quantities, "HYPE_USD": 1},
+                    {**quantities, "HYPE_USD": 1.25},
+                ],
+            ),
+            patch.object(
+                ghostfolio_sync,
+                "_preflight_recovery_event",
+                side_effect=["missing", "missing", "missing"],
+            ),
+            patch.object(
+                ghostfolio_sync,
+                "_put_residual_opening_activity",
+                side_effect=update_opening,
+            ) as update,
+            patch.object(
+                ghostfolio_sync,
+                "_post_recovery_event",
+                return_value="hype-recovery-activity",
+            ) as imported,
+            patch.object(ghostfolio_sync, "flush_ghostfolio_cache"),
+            patch.object(
+                ghostfolio_sync,
+                "ghostfolio_portfolio_calculation",
+                return_value={
+                    "portfolio_calculation_status": "OK",
+                    "portfolio_calculation_has_error": False,
+                },
+            ),
+            patch.object(
+                ghostfolio_sync,
+                "gist",
+                side_effect=lambda: json.loads(ghostfolio_sync.canonical(remote)),
+            ),
+            patch.object(
+                ghostfolio_sync, "request_json", side_effect=publish_gist
+            ),
+        ):
+            result = ghostfolio_sync.process_hype_provenance_reclassification(
+                payload,
+                events,
+                receipts,
+                "token",
+                "kraken",
+                now=datetime(2026, 8, 7, 8, 30, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(result["status"], "COMPLETE")
+        self.assertTrue(result["clear_intent_after_state"])
+        self.assertEqual(receipts, {SYNTHETIC_RECOVERY_EVENT_ID})
+        self.assertEqual(len(gist_updates), 1)
+        update.assert_called_once()
+        imported.assert_called_once_with(item, "token")
+        intent = ghostfolio_sync.load_provenance_reclassification_intent()
+        self.assertEqual(intent["phase"], "RECEIPTS_PUBLISHED")
+        _snapshot, original_quantity, residual_quantity, event_quantity = (
+            ghostfolio_sync._intent_economics(intent)
+        )
+        self.assertEqual(original_quantity, ghostfolio_sync.Decimal("1.25"))
+        self.assertEqual(residual_quantity, ghostfolio_sync.Decimal("1"))
+        self.assertEqual(event_quantity, ghostfolio_sync.Decimal("0.25"))
+        update_payload = ghostfolio_sync._opening_update_payload(
+            ghostfolio_sync._stable_hype_activity(original[0], "kraken"),
+            ghostfolio_sync.Decimal("1"),
+            item,
+            SYNTHETIC_OPENING_HASH,
+        )
+        self.assertEqual(update_payload["type"], "BUY")
+        self.assertEqual(update_payload["id"], original[0]["id"])
+        self.assertEqual(hype_event_activity(item)["type"], "BUY")
+        event_rows = ghostfolio_sync._event_receipt_rows(
+            ghostfolio_sync.file_content(remote, ghostfolio_sync.RECEIPT_FILE),
+            events,
+        )
+        provenance_rows = (
+            ghostfolio_sync.parse_provenance_reclassification_receipts(
+                ghostfolio_sync.file_content(
+                    remote,
+                    ghostfolio_sync.PROVENANCE_RECLASSIFICATION_RECEIPT_FILE,
+                ),
+                events,
+            )
+        )
+        self.assertIn(SYNTHETIC_RECOVERY_EVENT_ID, event_rows)
+        self.assertIn(SYNTHETIC_RECOVERY_EVENT_ID, provenance_rows)
+
+        ghostfolio_sync.clear_provenance_reclassification_intent()
+        with (
+            patch.dict(
+                ghostfolio_sync.os.environ,
+                {"GHOSTFOLIO_ACCOUNT_MAP": json.dumps({"HYPE_USD": "kraken"})},
+                clear=True,
+            ),
+            patch.object(
+                ghostfolio_sync,
+                "ghostfolio_hype_activities",
+                return_value=completed,
+            ),
+        ):
+            completed_without_private_env = (
+                ghostfolio_sync.process_hype_provenance_reclassification(
+                    remote,
+                    events,
+                    set(event_rows),
+                    "token",
+                    "kraken",
+                )
+            )
+        self.assertEqual(completed_without_private_env["status"], "COMPLETE")
+
+    def test_residual_opening_update_uses_exact_put_contract(self):
+        item = confirmed_hype_event()
+        identity = ghostfolio_sync._stable_hype_activity(
+            hype_opening_activity(), "kraken"
+        )
+        with (
+            patch.dict(
+                ghostfolio_sync.os.environ,
+                {"GHOSTFOLIO_URL": "http://ghostfolio.test"},
+            ),
+            patch.object(
+                ghostfolio_sync,
+                "request_json",
+                return_value=(200, {}),
+            ) as request,
+        ):
+            ghostfolio_sync._put_residual_opening_activity(
+                identity,
+                ghostfolio_sync.Decimal("1"),
+                item,
+                SYNTHETIC_OPENING_HASH,
+                "security-token",
+            )
+
+        request.assert_called_once_with(
+            "http://ghostfolio.test/api/v1/activities/hype-opening-activity",
+            method="PUT",
+            token="security-token",
+            payload={
+                "accountId": "kraken",
+                "comment": (
+                    "Kraken opening-balance residual after PortfolioEvent recovery; "
+                    f"snapshot={SYNTHETIC_OPENING_HASH}; target=HYPE_USD; "
+                    f"event={SYNTHETIC_RECOVERY_EVENT_ID}"
+                ),
+                "currency": "USD",
+                "dataSource": "YAHOO",
+                "date": "2026-08-07T06:30:00.000000Z",
+                "fee": 0.0,
+                "id": "hype-opening-activity",
+                "quantity": 1.0,
+                "symbol": "HYPE32196USD",
+                "tags": [],
+                "type": "BUY",
+                "unitPrice": 40.0,
+            },
+        )
+
+    def test_sync_once_keeps_provenance_intent_and_refuses_mutating_drift(self):
+        payload = {"files": {}}
+        holdings = {
+            "status": "DRIFT",
+            "drift": {"SOL_GBP": ghostfolio_sync.Decimal("0.1")},
+            "snapshot_as_of": "2026-08-07T04:00:00Z",
+            "snapshot_hash": "a" * 64,
+            "portfolio_calculation_status": "OK",
+            "portfolio_calculation_has_error": False,
+        }
+        provenance = {
+            "status": "COMPLETE",
+            "event_id": SYNTHETIC_RECOVERY_EVENT_ID,
+            "event_hash": confirmed_hype_event()["canonical_hash"],
+            "opening_snapshot_hash": SYNTHETIC_OPENING_HASH,
+            "receipt_present": True,
+            "clear_intent_after_state": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            with (
+                patch.object(ghostfolio_sync, "STATE_PATH", state_path),
+                patch.object(ghostfolio_sync, "gist", return_value=payload),
+                patch.object(ghostfolio_sync, "ghostfolio_token", return_value="token"),
+                patch.object(
+                    ghostfolio_sync,
+                    "verify_ghostfolio_reporting_accounts",
+                    return_value={"Kraken DCA": "kraken"},
+                ),
+                patch.object(
+                    ghostfolio_sync,
+                    "verify_ghostfolio_account_map",
+                    return_value="kraken",
+                ),
+                patch.object(
+                    ghostfolio_sync,
+                    "process_hype_provenance_reclassification",
+                    return_value=provenance,
+                ),
+                patch.object(
+                    ghostfolio_sync,
+                    "reconcile_holdings_snapshot",
+                    return_value=holdings,
+                ) as reconcile,
+                patch.object(
+                    ghostfolio_sync,
+                    "clear_provenance_reclassification_intent",
+                ) as clear_intent,
+                self.assertRaisesRegex(RuntimeError, "holdings drift blocks"),
+            ):
+                ghostfolio_sync.sync_once()
+
+        reconcile.assert_called_once_with(
+            commit=False,
+            token="token",
+            gist_payload=payload,
+            allow_provenance_intent=True,
+        )
+        clear_intent.assert_not_called()
+        self.assertFalse(state_path.exists())
+
+    def test_unreceipted_hype_event_requires_private_recovery_evidence(self):
+        payload = hype_recovery_payload()
+        events = ghostfolio_sync.parse_events(
+            ghostfolio_sync.file_content(payload, ghostfolio_sync.EVENT_FILE)
+        )
+        with (
+            patch.dict(
+                ghostfolio_sync.os.environ,
+                {"GHOSTFOLIO_ACCOUNT_MAP": json.dumps({"HYPE_USD": "kraken"})},
+                clear=True,
+            ),
+            patch.object(ghostfolio_sync, "ghostfolio_hype_activities") as read,
+            self.assertRaisesRegex(RuntimeError, "recovery evidence is required"),
+        ):
+            ghostfolio_sync.process_hype_provenance_reclassification(
+                payload, events, set(), "token", "kraken"
+            )
+        read.assert_not_called()
+
+    def test_hype_recovery_fails_closed_on_ambiguity_negative_residual_and_drift(self):
+        item = confirmed_hype_event()
+        opening = hype_opening_activity()
+        duplicate = dict(opening, id="second-opening")
+        with (
+            patch.dict(
+                ghostfolio_sync.os.environ,
+                {"GHOSTFOLIO_ACCOUNT_MAP": json.dumps({"HYPE_USD": "kraken"})},
+            ),
+            self.assertRaisesRegex(RuntimeError, "topology is ambiguous"),
+        ):
+            ghostfolio_sync._hype_activity_topology(
+                [opening, duplicate], "kraken", item
+            )
+
+        payload = hype_recovery_payload()
+        payload["files"][ghostfolio_sync.HOLDINGS_SNAPSHOT_FILE]["content"] = (
+            ghostfolio_sync.canonical(
+                resign_snapshot({
+                    **synthetic_recovery_snapshot(),
+                    "holdings": {
+                        **synthetic_recovery_snapshot()["holdings"],
+                        "HYPE_USD": {
+                            **synthetic_recovery_snapshot()["holdings"]["HYPE_USD"],
+                            "quantity": "0.2",
+                        },
+                    },
+                })
+            )
+        )
+        payload["files"][ghostfolio_sync.HOLDINGS_RECEIPT_FILE]["content"] = (
+            ghostfolio_sync.canonical({
+                "snapshot_hash": SYNTHETIC_OPENING_HASH,
+                "reconciled_at": "2026-08-07T06:35:00Z",
+                "adjustments": [
+                    {"target": "HYPE_USD", "quantity_delta": "0.2"}
+                ],
+            })
+            + "\n"
+        )
+        small_opening = hype_opening_activity()
+        small_opening["quantity"] = 0.2
+        events = [item]
+        with self.assertRaisesRegex(RuntimeError, "residual is not positive"):
+            ghostfolio_sync._recovery_snapshot(
+                payload,
+                events,
+                item,
+                ghostfolio_sync._stable_hype_activity(small_opening, "kraken"),
+                now=datetime(2026, 8, 7, 8, 30, tzinfo=timezone.utc),
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "drift.*HYPE_USD"):
+            ghostfolio_sync._require_recovery_quantities(
+                synthetic_recovery_snapshot(),
+                {"BTC_GBP": 0.01, "HYPE_USD": 1.2, "SOL_GBP": 2},
+                ghostfolio_sync.Decimal("1.25"),
+            )
+
+    def test_hype_reclassification_recovers_after_each_remote_crash_boundary(self):
+        item = confirmed_hype_event()
+        now = datetime(2026, 8, 7, 8, 30, tzinfo=timezone.utc)
+        balances = {"BTC_GBP": 0.01, "SOL_GBP": 2}
+
+        for crash_point in ("after_put", "after_import", "after_receipts"):
+            with self.subTest(crash_point=crash_point):
+                ghostfolio_sync.clear_provenance_reclassification_intent()
+                remote = hype_recovery_payload()
+                state = {
+                    "opening_reduced": False,
+                    "event_imported": False,
+                    "crashed": False,
+                    "put_count": 0,
+                    "import_count": 0,
+                    "publish_count": 0,
+                }
+
+                def activities(_token, _account):
+                    result = [
+                        hype_opening_activity(residual=state["opening_reduced"])
+                    ]
+                    if state["event_imported"]:
+                        result.append(hype_event_activity(item))
+                    return result
+
+                def quantities(_token, _account):
+                    hype = 1 if state["opening_reduced"] else 1.25
+                    if state["event_imported"]:
+                        hype += 0.25
+                    return {**balances, "HYPE_USD": hype}
+
+                def preflight(_event, _token):
+                    return "duplicate" if state["event_imported"] else "missing"
+
+                def put_opening(
+                    _identity, _residual, _event, _snapshot_hash, _token
+                ):
+                    state["opening_reduced"] = True
+                    state["put_count"] += 1
+                    if crash_point == "after_put" and not state["crashed"]:
+                        state["crashed"] = True
+                        raise RuntimeError("simulated crash after PUT")
+
+                def import_event(_event, _token):
+                    state["event_imported"] = True
+                    state["import_count"] += 1
+                    if crash_point == "after_import" and not state["crashed"]:
+                        state["crashed"] = True
+                        raise RuntimeError("simulated crash after import")
+                    return "hype-recovery-activity"
+
+                def publish(intent):
+                    state["publish_count"] += 1
+                    event_receipt, provenance_receipt = (
+                        ghostfolio_sync._migration_receipts(
+                            intent["event"], intent
+                        )
+                    )
+                    files = remote.setdefault("files", {})
+                    files[ghostfolio_sync.RECEIPT_FILE] = {
+                        "content": ghostfolio_sync.canonical(event_receipt)
+                        + "\n"
+                    }
+                    files[
+                        ghostfolio_sync.PROVENANCE_RECLASSIFICATION_RECEIPT_FILE
+                    ] = {
+                        "content": ghostfolio_sync.canonical(provenance_receipt)
+                        + "\n"
+                    }
+                    if crash_point == "after_receipts" and not state["crashed"]:
+                        state["crashed"] = True
+                        raise RuntimeError("simulated crash after receipts")
+
+                with (
+                    patch.dict(
+                        ghostfolio_sync.os.environ,
+                        {
+                            "GHOSTFOLIO_ACCOUNT_MAP": json.dumps(
+                                {"HYPE_USD": "kraken"}
+                            )
+                        },
+                    ),
+                    patch.object(
+                        ghostfolio_sync,
+                        "ghostfolio_hype_activities",
+                        side_effect=activities,
+                    ),
+                    patch.object(
+                        ghostfolio_sync,
+                        "ghostfolio_quantities",
+                        side_effect=quantities,
+                    ),
+                    patch.object(
+                        ghostfolio_sync,
+                        "_preflight_recovery_event",
+                        side_effect=preflight,
+                    ),
+                    patch.object(
+                        ghostfolio_sync,
+                        "_put_residual_opening_activity",
+                        side_effect=put_opening,
+                    ),
+                    patch.object(
+                        ghostfolio_sync,
+                        "_post_recovery_event",
+                        side_effect=import_event,
+                    ),
+                    patch.object(
+                        ghostfolio_sync,
+                        "_publish_recovery_receipts",
+                        side_effect=publish,
+                    ),
+                    patch.object(ghostfolio_sync, "flush_ghostfolio_cache"),
+                    patch.object(
+                        ghostfolio_sync,
+                        "ghostfolio_portfolio_calculation",
+                        return_value={
+                            "portfolio_calculation_status": "OK",
+                            "portfolio_calculation_has_error": False,
+                        },
+                    ),
+                ):
+                    first_payload = json.loads(ghostfolio_sync.canonical(remote))
+                    first_events = ghostfolio_sync.parse_events(
+                        ghostfolio_sync.file_content(
+                            first_payload, ghostfolio_sync.EVENT_FILE
+                        )
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+                        ghostfolio_sync.process_hype_provenance_reclassification(
+                            first_payload,
+                            first_events,
+                            set(),
+                            "token",
+                            "kraken",
+                            now=now,
+                        )
+                    self.assertTrue(
+                        ghostfolio_sync.PROVENANCE_RECLASSIFICATION_INTENT_PATH.is_file()
+                    )
+
+                    resume_payload = json.loads(ghostfolio_sync.canonical(remote))
+                    resume_events = ghostfolio_sync.parse_events(
+                        ghostfolio_sync.file_content(
+                            resume_payload, ghostfolio_sync.EVENT_FILE
+                        )
+                    )
+                    resume_receipts = ghostfolio_sync.parse_event_receipts(
+                        ghostfolio_sync.file_content(
+                            resume_payload, ghostfolio_sync.RECEIPT_FILE
+                        ),
+                        resume_events,
+                    )
+                    result = ghostfolio_sync.process_hype_provenance_reclassification(
+                        resume_payload,
+                        resume_events,
+                        resume_receipts,
+                        "token",
+                        "kraken",
+                        now=now,
+                    )
+
+                self.assertEqual(result["status"], "COMPLETE")
+                self.assertEqual(state["put_count"], 1)
+                self.assertEqual(state["import_count"], 1)
+                self.assertAlmostEqual(quantities(None, None)["HYPE_USD"], 1.25)
+                self.assertGreaterEqual(state["publish_count"], 1)
+
+    def test_hype_recovery_intent_rejects_a_newer_outbox_event(self):
+        item = confirmed_hype_event()
+        snapshot = synthetic_recovery_snapshot()
+        opening = ghostfolio_sync._stable_hype_activity(
+            hype_opening_activity(), "kraken"
+        )
+        ghostfolio_sync.save_provenance_reclassification_intent({
+            "version": 1,
+            "phase": "PREPARED",
+            "event": item,
+            "snapshot": snapshot,
+            "baseline_event_ids": [item["event_id"]],
+            "opening_snapshot_hash": SYNTHETIC_OPENING_HASH,
+            "opening_original": opening,
+            "event_activity_id": None,
+            "completed_at": None,
+        })
+        newer = event("NEWER-SOL-EVENT")
+        newer["occurred_at"] = "2026-08-07T08:05:00Z"
+        resign_event(newer)
+        payload = hype_recovery_payload()
+        payload["files"][ghostfolio_sync.EVENT_FILE]["content"] += (
+            ghostfolio_sync.canonical(newer) + "\n"
+        )
+        events = ghostfolio_sync.parse_events(
+            payload["files"][ghostfolio_sync.EVENT_FILE]["content"]
+        )
+        with (
+            patch.object(ghostfolio_sync, "ghostfolio_hype_activities") as read,
+            self.assertRaisesRegex(RuntimeError, "newer or changed"),
+        ):
+            ghostfolio_sync.process_hype_provenance_reclassification(
+                payload, events, set(), "token", "kraken"
+            )
+        read.assert_not_called()
+
     def test_successful_event_import_without_activity_id_is_not_receipted(self):
         item = event("MISSING-ACTIVITY-ID")
         payload = {
@@ -747,8 +1488,10 @@ class GhostfolioSyncTests(unittest.TestCase):
                     ghostfolio_sync.os.environ,
                     {
                         "GHOSTFOLIO_ACCOUNT_MAP": json.dumps({"SOL_GBP": "kraken"}),
-                        "HOLDINGS_SNAPSHOT_MAX_AGE_SECONDS": "14400",
                     },
+                ),
+                patch.object(
+                    ghostfolio_sync, "HOLDINGS_SNAPSHOT_MAX_AGE_SECONDS", 21600
                 ),
                 patch.object(
                     ghostfolio_sync, "STATE_PATH", Path(directory) / "state.json"
@@ -1307,6 +2050,11 @@ class GhostfolioSyncTests(unittest.TestCase):
                 healthy_fields = {
                     "holdings_snapshot_as_of": fresh_snapshot,
                     "holdings_snapshot_hash": "a" * 64,
+                    "provenance_reclassification_status": "NOT_REQUIRED",
+                    "provenance_reclassification_event_id": None,
+                    "provenance_reclassification_event_hash": None,
+                    "provenance_reclassification_opening_snapshot_hash": None,
+                    "provenance_reclassification_receipt_present": False,
                 }
                 state_path.write_text(
                     json.dumps({
@@ -1337,6 +2085,32 @@ class GhostfolioSyncTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 self.assertEqual(ghostfolio_sync.main(), 0)
+
+                state_path.write_text(
+                    json.dumps({
+                        "holdings_status": "IN_SYNC",
+                        "portfolio_calculation_has_error": False,
+                        **healthy_fields,
+                        "provenance_reclassification_status": "COMPLETE",
+                        "provenance_reclassification_event_id": (
+                            SYNTHETIC_RECOVERY_EVENT_ID
+                        ),
+                        "provenance_reclassification_event_hash": (
+                            confirmed_hype_event()["canonical_hash"]
+                        ),
+                        "provenance_reclassification_opening_snapshot_hash": (
+                            SYNTHETIC_OPENING_HASH
+                        ),
+                        "provenance_reclassification_receipt_present": True,
+                    }),
+                    encoding="utf-8",
+                )
+                self.assertEqual(ghostfolio_sync.main(), 0)
+                ghostfolio_sync.PROVENANCE_RECLASSIFICATION_INTENT_PATH.write_text(
+                    "{}", encoding="utf-8"
+                )
+                self.assertEqual(ghostfolio_sync.main(), 1)
+                ghostfolio_sync.PROVENANCE_RECLASSIFICATION_INTENT_PATH.unlink()
 
                 # The prior state schema cannot prove current Kraken coverage.
                 state_path.write_text(
