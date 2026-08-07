@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 import requests
 
+from dca_config import validate_execution_state
 from kraken_client import get_kraken_exchange
 
 
@@ -26,15 +27,66 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def ensure_snapshot_safe_execution_state(value):
+    """Refuse a balance watermark while a fill or outbox event is unresolved."""
+    state = validate_execution_state(value)
+    blockers = []
+    for target, entry in state.items():
+        if entry.get("PENDING_ORDER") is not None:
+            blockers.append(f"{target}:pending-order")
+        if entry.get("PENDING_GIST_DELIVERIES"):
+            blockers.append(f"{target}:pending-delivery")
+    if blockers:
+        raise RuntimeError(
+            "Kraken holdings snapshot blocked by unresolved DCA state: "
+            + ", ".join(sorted(blockers))
+        )
+    return state
+
+
 def build_snapshot(exchange, *, now=None):
     reference = now or datetime.now(timezone.utc)
-    balances = exchange.fetch_balance().get("total", {}) or {}
+    if (
+        not isinstance(reference, datetime)
+        or reference.tzinfo is None
+        or reference.utcoffset() is None
+    ):
+        raise RuntimeError("Kraken holdings snapshot time must include a timezone")
+    balance_response = exchange.fetch_balance()
+    balances = (
+        balance_response.get("total")
+        if isinstance(balance_response, dict)
+        else None
+    )
+    if not isinstance(balances, dict):
+        raise RuntimeError("Kraken balance response is malformed")
+    normalized_balances = {}
+    for asset, value in balances.items():
+        if not isinstance(asset, str) or not asset or isinstance(value, bool):
+            raise RuntimeError("Kraken balance response is malformed")
+        try:
+            quantity = float(value or 0)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"invalid Kraken balance for {asset}") from error
+        if not math.isfinite(quantity) or quantity < 0:
+            raise RuntimeError(f"invalid Kraken balance for {asset}")
+        normalized_balances[asset] = quantity
     holdings = {}
     for target, (asset, pair, quote) in TARGETS.items():
-        quantity = float(balances.get(asset) or 0)
+        quantity = normalized_balances.get(asset, 0.0)
         ticker = exchange.fetch_ticker(pair)
-        price = float(ticker.get("last") or ticker.get("close") or 0)
-        if not math.isfinite(quantity) or quantity < 0 or not math.isfinite(price) or price <= 0:
+        if not isinstance(ticker, dict):
+            raise RuntimeError(f"invalid Kraken holding or ticker for {target}")
+        price_value = ticker.get("last") or ticker.get("close") or 0
+        if isinstance(price_value, bool):
+            raise RuntimeError(f"invalid Kraken holding or ticker for {target}")
+        try:
+            price = float(price_value)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"invalid Kraken holding or ticker for {target}"
+            ) from error
+        if not math.isfinite(price) or price <= 0:
             raise RuntimeError(f"invalid Kraken holding or ticker for {target}")
         holdings[target] = {
             "asset": asset,
@@ -45,8 +97,8 @@ def build_snapshot(exchange, *, now=None):
         }
     supported_assets = {item[0] for item in TARGETS.values()}
     unsupported = sorted(
-        asset for asset, value in balances.items()
-        if asset not in supported_assets | FIAT and float(value or 0) > 0
+        asset for asset, value in normalized_balances.items()
+        if asset not in supported_assets | FIAT and value > 0
     )
     snapshot = {
         "version": 1,
@@ -75,6 +127,7 @@ def publish(snapshot):
 
 
 def main():
+    ensure_snapshot_safe_execution_state(os.environ["DCA_EXECUTION_STATE"])
     snapshot = build_snapshot(get_kraken_exchange())
     publish(snapshot)
     print(

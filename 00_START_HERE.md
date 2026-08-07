@@ -75,8 +75,9 @@ rules, decisions, pending state, and scheduler posture.
    the trader when a pair is due.
 6. The trader rechecks the live rule, decision, date, window, Kraken minimum,
    pending-order state, and once-per-day guard.
-7. It sells the exact GBP budget on `GBP/USD`, waits for confirmed net USD, and
-   spends that USD on the selected crypto/USD pair.
+7. BTC and SOL spend GBP directly on `BTC/GBP` and `SOL/GBP`. Only HYPE uses
+   the explicit `GBP/USD` funding leg before spending confirmed net USD on
+   `HYPE/USD`.
 8. Kraken remains the authoritative record and Discord receives the result.
 
 Gemini Flash-Lite explains the completed Python decision. It cannot select or
@@ -343,6 +344,50 @@ acknowledged. The Railway controller retries it on the guarded schedule without
 calling Kraken or blocking recovery of an existing order. Do not delete the
 queue manually; Portfolio Compass will import the row idempotently. Ghostfolio
 remains an optional mirror.
+
+### Ghostfolio is empty or remains on loading placeholders
+
+1. Open `C:\Users\anand\GLaDOS\Ghostfolio\Key.txt` and use that key for the
+   localhost Ghostfolio login. Do not reuse an older exported key.
+2. From the recovery repository, set `DCA_GHOSTFOLIO_SECRETS_FILE` to
+   `%LOCALAPPDATA%\dca-ghostfolio\secrets.env`, then run
+   `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ghostfolio\sync-canonical-key.ps1 -MinimumHoldings 3`.
+   This fails unless the visible key and sync service resolve to the same
+   populated Ghostfolio user.
+3. Run `docker compose -f .\ghostfolio\compose.yml ps`. The app, PostgreSQL,
+   Redis, and sync services must all be healthy. A failed sync health check can
+   indicate Kraken quantity drift, missing `USDGBP` reporting data, a non-GBP
+   custody account, or `portfolio/details` returning `hasError`.
+4. Sign out of Ghostfolio, sign in with the current `Key.txt`, and reload
+   `/en/home/holdings`. The expected active rows are Bitcoin, Hyperliquid USD,
+   and Solana. Do not create another local user or copy activities between user
+   IDs.
+
+The signed holdings workflow runs at minutes 11 and 41. The local sidecar polls
+every five minutes and reconciles a new signed snapshot idempotently, so either
+component may be offline temporarily and catch up later without reaching
+Kraken's trading API. Reconciliation is restricted to the `Kraken DCA` custody
+account and cannot alter `Bitkub Legacy`; a snapshot older than a recorded DCA
+fill is held until the next signed snapshot arrives. The health check fails if
+the snapshot is missing, older than two hours, moves backwards, or has an
+unfinished durable reconciliation receipt.
+
+The sidecar completes any older durable holdings intent before importing a
+newer DCA event. It rejects malformed or re-hashed event rows whose exact pair,
+route, currencies, order IDs, timestamp, or numeric values do not match the
+PortfolioEventV3 contract. This preserves automatic catch-up without allowing
+an ambiguous offline state to double-count a holding.
+
+### Local Ghostfolio backup task
+
+Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+.\ghostfolio\install-backup-task.ps1 -RetentionCount 14` from the recovery
+repository. The user-only task runs at 03:15, catches up a missed start, waits
+briefly for Docker Desktop, retries bounded failures, and never overlaps an
+existing run. It keeps the latest 14 backups only after a new dump passes a
+disposable restore test. Check
+`%LOCALAPPDATA%\dca-ghostfolio\backup-task-status.json`, the matching dump and
+`.sha256` file, and Task Scheduler result `0` after registration or recovery.
 
 ## Safety rules
 

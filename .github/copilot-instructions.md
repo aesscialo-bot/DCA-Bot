@@ -11,12 +11,12 @@ schemas, workflows, or deployment configuration.
 - `DCA_TARGET_MAP` contains every canonical target with only
   `REGIME_AMOUNTS_GBP` (`LOW` lower endpoint and compatibility-named `UP` upper
   endpoint) and boolean `BUY_ENABLED`.
-- Budgets remain GBP-denominated. The target markets execute in USD.
-- The bot sells the exact GBP budget on Kraken `GBP/USD` with `fciq`, waits for
-  confirmed net USD, and spends that USD on crypto/USD with `fcib`.
-- BTC and SOL use direct Kraken GBP markets; HYPE uses HYPE/USD with the
+- Budgets remain GBP-denominated and execute in each configured quote currency.
+- BTC and SOL use direct Kraken GBP markets; HYPE uses `HYPE/USD` with the
   explicit GBP/USD funding leg. Never use implicit conversion, THB, Bitkub,
   or the legacy `AMOUNT_GBP` / `TIME` schema.
+- For HYPE only, sell the exact GBP budget on Kraken `GBP/USD` with `fciq`, wait
+  for confirmed net USD, and spend that USD on `HYPE/USD` with `fcib`.
 - Counter-cyclical spend mapping is `DOWNTREND`→`HIGH`, `SIDEWAYS`→`MID`, and
   `UPTREND`→`LOW`. `MID` is `(LOW + UP) / 2`, rounded to the nearest penny with
   `ROUND_HALF_UP`; `HIGH` reads the stored `UP` endpoint. Never infer spend from

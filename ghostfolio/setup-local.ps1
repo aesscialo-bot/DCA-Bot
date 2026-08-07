@@ -38,6 +38,7 @@ $content = @(
 icacls $secretRoot /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F" | Out-Null
 [Environment]::SetEnvironmentVariable('DCA_GHOSTFOLIO_SECRETS_FILE', $secretFile, 'User')
 $env:DCA_GHOSTFOLIO_SECRETS_FILE = $secretFile
+& (Join-Path $PSScriptRoot 'write-service-env.ps1') | Out-Null
 
 docker compose -f (Join-Path $PSScriptRoot 'compose.yml') config --quiet
 docker compose -f (Join-Path $PSScriptRoot 'compose.yml') up -d --build

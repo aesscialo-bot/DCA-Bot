@@ -17,8 +17,9 @@ workflows, or release configuration.
   £5/£15, producing sideways amounts £15/£12.50/£10. Budget changes must use
   the guarded configuration flow and must keep the lower endpoint at or below
   the higher endpoint.
-- Each buy is two reconciled Kraken orders: sell the exact GBP budget on
-  `GBP/USD` with `fciq`, then spend confirmed net USD on the target with `fcib`.
+- BTC and SOL are direct GBP buys on `BTC/GBP` and `SOL/GBP`. HYPE alone uses
+  two reconciled Kraken orders: sell the exact GBP budget on `GBP/USD` with
+  `fciq`, then spend confirmed net USD on `HYPE/USD` with `fcib`.
 - One purchase per enabled asset per Bangkok calendar day is permitted.
 - Stale, missing, insufficient, or inconsistent state always skips trading.
 - A pending funding or crypto order must be reconciled before any new order.
