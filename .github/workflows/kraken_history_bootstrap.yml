@@ -1,0 +1,45 @@
+name: Kraken History Bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: Comma-separated canonical targets or all
+        required: false
+        default: all
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dca-kraken-history-writer
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: Bootstrap 65-day first-party history
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Load private history Gist identity
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          value="$(gh variable get DCA_HISTORY_GIST_ID --repo "$GITHUB_REPOSITORY")"
+          printf '::add-mask::%s\n' "$value"
+          printf 'DCA_HISTORY_GIST_ID=%s\n' "$value" >> "$GITHUB_ENV"
+      - name: Stream, checkpoint, aggregate, and validate
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: python -u kraken_history.py bootstrap --targets "${{ inputs.targets }}"

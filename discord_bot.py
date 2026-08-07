@@ -9,8 +9,10 @@ is exact, allowlisted, and fail-closed.
 from __future__ import annotations
 
 import asyncio
+import base64
 from copy import deepcopy
 from datetime import date, datetime, time, timezone
+import hashlib
 import json
 import os
 import re
@@ -49,11 +51,15 @@ from dca_config import (
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GH_PAT = os.environ.get("GH_PAT", "")
+GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
+GIST_ID = os.environ.get("GIST_ID", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_WORKFLOW_REF = os.environ.get("GITHUB_WORKFLOW_REF", "").strip()
 CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
 ALLOWED_USERS = os.environ.get("DISCORD_ALLOWED_USERS", "")
 DCA_CRON_ENABLED = os.environ.get("DCA_CRON_ENABLED", "false").lower() == "true"
+DCA_TRADING_MODE = os.environ.get("DCA_TRADING_MODE", "shadow").strip().lower()
+DCA_CANARY_SYMBOL = os.environ.get("DCA_CANARY_SYMBOL", "SOL_USD").strip().upper()
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 
 RULES_VARIABLE = "DCA_TARGET_MAP"
@@ -65,16 +71,18 @@ DCA_AMOUNT_MIN_GBP = 5.0
 DCA_AMOUNT_MAX_GBP = 1_000.0
 ENABLE_CONFIRMATION_TTL_SECONDS = 300
 DISPATCH_RETRY_SECONDS = 30 * 60
-# The daily workflow is scheduled for 04:00 Bangkok. Give GitHub Actions a
+# The primary workflow is scheduled for 04:07 Bangkok. Give GitHub Actions a
 # bounded startup window before treating a missing start-day decision as an
 # operational error.
-START_DAY_ANALYSIS_EXPECTED_BY = time(4, 15)
+START_DAY_ANALYSIS_EXPECTED_BY = time(4, 20)
 
 GH_API = "https://api.github.com"
 GH_HEADERS = {
     "Authorization": f"token {GH_PAT}",
     "Accept": "application/vnd.github+json",
 }
+PORTFOLIO_EVENT_FILE = "kraken_usd_dca_ghostfolio_events.jsonl"
+GHOSTFOLIO_RECEIPT_FILE = "ghostfolio_sync_receipts.jsonl"
 
 # A restart intentionally cancels pending confirmations.
 _pending_enable_confirmations: dict[str, dict[str, Any]] = {}
@@ -89,6 +97,8 @@ _schedule_error: str | None = None
 _schedule_warning: str | None = None
 _last_schedule_alert: str | None = None
 _schedule_start_date: date | None = None
+_workflow_contract_error: str | None = None
+_analysis_watchdog_last_dispatch: float | None = None
 
 
 def _log(message: str) -> None:
@@ -290,6 +300,58 @@ def trigger_workflow(workflow_file: str, inputs: dict[str, str] | None = None) -
         _log(f"ERROR workflow dispatch rejected: HTTP {response.status_code}")
         return False
     return True
+
+
+def validate_workflow_contracts() -> str | None:
+    """Validate the configured ref and dispatch input schemas at startup."""
+    if not GITHUB_REPO or not GITHUB_WORKFLOW_REF:
+        return "GITHUB_REPO and GITHUB_WORKFLOW_REF are required"
+    try:
+        ref_response = requests.get(
+            f"{GH_API}/repos/{GITHUB_REPO}/commits/{GITHUB_WORKFLOW_REF}",
+            headers=GH_HEADERS,
+            timeout=15,
+        )
+        if ref_response.status_code != 200:
+            return f"workflow ref {GITHUB_WORKFLOW_REF!r} is unavailable"
+        for filename, required_input in (
+            ("crypto_analysis.yml", "symbol"),
+            ("daily_dca.yml", "symbols_json"),
+        ):
+            response = requests.get(
+                f"{GH_API}/repos/{GITHUB_REPO}/contents/.github/workflows/{filename}",
+                headers=GH_HEADERS,
+                params={"ref": GITHUB_WORKFLOW_REF},
+                timeout=15,
+            )
+            if response.status_code != 200:
+                return f"{filename} is unavailable on {GITHUB_WORKFLOW_REF}"
+            encoded = response.json().get("content", "")
+            source = base64.b64decode(encoded).decode("utf-8")
+            if "workflow_dispatch:" not in source or f"{required_input}:" not in source:
+                return f"{filename} does not accept expected input {required_input}"
+    except (KeyError, TypeError, ValueError, UnicodeError, requests.RequestException) as exc:
+        return f"workflow contract validation failed ({type(exc).__name__})"
+    return None
+
+
+def analysis_workflow_active() -> bool:
+    """Return whether GitHub already has queued/in-progress analysis on the ref."""
+    try:
+        response = requests.get(
+            f"{GH_API}/repos/{GITHUB_REPO}/actions/workflows/crypto_analysis.yml/runs",
+            headers=GH_HEADERS,
+            params={"branch": GITHUB_WORKFLOW_REF, "per_page": 20},
+            timeout=15,
+        )
+        if response.status_code != 200:
+            return False
+        return any(
+            run.get("status") in {"queued", "in_progress", "waiting", "pending"}
+            for run in response.json().get("workflow_runs", [])
+        )
+    except (TypeError, requests.RequestException):
+        return False
 
 
 def get_repo_variable(name: str) -> str | None:
@@ -511,8 +573,10 @@ def _enable_review(
             )
 
     decision = analysis["TARGETS"][symbol]
-    if decision["STATUS"] != "READY":
-        raise ConfigError(f"{symbol} analysis is ERROR; run a fresh analysis")
+    if decision["ANALYSIS_STATUS"] != "READY":
+        raise ConfigError(
+            f"{symbol} analysis is {decision['ANALYSIS_STATUS']}; run a fresh analysis"
+        )
     expected_hash = rules_hash(symbol, rule)
     if decision["RULES_HASH"] != expected_hash:
         raise ConfigError(f"{symbol} analysis does not match the live budgets")
@@ -713,10 +777,16 @@ def _decision_summary(
         if delivery_count
         else ""
     )
-    if decision["STATUS"] == "READY":
+    current_date = now.astimezone(TIMEZONE).date().isoformat()
+    if (
+        decision["ANALYSIS_STATUS"] == "READY"
+        and decision["ANALYSIS_DATE"] == current_date
+        and parse_utc_iso(decision["VALID_UNTIL"]) >= now
+    ):
         regime = decision["REGIME"]
         amount = _display_amount(effective_amount(rule, decision))
         next_time = _local_timestamp(decision["EXECUTE_AT"])
+        selected_time = _local_timestamp(decision["SELECTED_AT"])
         age = _decision_age(decision, now)
         current_hash = rules_hash(symbol, rule)
         decision_status = "READY" if decision["RULES_HASH"] == current_hash else "RULES MISMATCH"
@@ -725,14 +795,21 @@ def _decision_summary(
         amount = "skipped"
         next_time = "not scheduled"
         age = _decision_age(decision, now)
-        decision_status = "ERROR"
+        selected_time = "none"
+        decision_status = (
+            "STALE/EXPIRED"
+            if decision["ANALYSIS_STATUS"] == "READY"
+            else decision["ANALYSIS_STATUS"]
+        )
     return (
         f"**{symbol}** — {status} | UPTREND/lower "
         f"{_display_amount(amounts['LOW'])} | SIDEWAYS/midpoint "
         f"{_display_amount(amount_for_tier_gbp(rule, 'MID'))} | DOWNTREND/higher "
         f"{_display_amount(amounts['UP'])}\n"
         f"  Analysis: {decision_status} | Regime: `{regime}` | Effective: {amount} | "
-        f"Next: `{next_time}` | Age: `{age}`\n"
+        f"Selected: `{selected_time}` | Effective: `{next_time}` | Age: `{age}`\n"
+        f"  Analysis date: `{decision['ANALYSIS_DATE']}` | Decision: `{decision['DECISION_ID']}` | "
+        f"Execution: `{decision['EXECUTION_STATUS']}`\n"
         f"  Last buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}`"
         f"{pending_text}{delivery_text}"
     )
@@ -747,6 +824,69 @@ def _pending_gist_delivery_count(execution: Mapping[str, Any]) -> int:
     )
 
 
+def get_ghostfolio_delivery_health() -> dict[str, Any]:
+    """Compare durable PortfolioEventV2 rows with local sync receipts."""
+    if not GIST_ID or not GIST_TOKEN:
+        return {"status": "UNAVAILABLE", "pending": None, "completed": None}
+    response = requests.get(
+        f"https://api.github.com/gists/{GIST_ID}",
+        headers={
+            "Authorization": f"token {GIST_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        },
+        timeout=15,
+    )
+    if response.status_code != 200:
+        return {
+            "status": f"HTTP_{response.status_code}",
+            "pending": None,
+            "completed": None,
+        }
+    try:
+        files = response.json().get("files", {})
+        event_text = (files.get(PORTFOLIO_EVENT_FILE) or {}).get("content", "")
+        receipt_text = (files.get(GHOSTFOLIO_RECEIPT_FILE) or {}).get("content", "")
+        events = {}
+        for line in event_text.splitlines():
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            event_id = event["event_id"]
+            if event_id in events:
+                raise ValueError("duplicate event ID")
+            supplied_hash = event["canonical_hash"]
+            unhashed = {key: value for key, value in event.items() if key != "canonical_hash"}
+            actual_hash = hashlib.sha256(
+                json.dumps(
+                    unhashed,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if supplied_hash != actual_hash:
+                raise ValueError("event hash mismatch")
+            events[event_id] = supplied_hash
+        receipts = {}
+        for line in receipt_text.splitlines():
+            if not line.strip():
+                continue
+            receipt = json.loads(line)
+            order_id = receipt["order_id"]
+            if order_id in receipts or order_id not in events:
+                raise ValueError("invalid receipt identity")
+            if receipt["event_hash"] != events[order_id]:
+                raise ValueError("receipt hash mismatch")
+            receipts[order_id] = receipt
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return {"status": "INVALID", "pending": None, "completed": None}
+    return {
+        "status": "CLEAR" if len(events) == len(receipts) else "PENDING",
+        "pending": len(events) - len(receipts),
+        "completed": len(receipts),
+    }
+
+
 async def handle_status(params: dict[str, Any], message: discord.Message) -> None:
     try:
         rules, analysis, execution = await asyncio.to_thread(_load_live_state)
@@ -757,8 +897,14 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         )
         return
 
+    ghostfolio_health = await asyncio.to_thread(get_ghostfolio_delivery_health)
     now = datetime.now(timezone.utc)
-    lines = ["**Kraken USD-pair DCA status (GBP budgets)**"]
+    lines = [
+        "**Kraken USD-pair DCA status (GBP budgets)**",
+        f"Trading mode: **{DCA_TRADING_MODE}**"
+        + (f" (`{DCA_CANARY_SYMBOL}` only)" if DCA_TRADING_MODE == "canary" else ""),
+        f"Workflow ref: `{GITHUB_WORKFLOW_REF or 'missing'}`",
+    ]
     for symbol in ALLOWED_TARGETS:
         lines.append(
             _decision_summary(
@@ -779,7 +925,7 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         scheduler = "paused by DCA_CRON_ENABLED=false"
     elif awaiting_symbols:
         scheduler = (
-            "armed; awaiting 04:00 start-day analysis for "
+            "armed; awaiting 04:07 start-day analysis for "
             f"{', '.join(sorted(awaiting_symbols))} on "
             f"{_schedule_start_date.isoformat()} {TIMEZONE.key}; "
             f"{len(_dca_schedule)} active target(s)"
@@ -788,7 +934,8 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         scheduler = f"running; {len(_dca_schedule)} active target(s)"
     lines.append(f"Scheduler: **{scheduler}**")
     analysis_ready = all(
-        decision["STATUS"] == "READY"
+        decision["ANALYSIS_STATUS"] == "READY"
+        and decision["ANALYSIS_DATE"] == now.astimezone(TIMEZONE).date().isoformat()
         and decision["RULES_HASH"] == rules_hash(symbol, rules[symbol])
         and parse_utc_iso(decision["VALID_UNTIL"]) >= now
         for symbol, decision in analysis["TARGETS"].items()
@@ -810,6 +957,18 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         )
     else:
         lines.append("Portfolio ledger delivery: **clear (0 pending records)**")
+    if ghostfolio_health["status"] in {"CLEAR", "PENDING"}:
+        lines.append(
+            "Local Ghostfolio completion: **"
+            f"{ghostfolio_health['status'].lower()}** "
+            f"({ghostfolio_health['completed']} receipt(s), "
+            f"{ghostfolio_health['pending']} pending)"
+        )
+    else:
+        lines.append(
+            "Local Ghostfolio completion: **"
+            f"{ghostfolio_health['status'].lower()}**"
+        )
     if (
         all_disabled
         and analysis_ready
@@ -833,6 +992,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
             "- New orders: blocked"
         )
         return
+    ghostfolio_health = await asyncio.to_thread(get_ghostfolio_delivery_health)
     now = datetime.now(timezone.utc)
     awaiting_symbols = _pending_start_day_analysis_symbols(rules, analysis, now)
     ready = []
@@ -843,8 +1003,11 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
         decision = analysis["TARGETS"][symbol]
         if symbol in awaiting_symbols:
             continue
-        if decision["STATUS"] != "READY":
+        if decision["ANALYSIS_STATUS"] != "READY":
             errors.append(symbol)
+            continue
+        if decision["ANALYSIS_DATE"] != now.astimezone(TIMEZONE).date().isoformat():
+            stale.append(symbol)
             continue
         if decision["RULES_HASH"] != rules_hash(symbol, rules[symbol]):
             mismatched.append(symbol)
@@ -900,7 +1063,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
         f"**DCA health: {posture}**",
         f"- Rules: valid ({len(rules)}/3 USD targets; GBP budgets)",
         (
-            "- Analysis: awaiting 04:00 start-day analysis"
+            "- Analysis: awaiting 04:07 start-day analysis"
             if awaiting_start_analysis
             else f"- Analysis: fresh READY {len(ready)}/3"
         ),
@@ -911,6 +1074,12 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
             f"{delivery_retry_status}"
             if delivery_count
             else "- Portfolio ledger delivery: clear; 0 pending records"
+        ),
+        (
+            f"- Local Ghostfolio receipts: {ghostfolio_health['status']}; "
+            f"completed {ghostfolio_health['completed']}, pending {ghostfolio_health['pending']}"
+            if ghostfolio_health["status"] in {"CLEAR", "PENDING"}
+            else f"- Local Ghostfolio receipts: {ghostfolio_health['status']}"
         ),
         f"- Scheduler: {'running' if DCA_CRON_ENABLED else 'paused'}; "
         f"active targets {len(_dca_schedule)}",
@@ -1032,6 +1201,36 @@ def refresh_dca_schedule(
         rules, analysis, current, _schedule_start_date
     )
     _awaiting_start_day_symbols.update(awaiting_start_symbols)
+    if awaiting_start_symbols:
+        _dca_schedule.clear()
+        _schedule_error = None
+        _schedule_warning = None
+        return True
+    current_date = current.astimezone(TIMEZONE).date().isoformat()
+    global_history_failures = []
+    for target in ALLOWED_TARGETS:
+        decision = analysis["TARGETS"][target]
+        history = decision.get("HISTORY") or {}
+        if target in awaiting_start_symbols:
+            continue
+        if decision["ANALYSIS_STATUS"] != "READY":
+            global_history_failures.append(
+                f"{target}: analysis {decision['ANALYSIS_STATUS']}"
+            )
+        elif decision["ANALYSIS_DATE"] != current_date:
+            global_history_failures.append(f"{target}: stale analysis date")
+        elif history.get("STATUS") != "READY":
+            global_history_failures.append(
+                f"{target}: history {history.get('STATUS', 'missing')}"
+            )
+    if global_history_failures:
+        _dca_schedule.clear()
+        _schedule_error = None
+        _schedule_warning = (
+            "global all-three Kraken history gate: "
+            + "; ".join(global_history_failures)
+        )
+        return True
     for symbol in ALLOWED_TARGETS:
         rule = rules[symbol]
         if not rule["BUY_ENABLED"]:
@@ -1039,8 +1238,13 @@ def refresh_dca_schedule(
         decision = analysis["TARGETS"][symbol]
         if symbol in awaiting_start_symbols:
             continue
-        if decision["STATUS"] != "READY":
-            invalid_enabled.append(f"{symbol}: analysis ERROR")
+        if decision["ANALYSIS_STATUS"] != "READY":
+            invalid_enabled.append(
+                f"{symbol}: analysis {decision['ANALYSIS_STATUS']}"
+            )
+            continue
+        if decision["ANALYSIS_DATE"] != current_date:
+            invalid_enabled.append(f"{symbol}: stale analysis date")
             continue
         if decision["RULES_HASH"] != rules_hash(symbol, rule):
             invalid_enabled.append(f"{symbol}: rules mismatch")
@@ -1138,7 +1342,7 @@ def _format_cron_status() -> str:
         return f"Scheduler running with skipped target(s): {_schedule_warning}"
     if _awaiting_start_day_symbols:
         return (
-            "Scheduler armed; awaiting 04:00 start-day analysis for "
+            "Scheduler armed; awaiting 04:07 start-day analysis for "
             f"{', '.join(sorted(_awaiting_start_day_symbols))} on "
             f"{_schedule_start_date.isoformat()} {TIMEZONE.key}"
         )
@@ -1199,6 +1403,51 @@ async def _notify(content: str) -> None:
         _log(f"WARN Discord scheduler alert failed: {type(exc).__name__}")
 
 
+async def _analysis_watchdog(analysis_json: str | None, now: datetime) -> None:
+    """Recover a dropped daily analysis after 04:20 Bangkok, idempotently."""
+    global _analysis_watchdog_last_dispatch
+    local_now = now.astimezone(TIMEZONE)
+    if local_now.time() < START_DAY_ANALYSIS_EXPECTED_BY:
+        return
+    current_date = local_now.date().isoformat()
+    complete = False
+    try:
+        analysis = validate_analysis_state(analysis_json)
+        complete = (
+            analysis["ANALYSIS_DATE"] == current_date
+            and all(
+                item["ANALYSIS_STATUS"] == "READY"
+                for item in analysis["TARGETS"].values()
+            )
+        )
+    except (ConfigError, TypeError, ValueError):
+        complete = False
+    if complete:
+        _analysis_watchdog_last_dispatch = None
+        return
+    if _workflow_contract_error:
+        await _notify(f"DCA analysis watchdog BLOCKED: {_workflow_contract_error}")
+        return
+    if await asyncio.to_thread(analysis_workflow_active):
+        return
+    now_mono = monotonic()
+    if (
+        _analysis_watchdog_last_dispatch is not None
+        and now_mono - _analysis_watchdog_last_dispatch < DISPATCH_RETRY_SECONDS
+    ):
+        return
+    accepted = await asyncio.to_thread(
+        trigger_workflow, "crypto_analysis.yml", {"symbol": "all"}
+    )
+    if accepted:
+        _analysis_watchdog_last_dispatch = now_mono
+        _log(f"WARN analysis watchdog dispatched recovery for {current_date}")
+    else:
+        await _notify(
+            f"DCA analysis watchdog could not dispatch recovery for {current_date}"
+        )
+
+
 @tasks.loop(minutes=5)
 async def dca_schedule_refresh() -> None:
     """Refresh every tick; invalid live state clears the old schedule and alerts."""
@@ -1210,6 +1459,7 @@ async def dca_schedule_refresh() -> None:
         asyncio.to_thread(get_repo_variable, EXECUTION_STATE_VARIABLE),
         asyncio.to_thread(get_repo_variable, START_DATE_VARIABLE),
     )
+    await _analysis_watchdog(values[1], datetime.now(timezone.utc))
     valid = refresh_dca_schedule(*values)
     if not valid:
         alert = f"DCA scheduler blocked: {_schedule_error}"
@@ -1269,12 +1519,20 @@ ACTION_HANDLERS = {
 
 @client.event
 async def on_ready() -> None:
+    global _workflow_contract_error
     commit = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "unknown")[:12]
     _log(f"INFO Discord connected commit={commit} timezone={TIMEZONE.key}")
     _log(
         f"INFO access channel_restricted={bool(CHANNEL_ID)} "
         f"allowlisted_users={len(_allowed_user_ids())}"
     )
+    _workflow_contract_error = await asyncio.to_thread(validate_workflow_contracts)
+    if _workflow_contract_error:
+        _clear_schedule(_workflow_contract_error)
+        _log(f"ERROR workflow contract BLOCKED: {_workflow_contract_error}")
+        await _notify(f"DCA scheduler BLOCKED: {_workflow_contract_error}")
+        return
+    _log(f"INFO workflow contract valid ref={GITHUB_WORKFLOW_REF}")
     if not DCA_CRON_ENABLED:
         _log("INFO scheduler paused by DCA_CRON_ENABLED=false")
         return

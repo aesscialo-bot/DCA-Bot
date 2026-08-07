@@ -140,7 +140,7 @@ def apply_change(
     state = validate_analysis_state(analysis_state, now=reference)
     decision = state["TARGETS"][symbol]
     live_hash = rules_hash(symbol, rules[symbol])
-    if decision["STATUS"] != "READY":
+    if decision["ANALYSIS_STATUS"] != "READY":
         raise ConfigError(f"{symbol} does not have a READY analysis decision")
     if expected_rules_hash != live_hash or decision["RULES_HASH"] != live_hash:
         raise ConfigError("Budgets changed after the enable review")

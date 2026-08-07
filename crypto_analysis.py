@@ -8,6 +8,7 @@ candles and are persisted as ``DCA_ANALYSIS_STATE``.
 from __future__ import annotations
 
 from datetime import date, datetime, time as clock_time, timedelta, timezone
+from hashlib import sha256
 import json
 import math
 import os
@@ -15,7 +16,6 @@ from pathlib import Path
 import re
 from statistics import median
 from typing import Any, Iterable, Mapping
-from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import ccxt
@@ -29,6 +29,7 @@ from dca_config import (
     READY_STATUS,
     TARGET_KEYS,
     TARGET_SYMBOLS,
+    TIMING_POLICY_VERSION,
     amount_tier_for_regime,
     default_rules_map,
     effective_amount,
@@ -37,6 +38,7 @@ from dca_config import (
     validate_analysis_state,
     validate_rules_map,
 )
+from kraken_history import HistoryError, load_ready_history
 
 
 EXCHANGE_ID = os.environ.get("EXCHANGE_ID", "kraken")
@@ -47,7 +49,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 DCA_TARGET_MAP_ENV = os.environ.get("DCA_TARGET_MAP", "{}")
 DCA_ANALYSIS_STATE_ENV = os.environ.get("DCA_ANALYSIS_STATE", "")
 ANALYSIS_VARIABLE = "DCA_ANALYSIS_STATE"
-PERIODS = (3, 5, 7)
+PERIODS = (14, 30, 45, 60)
+DCA_TRADING_MODE = os.environ.get("DCA_TRADING_MODE", "shadow").strip().lower()
+DCA_CANARY_SYMBOL = os.environ.get("DCA_CANARY_SYMBOL", "SOL_USD").strip().upper()
 
 DAILY_TIMEFRAME_MS = 24 * 60 * 60 * 1000
 WEEKLY_TIMEFRAME_MS = 7 * DAILY_TIMEFRAME_MS
@@ -60,7 +64,7 @@ MIN_DAILY_CANDLES = 170
 MIN_WEEKLY_CANDLES = 20
 KRAKEN_OHLCV_LIMIT = 720
 INTRADAY_CANDLES_PER_DAY = 96
-INTRADAY_HISTORY_CANDLES = 7 * INTRADAY_CANDLES_PER_DAY
+INTRADAY_HISTORY_CANDLES = 60 * INTRADAY_CANDLES_PER_DAY
 MAX_DAILY_DATA_AGE = timedelta(hours=30)
 MAX_WEEKLY_DATA_AGE = timedelta(days=7, hours=12)
 MAX_INTRADAY_DATA_AGE = timedelta(minutes=45)
@@ -428,41 +432,51 @@ def choose_timing_candidate(
     """Apply recency, base-window, and deterministic tie-break rules."""
 
     if any(days not in tables or not tables[days] for days in PERIODS):
-        raise AnalysisError("Timing tables must contain non-empty 3, 5, and 7-day windows")
-    best3, best5, best7 = (tables[days][0] for days in PERIODS)
+        raise AnalysisError(
+            "Timing tables must contain non-empty 14, 30, 45, and 60-day windows"
+        )
+    best14, best30, _best45, best60 = (tables[days][0] for days in PERIODS)
     if (
-        best3["WIN_RATE"] >= best7["WIN_RATE"] + 10.0
-        and best3["MEDIAN_MISS"] <= best7["MEDIAN_MISS"] + 0.20
+        best14["WIN_RATE"] >= best30["WIN_RATE"] + 10.0
+        and best14["MEDIAN_MISS"] <= best30["MEDIAN_MISS"] + 0.20
     ):
-        selected_window = 3
-        selection_rule = "RECENCY_3D_OVERRIDE"
-        initial = best3
-    elif best5["MEDIAN_MISS"] <= best7["MEDIAN_MISS"] - 0.15:
-        selected_window = 5
-        selection_rule = "BASE_5D_MATERIAL_IMPROVEMENT"
-        initial = best5
+        selected_window = 14
+        selection_rule = "RECENCY_14D_OVERRIDE"
+        initial = best14
+    elif best30["MEDIAN_MISS"] <= best60["MEDIAN_MISS"] - 0.15:
+        selected_window = 30
+        selection_rule = "BASE_30D_MATERIAL_IMPROVEMENT"
+        initial = best30
     else:
-        selected_window = 7
-        selection_rule = "BASE_7D"
-        initial = best7
+        selected_window = 60
+        selection_rule = "BASE_60D"
+        initial = best60
 
     near_ties = [
         item
         for item in tables[selected_window]
         if item["MEDIAN_MISS"] <= initial["MEDIAN_MISS"] + 0.10
     ]
+    consistency_periods = (30, 45, 60)
     top_five_times = {
-        days: {item["TIME"] for item in tables[days][:5]} for days in PERIODS
+        days: {item["TIME"] for item in tables[days][:5]}
+        for days in consistency_periods
     }
-    seven_day_by_time = {item["TIME"]: item for item in tables[7]}
+    sixty_day_by_time = {item["TIME"]: item for item in tables[60]}
 
     def tie_key(item: Mapping[str, Any]):
-        appearances = sum(item["TIME"] in top_five_times[days] for days in PERIODS)
-        seven_day_win_rate = seven_day_by_time.get(item["TIME"], {}).get("WIN_RATE", -1.0)
-        return (-appearances, -seven_day_win_rate, item["TIME"])
+        appearances = sum(
+            item["TIME"] in top_five_times[days] for days in consistency_periods
+        )
+        sixty_day_win_rate = sixty_day_by_time.get(item["TIME"], {}).get(
+            "WIN_RATE", -1.0
+        )
+        return (-appearances, -sixty_day_win_rate, item["TIME"])
 
     selected = min(near_ties, key=tie_key)
-    appearances = sum(selected["TIME"] in top_five_times[days] for days in PERIODS)
+    appearances = sum(
+        selected["TIME"] in top_five_times[days] for days in consistency_periods
+    )
     return dict(selected), selected_window, selection_rule, appearances
 
 
@@ -472,7 +486,7 @@ def select_best_time(
     now: datetime | None = None,
     local_tz: str = LOCAL_TZ,
 ) -> tuple[str, dict[str, Any]]:
-    """Select a local buy time using the deterministic 3/5/7-day policy."""
+    """Select a local buy time using the original deterministic policy."""
 
     reference = now or _utc_now()
     try:
@@ -489,19 +503,21 @@ def select_best_time(
         now=reference,
         label="15-minute market data",
     )
-    frame = _contiguous_tail(
-        frame,
-        INTRADAY_HISTORY_CANDLES,
-        QUARTER_HOUR_MS,
-        label="15-minute market data",
-    )
     frame["local_ts"] = frame["ts"].dt.tz_convert(zone)
+    frame["local_date"] = frame["local_ts"].dt.date
     frame["local_time"] = frame["local_ts"].dt.strftime("%H:%M")
-
-    tables = {
-        days: _rolling_time_stats(
-            frame.tail(days * INTRADAY_CANDLES_PER_DAY).copy(), days
+    current_date = reference.astimezone(zone).date()
+    complete_dates = sorted(
+        value for value in frame["local_date"].unique() if value < current_date
+    )
+    if len(complete_dates) < 60:
+        raise AnalysisError(
+            f"15-minute market data has {len(complete_dates)} complete Bangkok days; need 60"
         )
+    selected_dates = complete_dates[-60:]
+    frame = frame[frame["local_date"].isin(selected_dates)].copy()
+    tables = {
+        days: _time_stats(frame, selected_dates[-days:])
         for days in PERIODS
     }
     selected, selected_window, selection_rule, appearances = choose_timing_candidate(tables)
@@ -513,7 +529,8 @@ def select_best_time(
         "SELECTION_RULE": selection_rule,
         "TOP_FIVE_APPEARANCES": appearances,
         "SELECTED_METRICS": _rounded_candidate(selected),
-        "HISTORY_CANDLES": INTRADAY_HISTORY_CANDLES,
+        "POLICY_VERSION": TIMING_POLICY_VERSION,
+        "HISTORY_CANDLES": len(frame),
         "HISTORY_START": _iso_utc(frame.iloc[0]["ts"].to_pydatetime()),
         "HISTORY_END": _iso_utc(frame.iloc[-1]["ts"].to_pydatetime()),
         "WINDOWS": {
@@ -535,7 +552,7 @@ def analyze_period(df: pd.DataFrame, days: int, local_tz: str):
     """
 
     if days not in PERIODS:
-        raise ValueError("days must be one of 3, 5, or 7")
+        raise ValueError("days must be one of 14, 30, 45, or 60")
     period = df.copy()
     if "local_date" not in period or "local_time" not in period:
         period["local_ts"] = period["ts"].dt.tz_convert(local_tz)
@@ -575,9 +592,14 @@ def next_execution_time(
     *,
     analyzed_at: datetime,
     local_tz: str = LOCAL_TZ,
-    minimum_notice: timedelta = timedelta(minutes=30),
+    minimum_notice: timedelta = timedelta(0),
 ) -> datetime:
-    """Return the next occurrence at least 30 minutes after analysis."""
+    """Return today's selected time or the bounded 05:00 legacy catch-up.
+
+    The original system analyzed at 04:00 Bangkok and bought at 05:00 when a
+    selected time had already passed.  This preserves that explicitly without
+    rolling the decision into tomorrow or allowing an all-day catch-up.
+    """
 
     if analyzed_at.tzinfo is None or analyzed_at.utcoffset() is None:
         raise AnalysisError("analyzed_at must include a timezone")
@@ -588,22 +610,45 @@ def next_execution_time(
     hour, minute = (int(value) for value in selected_local_time.split(":"))
     candidate = datetime.combine(local_now.date(), clock_time(hour, minute), tzinfo=zone)
     if candidate < local_now + minimum_notice:
-        candidate += timedelta(days=1)
+        candidate = datetime.combine(
+            local_now.date(), clock_time(5, 0), tzinfo=zone
+        )
     return candidate.astimezone(timezone.utc)
 
 
-def _fetch_asset_rows(exchange, symbol: str) -> tuple[list, list, list]:
+def _fetch_asset_rows(exchange, symbol: str) -> tuple[list, list, list, dict[str, Any]]:
     daily = exchange.fetch_ohlcv(symbol, timeframe="1d", limit=260)
     weekly = exchange.fetch_ohlcv(symbol, timeframe="1w", limit=40)
-    intraday = fetch_ohlcv_last_n_days(exchange, symbol, "15m", 7)
-    return daily, weekly, intraday
+    target = symbol.replace("/", "_")
+    intraday, history = load_ready_history(target)
+    return daily, weekly, intraday, history
 
 
-def _decision_id(target: str, generated_at: datetime, fingerprint: str) -> str:
-    # UUID suffix ensures rerunning within the same second still invalidates an
-    # earlier failed/ready decision rather than accidentally reusing it.
-    stamp = generated_at.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"{target.lower()}-{stamp}-{fingerprint[:8]}-{uuid4().hex[:8]}"
+def _decision_id(
+    target: str,
+    analysis_date: str,
+    fingerprint: str,
+    history_hash: str,
+) -> str:
+    payload = "|".join(
+        (target, analysis_date, TIMING_POLICY_VERSION, fingerprint, history_hash)
+    )
+    digest = sha256(payload.encode("utf-8")).hexdigest()
+    return f"{target.lower()}-{analysis_date.replace('-', '')}-{digest[:16]}"
+
+
+def _execution_status(target: str, rule: Mapping[str, Any], execute_at: datetime, now: datetime) -> str:
+    if not rule["BUY_ENABLED"]:
+        return "DISABLED"
+    if execute_at + timedelta(minutes=60) < now.astimezone(timezone.utc):
+        return "EXPIRED"
+    if DCA_TRADING_MODE == "shadow":
+        return "SHADOW"
+    if DCA_TRADING_MODE == "canary" and target != DCA_CANARY_SYMBOL:
+        return "SHADOW"
+    if DCA_TRADING_MODE in {"canary", "live"}:
+        return "ARMED"
+    return "BLOCKED"
 
 
 def analyze_asset(
@@ -619,23 +664,41 @@ def analyze_asset(
         raise AnalysisError(f"Unsupported target: {target}")
     generated = now or _utc_now()
     fingerprint = rules_hash(target, rule)
-    daily, weekly, intraday = _fetch_asset_rows(exchange, TARGET_SYMBOLS[target])
+    daily, weekly, intraday, history = _fetch_asset_rows(exchange, TARGET_SYMBOLS[target])
     regime, signals = classify_trend(daily, weekly, now=generated)
     selected_time, timing = select_best_time(intraday, now=generated, local_tz=LOCAL_TZ)
+    zone = ZoneInfo(LOCAL_TZ)
+    local_now = generated.astimezone(zone)
+    hour, minute = (int(value) for value in selected_time.split(":"))
+    selected_at = datetime.combine(
+        local_now.date(), clock_time(hour, minute), tzinfo=zone
+    ).astimezone(timezone.utc)
     execute_at = next_execution_time(
         selected_time, analyzed_at=generated, local_tz=LOCAL_TZ
     )
+    catchup_applied = execute_at != selected_at
+    analysis_date = local_now.date().isoformat()
     amount_tier = amount_tier_for_regime(regime)
     return {
-        "STATUS": READY_STATUS,
+        "ENABLED": bool(rule["BUY_ENABLED"]),
+        "ANALYSIS_STATUS": READY_STATUS,
+        "EXECUTION_STATUS": _execution_status(target, rule, execute_at, generated),
         "REGIME": regime,
         "AMOUNT_TIER": amount_tier,
+        "SELECTED_AT": _iso_utc(selected_at),
         "EXECUTE_AT": _iso_utc(execute_at),
         "VALID_UNTIL": _iso_utc(execute_at + timedelta(minutes=60)),
-        "DECISION_ID": _decision_id(target, generated, fingerprint),
+        "CATCHUP_APPLIED": catchup_applied,
+        "DECISION_ID": _decision_id(
+            target, analysis_date, fingerprint, history["HASH"]
+        ),
         "RULES_HASH": fingerprint,
+        "POLICY_VERSION": TIMING_POLICY_VERSION,
+        "ANALYSIS_DATE": analysis_date,
+        "HISTORY": history,
         "SIGNALS": signals,
         "TIMING": timing,
+        "ERROR": None,
     }
 
 
@@ -651,16 +714,29 @@ def error_decision(
     generated = now or _utc_now()
     fingerprint = rules_hash(target, rule)
     message = str(error).strip() or "Unknown analysis failure"
+    analysis_status = "HISTORY_NOT_READY" if isinstance(error, HistoryError) else ERROR_STATUS
+    analysis_date = generated.astimezone(ZoneInfo(LOCAL_TZ)).date().isoformat()
+    history = {
+        "STATUS": "HISTORY_NOT_READY" if analysis_status == "HISTORY_NOT_READY" else "ERROR"
+    }
     return {
-        "STATUS": ERROR_STATUS,
+        "ENABLED": bool(rule["BUY_ENABLED"]),
+        "ANALYSIS_STATUS": analysis_status,
+        "EXECUTION_STATUS": "DISABLED" if not rule["BUY_ENABLED"] else "BLOCKED",
         "REGIME": None,
         "AMOUNT_TIER": None,
+        "SELECTED_AT": None,
         "EXECUTE_AT": None,
         "VALID_UNTIL": None,
-        "DECISION_ID": _decision_id(target, generated, fingerprint),
+        "CATCHUP_APPLIED": False,
+        "DECISION_ID": _decision_id(target, analysis_date, fingerprint, "0" * 64),
         "RULES_HASH": fingerprint,
+        "POLICY_VERSION": TIMING_POLICY_VERSION,
+        "ANALYSIS_DATE": analysis_date,
+        "HISTORY": history,
         "SIGNALS": {"ERROR": message},
         "TIMING": {"ANALYZED_AT": _iso_utc(generated), "ERROR": message},
+        "ERROR": message,
     }
 
 
@@ -691,21 +767,24 @@ or execution time. Do not invent metrics. The Python decision is final.
 
 
 def _decision_report(target: str, decision: Mapping[str, Any], rule: Mapping[str, Any]) -> str:
-    if decision["STATUS"] == ERROR_STATUS:
+    if decision["ANALYSIS_STATUS"] != READY_STATUS:
         return (
             f"❌ **{target} analysis ERROR**\n"
-            f"Purchase skipped. {decision['SIGNALS'].get('ERROR', 'Unknown error')}"
+            f"Purchase skipped. {decision.get('ERROR') or 'Unknown error'}"
         )
     tier = decision["AMOUNT_TIER"]
     amount = effective_amount(rule, decision)
     timing = decision["TIMING"]
+    history = decision["HISTORY"]
+    catchup = " (05:00 catch-up)" if decision["CATCHUP_APPLIED"] else ""
     return (
         f"📊 **{target} daily decision**\n"
         f"Regime: `{decision['REGIME']}` → `{tier}` tier (`£{amount:g}` configured)\n"
         f"Best time: `{timing['SELECTED_LOCAL_TIME']} {timing['TIMEZONE']}` "
         f"via `{timing['SELECTION_RULE']}`\n"
-        f"Execution: `{decision['EXECUTE_AT']}` to `{decision['VALID_UNTIL']}`\n"
-        f"Trading: `{'enabled' if rule['BUY_ENABLED'] else 'disabled'}`"
+        f"Effective execution: `{decision['EXECUTE_AT']}`{catchup}; valid to `{decision['VALID_UNTIL']}`\n"
+        f"History: `{history.get('FROM')} to {history.get('THROUGH')}`; hash `{history.get('HASH', '')[:12]}`\n"
+        f"Execution status: `{decision['EXECUTION_STATUS']}`; decision `{decision['DECISION_ID']}`"
     )
 
 
@@ -809,8 +888,28 @@ def main() -> int:
 
     selected_targets = [symbol.replace("/", "_") for symbol in symbols]
     state = _existing_or_empty_state(rules, generated)
+    analysis_date = generated.astimezone(ZoneInfo(LOCAL_TZ)).date().isoformat()
+    already_complete = (
+        state.get("ANALYSIS_DATE") == analysis_date
+        and state.get("POLICY_VERSION") == TIMING_POLICY_VERSION
+        and all(
+            state["TARGETS"][target].get("ANALYSIS_STATUS") == READY_STATUS
+            and state["TARGETS"][target].get("RULES_HASH") == rules_hash(target, rules[target])
+            for target in selected_targets
+        )
+    )
+    if already_complete:
+        print(
+            f"Analysis no-op: {analysis_date} already complete under "
+            f"{TIMING_POLICY_VERSION}."
+        )
+        _write_actions_output(state)
+        return 0
+
     state["VERSION"] = ANALYSIS_STATE_VERSION
     state["GENERATED_AT"] = _iso_utc(generated)
+    state["POLICY_VERSION"] = TIMING_POLICY_VERSION
+    state["ANALYSIS_DATE"] = analysis_date
     exchange = get_analysis_exchange()
     had_error = False
 
@@ -831,7 +930,12 @@ def main() -> int:
             report = _decision_report(target, decision, rules[target])
             print(f"{target}: ERROR {exc}")
         state["TARGETS"][target] = decision
-        send_to_discord(report, color=15_148_332 if decision["STATUS"] == ERROR_STATUS else 3_447_003)
+        send_to_discord(
+            report,
+            color=15_148_332
+            if decision["ANALYSIS_STATUS"] != READY_STATUS
+            else 3_447_003,
+        )
 
     # Structural validation happens before either persistence route.
     validated = validate_analysis_state(state, rules)
@@ -842,9 +946,9 @@ def main() -> int:
         f"state persistence={'direct' if persisted else 'workflow output'}; "
         f"errors={'yes' if had_error else 'no'}."
     )
-    # A per-asset ERROR is successfully persisted fail-closed state, not a
-    # workflow crash. The Discord alert and STATUS=ERROR are the operational signal.
-    return 0
+    # Pair-local failures remain persisted, but the workflow must visibly fail
+    # so the recovery schedules retry instead of treating partial analysis as healthy.
+    return 1 if had_error else 0
 
 
 if __name__ == "__main__":

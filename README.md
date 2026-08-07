@@ -5,7 +5,7 @@
 > contains the everyday Discord commands, direct app links, current GBP budgets,
 > JSON ownership rules, pair-change procedure, and troubleshooting steps.
 
-This repository is the production source for a fully automated Kraken spot DCA
+This repository is the production source for a fail-closed Kraken spot DCA
 service. It tracks and buys exactly these USD markets:
 
 - `BTC/USD`
@@ -20,7 +20,14 @@ Kraken is the authoritative record of cash, holdings, fees, and orders. Every
 confirmed purchase is also placed in a durable, retry-safe outbox for Portfolio
 Compass's read-only private-Gist adapter. A Gist outage cannot repeat a Kraken
 order; the exact ledger row remains queued until it is delivered. Ghostfolio is
-an optional post-fill mirror.
+a reporting-only local mirror and can never affect analysis, budgets, scheduling,
+or Kraken execution.
+
+> [!WARNING]
+> Recovery defaults to `DCA_TRADING_MODE=shadow`. Production scheduling remains
+> paused until the 65-day Kraken bootstrap reports verified `READY` coverage for
+> all three pairs and a full shadow cycle passes. The missed 7 August purchase
+> is intentionally not replayed.
 
 ## Production configuration
 
@@ -63,12 +70,12 @@ Each enabled asset can buy at most once per Bangkok calendar day.
 
 ```mermaid
 flowchart TD
-    A["04:00 Asia/Bangkok"] --> B["Analyze completed Kraken candles"]
+    A["04:07 primary / 04:37 recovery"] --> B["Refresh first-party Kraken trade history"]
     B --> C["Classify each target: up, down, or sideways"]
     C --> D["Select GBP budget and best 15-minute execution time"]
     D --> E["Write fresh DCA_ANALYSIS_STATE"]
     E --> F["Railway scheduler watches absolute execution times"]
-    F --> G{"Date is on/after DCA_START_DATE and decision is due?"}
+    F --> G{"All 3 histories READY and decision due?"}
     G -- "No" --> H["Skip safely"]
     G -- "Yes" --> I["Revalidate live rules, decision, minimum, and daily state"]
     I --> J["Save durable pending intent"]
@@ -77,9 +84,10 @@ flowchart TD
     L --> M["Kraken leg 2: spend net USD on crypto/USD; fcib"]
     M --> N["Atomically save buy date and Portfolio Compass outbox row"]
     N --> O["Deliver exact row to private Gist with idempotent retry"]
-    O --> P["Portfolio Compass imports purchase and recalculates holdings"]
+    O --> P["Portfolio Compass imports the Markdown record"]
+    O --> S["Local sidecar imports the JSONL event into Ghostfolio"]
     N --> Q["Discord: Saved on Kraken"]
-    Q -. "optional" .-> R["Ghostfolio mirror"]
+    Q --> R["Reporting continues independently"]
 ```
 
 `fciq` requests the GBP/USD fee in quote currency; `fcib` requests the crypto
@@ -92,7 +100,9 @@ funding leg merely because an API response was interrupted.
 
 ## Trend and timing decisions
 
-Analysis runs daily at 04:00 Bangkok time and uses completed Kraken candles only.
+Analysis runs at 04:07 Bangkok with an idempotent 04:37 recovery and uses
+completed Kraken candles only. Railway independently checks after 04:20 and
+dispatches a missing analysis when GitHub has no queued or active run.
 
 - `UPTREND`: two consecutive daily closes above SMA150, EMA20 above EMA50,
   completed weekly close above weekly EMA20, and a positive 20-day SMA150 slope.
@@ -105,10 +115,23 @@ Analysis runs daily at 04:00 Bangkok time and uses completed Kraken candles only
 rounded to the nearest penny using half-up currency rounding. The configured
 lower endpoint cannot exceed the upper endpoint.
 
-The execution-time engine deterministically evaluates completed 15-minute data
-over 3-, 5-, and 7-day windows. A decision contains an absolute `EXECUTE_AT`, is
-valid only for its stated window, and must be at least 30 minutes after analysis.
-Gemini may explain the result but cannot choose the regime, budget, or time.
+The execution-time engine deterministically evaluates 14-, 30-, 45-, and
+60-day Bangkok-day windows at 15-minute resolution. It minimizes median closing
+price miss from each day's absolute low, measures wins within 0.5%, applies the
+locked 14-day override and 30-versus-60 thresholds, and resolves close candidates
+using Top-5 appearances, 60-day win rate, then earlier local time. Gemini may
+explain the result but cannot choose, change, or block it.
+
+History is built exclusively from Kraken's first-party PostTrade API into
+append-only monthly Gist partitions. The resumable bootstrap checkpoints every
+page, globally rate-limits requests, records explicit no-trade gaps and partition
+hashes, and verifies the overlapping recent 7.5 days against Kraken OHLC. No new
+order is permitted unless BTC/USD, HYPE/USD, and SOL/USD all have current,
+verified history and decisions.
+
+If analysis finishes after its selected time, the explicit legacy catch-up time
+is 05:00 Bangkok and is usable only through 06:00. Normal selections retain the
+one-hour recovery window. Expired decisions are never replayed.
 
 Insufficient, stale, missing, or failed analysis sets that target to `ERROR`,
 alerts Discord, and skips the purchase. Old decisions are never reused.
@@ -162,6 +185,9 @@ Required repository variables:
 - `DCA_EXECUTION_STATE`
 - `DCA_START_DATE` (`2026-08-07` for this rollout)
 - `TIMEZONE` (`Asia/Bangkok`)
+- `DCA_TRADING_MODE` (`shadow`, `canary`, or `live`; default `shadow`)
+- `DCA_CANARY_SYMBOL` (`SOL_USD`)
+- `DCA_HISTORY_GIST_ID` (dedicated private history Gist)
 
 `DCA_CRON_ENABLED` is a Railway runtime variable, not a GitHub repository
 variable. It must be `true` for normal scheduling and should be set to `false`
@@ -178,6 +204,9 @@ Required Railway runtime variables:
 - `DISCORD_ALLOWED_USERS`
 - `DCA_CRON_ENABLED` (`true` for normal operation)
 - `TIMEZONE` (`Asia/Bangkok`, matching the GitHub repository variable)
+- `DCA_TRADING_MODE` (must match the repository variable)
+- `DCA_CANARY_SYMBOL` (`SOL_USD`)
+- `GIST_ID` and `GIST_TOKEN` for receipt-aware status
 
 Railway may also contain `GEMINI_API_KEY` for optional read-only conversational
 intent classification. Exact DCA control commands never depend on AI.
@@ -230,8 +259,9 @@ maximum daily exposure.
 
 | Workflow | Trigger | Responsibility |
 | --- | --- | --- |
-| `crypto_analysis.yml` | Daily 04:00 Bangkok or manual | Build fresh decisions for BTC/USD, HYPE/USD, and SOL/USD. |
-| `daily_dca.yml` | Railway dispatch | Enforce `DCA_START_DATE`, revalidate state, and execute due two-leg purchases. |
+| `crypto_analysis.yml` | 04:07 and 04:37 Bangkok or manual | Refresh strict Kraken history and build idempotent deterministic decisions. |
+| `kraken_history_bootstrap.yml` | Manual | Resume the 65-day PostTrade history bootstrap and publish verified partitions. |
+| `daily_dca.yml` | Minutes 02/17/32/47 plus Railway | Revalidate the global history gate and execute due two-leg purchases exactly once. |
 | `portfolio_check.yml` | Monthly or manual | Read-only Kraken holdings and USD-market history, valued in GBP with live Kraken GBP/USD. |
 | `update_dca_config.yml` | Manual/Discord dispatch | Serialize atomic GBP budget and enable-state updates. |
 | `ci.yml` | Pull request and `main` | Compile, test, validate workflows, and build the Railway image. |
@@ -253,6 +283,25 @@ changes.
 Acceptance requires no pending intents, no same-day duplicate orders, a fresh
 decision for every canonical target, and no credential or complete production
 state JSON in public logs. No manual intervention is required after activation.
+
+## Local Ghostfolio
+
+The isolated `dca-ghostfolio` Compose project pins Ghostfolio 3.43.0 and keeps
+PostgreSQL 15 and Redis off host ports. Only `127.0.0.1:3333` is exposed. The
+no-port sync sidecar has no Kraken credentials and polls the durable Gist every
+five minutes. Secrets live under `%LOCALAPPDATA%\dca-ghostfolio`, outside Git,
+with user-only ACLs.
+
+```powershell
+$env:DCA_GHOSTFOLIO_SECRETS_FILE="$env:LOCALAPPDATA\dca-ghostfolio\secrets.env"
+docker compose -f .\ghostfolio\compose.yml ps
+.\ghostfolio\backup-and-restore-test.ps1
+```
+
+`ghostfolio/reconcile_legacy.py` is dry-run only. It maps recovered trades to
+fresh logical accounts and blocks migration if the hosted export is missing or
+any exact-match conflict exists. Portfolio Compass remains independently fed by
+the existing Markdown ledger.
 
 ## Local verification
 

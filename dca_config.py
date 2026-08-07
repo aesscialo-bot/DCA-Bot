@@ -21,23 +21,34 @@ ALLOWED_TARGETS = TARGET_KEYS
 TARGET_SYMBOLS = {key: key.replace("_", "/") for key in TARGET_KEYS}
 RULE_FIELDS = frozenset({"REGIME_AMOUNTS_GBP", "BUY_ENABLED"})
 REGIME_AMOUNT_FIELDS = frozenset({"LOW", "UP"})
-ANALYSIS_STATE_FIELDS = frozenset({"VERSION", "GENERATED_AT", "TARGETS"})
+TIMING_POLICY_VERSION = "original-14-30-45-60-v1"
+ANALYSIS_STATE_FIELDS = frozenset(
+    {"VERSION", "GENERATED_AT", "POLICY_VERSION", "ANALYSIS_DATE", "TARGETS"}
+)
 ANALYSIS_DECISION_FIELDS = frozenset(
     {
-        "STATUS",
+        "ENABLED",
+        "ANALYSIS_STATUS",
+        "EXECUTION_STATUS",
         "REGIME",
         "AMOUNT_TIER",
+        "SELECTED_AT",
         "EXECUTE_AT",
         "VALID_UNTIL",
+        "CATCHUP_APPLIED",
         "DECISION_ID",
         "RULES_HASH",
+        "POLICY_VERSION",
+        "ANALYSIS_DATE",
+        "HISTORY",
         "SIGNALS",
         "TIMING",
+        "ERROR",
     }
 )
-ANALYSIS_STATE_VERSION = 2
+ANALYSIS_STATE_VERSION = 3
 AMOUNT_POLICY_VERSION = 2
-GIST_DELIVERY_VERSION = 1
+GIST_DELIVERY_VERSION = 2
 MAX_PENDING_GIST_DELIVERIES = 16
 MAX_GIST_DELIVERY_ROW_BYTES = 2_048
 MAX_EXECUTION_STATE_JSON_BYTES = 40_000
@@ -46,7 +57,7 @@ MAX_EXECUTION_STATE_JSON_BYTES = 40_000
 # expansion (2x), with the remaining bytes covering the envelope, queue field,
 # and target entry.  Keeping this separate from the 40 KB hard budget lets the
 # executor reserve space for fill evidence before Kraken can receive AddOrder.
-GIST_DELIVERY_RESERVED_JSON_BYTES = 4_608
+GIST_DELIVERY_RESERVED_JSON_BYTES = 5_632
 GIST_DELIVERY_FIELDS = frozenset(
     {
         "version",
@@ -55,12 +66,42 @@ GIST_DELIVERY_FIELDS = frozenset(
         "symbol",
         "row",
         "row_sha256",
+        "event",
+        "event_sha256",
+    }
+)
+PORTFOLIO_EVENT_FIELDS = frozenset(
+    {
+        "event_version",
+        "event_id",
+        "occurred_at",
+        "target",
+        "base_currency",
+        "quote_currency",
+        "budget_currency",
+        "funding_order_id",
+        "crypto_order_id",
+        "gbp_debit",
+        "gbp_usd_rate",
+        "funded_usd",
+        "crypto_cost_usd",
+        "crypto_quantity",
+        "unit_price_usd",
+        "funding_fee_usd",
+        "crypto_fee_usd",
+        "canonical_hash",
     }
 )
 MIN_ENABLED_AMOUNT_GBP = 5.0
 MAX_AMOUNT_GBP = 1_000.0
 READY_STATUS = "READY"
 ERROR_STATUS = "ERROR"
+ANALYSIS_STATUSES = frozenset(
+    {"HISTORY_NOT_READY", "AWAITING_ANALYSIS", READY_STATUS, ERROR_STATUS}
+)
+EXECUTION_STATUSES = frozenset(
+    {"DISABLED", "SHADOW", "ARMED", "DUE", "EXECUTED", "EXPIRED", "BLOCKED"}
+)
 REGIMES = frozenset({"UPTREND", "DOWNTREND", "SIDEWAYS"})
 AMOUNT_TIERS = frozenset({"LOW", "MID", "HIGH"})
 REGIME_AMOUNT_TIERS = {
@@ -457,11 +498,71 @@ def validate_gist_delivery(value: Mapping[str, Any], target: str) -> dict[str, A
         raise ConfigError(f"{label}.row_sha256 must be a lowercase SHA-256 digest")
     if row_sha256 != sha256(row_bytes).hexdigest():
         raise ConfigError(f"{label}.row_sha256 does not match row")
+    event = delivery["event"]
+    if not isinstance(event, Mapping):
+        raise ConfigError(f"{label}.event must be an object")
+    event = dict(event)
+    _unexpected_fields(event, PORTFOLIO_EVENT_FIELDS, f"{label}.event")
+    if event["event_version"] != GIST_DELIVERY_VERSION:
+        raise ConfigError(f"{label}.event.event_version must be {GIST_DELIVERY_VERSION}")
+    if event["event_id"] != delivery_id or event["crypto_order_id"] != delivery_id:
+        raise ConfigError(f"{label}.event identifiers must match delivery_id")
+    if event["target"] != target:
+        raise ConfigError(f"{label}.event.target must be {target}")
+    if event["base_currency"] != expected_symbol:
+        raise ConfigError(f"{label}.event.base_currency must be {expected_symbol}")
+    if event["quote_currency"] != "USD" or event["budget_currency"] != "GBP":
+        raise ConfigError(f"{label}.event currencies must be GBP-funded USD")
+    if event["occurred_at"] != created_at:
+        raise ConfigError(f"{label}.event.occurred_at must match created_at")
+    for field in (
+        "gbp_debit",
+        "gbp_usd_rate",
+        "funded_usd",
+        "crypto_cost_usd",
+        "crypto_quantity",
+        "unit_price_usd",
+        "funding_fee_usd",
+        "crypto_fee_usd",
+    ):
+        raw = event[field]
+        if not isinstance(raw, str):
+            raise ConfigError(f"{label}.event.{field} must be a decimal string")
+        try:
+            number = Decimal(raw)
+        except Exception as exc:
+            raise ConfigError(f"{label}.event.{field} must be a decimal string") from exc
+        if not number.is_finite() or number < 0:
+            raise ConfigError(f"{label}.event.{field} must be non-negative")
+    funding_order_id = event["funding_order_id"]
+    if not isinstance(funding_order_id, str) or not funding_order_id.strip():
+        raise ConfigError(f"{label}.event.funding_order_id must be non-empty")
+    canonical_hash = event["canonical_hash"]
+    event_without_hash = {key: value for key, value in event.items() if key != "canonical_hash"}
+    expected_canonical_hash = sha256(
+        json.dumps(
+            event_without_hash,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    if canonical_hash != expected_canonical_hash:
+        raise ConfigError(f"{label}.event.canonical_hash does not match event")
+    canonical_event = json.dumps(
+        event, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    event_sha256 = delivery["event_sha256"]
+    if not isinstance(event_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", event_sha256):
+        raise ConfigError(f"{label}.event_sha256 must be a lowercase SHA-256 digest")
+    if event_sha256 != sha256(canonical_event).hexdigest():
+        raise ConfigError(f"{label}.event_sha256 does not match event")
+    delivery["event"] = event
     return delivery
 
 
 def validate_analysis_decision(target: str, value: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate one deterministic per-target analysis result."""
+    """Validate one deterministic per-target v3 analysis result."""
 
     if target not in TARGET_KEYS:
         raise ConfigError(f"Unsupported production target: {target}")
@@ -470,9 +571,22 @@ def validate_analysis_decision(target: str, value: Mapping[str, Any]) -> dict[st
     decision = dict(value)
     label = f"DCA_ANALYSIS_STATE.TARGETS.{target}"
     _unexpected_fields(decision, ANALYSIS_DECISION_FIELDS, label)
-    status = decision["STATUS"]
-    if status not in {READY_STATUS, ERROR_STATUS}:
-        raise ConfigError(f"{label}.STATUS must be READY or ERROR")
+    if type(decision["ENABLED"]) is not bool:
+        raise ConfigError(f"{label}.ENABLED must be a boolean")
+    analysis_status = decision["ANALYSIS_STATUS"]
+    if analysis_status not in ANALYSIS_STATUSES:
+        raise ConfigError(f"{label}.ANALYSIS_STATUS is invalid")
+    if decision["EXECUTION_STATUS"] not in EXECUTION_STATUSES:
+        raise ConfigError(f"{label}.EXECUTION_STATUS is invalid")
+    if decision["POLICY_VERSION"] != TIMING_POLICY_VERSION:
+        raise ConfigError(f"{label}.POLICY_VERSION must be {TIMING_POLICY_VERSION}")
+    analysis_date = decision["ANALYSIS_DATE"]
+    if not isinstance(analysis_date, str):
+        raise ConfigError(f"{label}.ANALYSIS_DATE must be YYYY-MM-DD")
+    try:
+        date.fromisoformat(analysis_date)
+    except ValueError as exc:
+        raise ConfigError(f"{label}.ANALYSIS_DATE must be YYYY-MM-DD") from exc
     decision_id = decision["DECISION_ID"]
     if not isinstance(decision_id, str) or not decision_id.strip():
         raise ConfigError(f"{label}.DECISION_ID must be a non-empty string")
@@ -483,6 +597,8 @@ def validate_analysis_decision(target: str, value: Mapping[str, Any]) -> dict[st
         raise ConfigError(f"{label}.SIGNALS must be an object")
     if not isinstance(decision["TIMING"], Mapping):
         raise ConfigError(f"{label}.TIMING must be an object")
+    if not isinstance(decision["HISTORY"], Mapping):
+        raise ConfigError(f"{label}.HISTORY must be an object")
     timing = dict(decision["TIMING"])
     if "ANALYZED_AT" not in timing:
         raise ConfigError(f"{label}.TIMING.ANALYZED_AT is required")
@@ -490,7 +606,7 @@ def validate_analysis_decision(target: str, value: Mapping[str, Any]) -> dict[st
         timing["ANALYZED_AT"], f"{label}.TIMING.ANALYZED_AT"
     )
 
-    if status == READY_STATUS:
+    if analysis_status == READY_STATUS:
         if decision["REGIME"] not in REGIMES:
             raise ConfigError(f"{label}.REGIME is invalid")
         if decision["AMOUNT_TIER"] not in AMOUNT_TIERS:
@@ -498,22 +614,38 @@ def validate_analysis_decision(target: str, value: Mapping[str, Any]) -> dict[st
         expected_tier = amount_tier_for_regime(decision["REGIME"])
         if decision["AMOUNT_TIER"] != expected_tier:
             raise ConfigError(f"{label}.AMOUNT_TIER does not match REGIME")
+        selected_at = parse_iso_datetime(decision["SELECTED_AT"], f"{label}.SELECTED_AT")
         execute_at = parse_iso_datetime(decision["EXECUTE_AT"], f"{label}.EXECUTE_AT")
         valid_until = parse_iso_datetime(decision["VALID_UNTIL"], f"{label}.VALID_UNTIL")
-        if execute_at < analyzed_at + timedelta(minutes=30):
-            raise ConfigError(
-                f"{label}.EXECUTE_AT must be at least 30 minutes after ANALYZED_AT"
-            )
         if valid_until != execute_at + timedelta(minutes=60):
             raise ConfigError(f"{label}.VALID_UNTIL must be exactly 60 minutes after EXECUTE_AT")
+        if type(decision["CATCHUP_APPLIED"]) is not bool:
+            raise ConfigError(f"{label}.CATCHUP_APPLIED must be a boolean")
+        if decision["CATCHUP_APPLIED"] and selected_at > analyzed_at:
+            raise ConfigError(f"{label}.CATCHUP_APPLIED requires an already-missed selected time")
+        if not decision["CATCHUP_APPLIED"] and execute_at != selected_at:
+            raise ConfigError(f"{label}.EXECUTE_AT must match SELECTED_AT without catch-up")
+        history = dict(decision["HISTORY"])
+        if history.get("STATUS") != "READY":
+            raise ConfigError(f"{label}.HISTORY must be READY")
+        history_hash = history.get("HASH")
+        if not isinstance(history_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", history_hash):
+            raise ConfigError(f"{label}.HISTORY.HASH must be a lowercase SHA-256 hash")
+        if decision["ERROR"] is not None:
+            raise ConfigError(f"{label}.ERROR must be null for READY analysis")
     else:
         if decision["REGIME"] is not None or decision["AMOUNT_TIER"] is not None:
-            raise ConfigError(f"{label} ERROR decisions cannot select a regime or amount")
-        if decision["EXECUTE_AT"] is not None or decision["VALID_UNTIL"] is not None:
-            raise ConfigError(f"{label} ERROR decisions cannot select an execution time")
+            raise ConfigError(f"{label} non-ready decisions cannot select a regime or amount")
+        if any(decision[field] is not None for field in ("SELECTED_AT", "EXECUTE_AT", "VALID_UNTIL")):
+            raise ConfigError(f"{label} non-ready decisions cannot select an execution time")
+        if decision["CATCHUP_APPLIED"] is not False:
+            raise ConfigError(f"{label}.CATCHUP_APPLIED must be false when not ready")
+        if not isinstance(decision["ERROR"], str) or not decision["ERROR"].strip():
+            raise ConfigError(f"{label}.ERROR must describe why analysis is not ready")
 
     return {
         **decision,
+        "HISTORY": dict(decision["HISTORY"]),
         "SIGNALS": dict(decision["SIGNALS"]),
         "TIMING": timing,
     }
@@ -541,6 +673,17 @@ def validate_analysis_state(
             f"DCA_ANALYSIS_STATE.VERSION must be {ANALYSIS_STATE_VERSION}"
         )
     generated_at = parse_iso_datetime(state["GENERATED_AT"], "DCA_ANALYSIS_STATE.GENERATED_AT")
+    if state["POLICY_VERSION"] != TIMING_POLICY_VERSION:
+        raise ConfigError(
+            f"DCA_ANALYSIS_STATE.POLICY_VERSION must be {TIMING_POLICY_VERSION}"
+        )
+    analysis_date = state["ANALYSIS_DATE"]
+    if not isinstance(analysis_date, str):
+        raise ConfigError("DCA_ANALYSIS_STATE.ANALYSIS_DATE must be YYYY-MM-DD")
+    try:
+        date.fromisoformat(analysis_date)
+    except ValueError as exc:
+        raise ConfigError("DCA_ANALYSIS_STATE.ANALYSIS_DATE must be YYYY-MM-DD") from exc
     targets = state["TARGETS"]
     if not isinstance(targets, Mapping):
         raise ConfigError("DCA_ANALYSIS_STATE.TARGETS must be an object")
@@ -561,10 +704,16 @@ def validate_analysis_state(
         for key in TARGET_KEYS
         if key in targets
     }
+    for target, decision in normalized_targets.items():
+        if decision["ANALYSIS_DATE"] != analysis_date:
+            raise ConfigError(
+                f"DCA_ANALYSIS_STATE.TARGETS.{target}.ANALYSIS_DATE must match "
+                "DCA_ANALYSIS_STATE.ANALYSIS_DATE"
+            )
     if rules_map is not None:
         normalized_rules = validate_rules_map(rules_map, require_all=require_all)
         for target, decision in normalized_targets.items():
-            if decision["STATUS"] == READY_STATUS:
+            if decision["ANALYSIS_STATUS"] == READY_STATUS:
                 expected = rules_hash(target, normalized_rules[target])
                 if decision["RULES_HASH"] != expected:
                     raise ConfigError(
@@ -576,6 +725,8 @@ def validate_analysis_state(
     return {
         "VERSION": ANALYSIS_STATE_VERSION,
         "GENERATED_AT": generated_at.isoformat().replace("+00:00", "Z"),
+        "POLICY_VERSION": TIMING_POLICY_VERSION,
+        "ANALYSIS_DATE": analysis_date,
         "TARGETS": normalized_targets,
     }
 
@@ -594,13 +745,15 @@ def decision_is_usable(
         normalized = validate_analysis_decision(target, decision)
     except ConfigError as exc:
         return False, str(exc)
-    if normalized["STATUS"] != READY_STATUS:
-        return False, "analysis status is ERROR"
+    if normalized["ANALYSIS_STATUS"] != READY_STATUS:
+        return False, f"analysis status is {normalized['ANALYSIS_STATUS']}"
     if normalized["RULES_HASH"] != expected_rules_hash:
         return False, "analysis rules hash does not match live budgets"
     if now.tzinfo is None or now.utcoffset() is None:
         raise ConfigError("now must include a timezone")
     now_utc = now.astimezone(timezone.utc)
+    if normalized["EXECUTION_STATUS"] in {"DISABLED", "BLOCKED", "EXPIRED"}:
+        return False, f"execution status is {normalized['EXECUTION_STATUS']}"
     execute_at = parse_iso_datetime(normalized["EXECUTE_AT"], "EXECUTE_AT")
     valid_until = parse_iso_datetime(normalized["VALID_UNTIL"], "VALID_UNTIL")
     if now_utc < execute_at - timedelta(minutes=early_minutes):
@@ -895,30 +1048,42 @@ def empty_analysis_state(
     now: datetime | None = None,
     reason: str = "Analysis has not run",
 ) -> dict[str, Any]:
-    """Return a complete fail-closed state with three fresh ERROR decisions."""
+    """Return a complete fail-closed v3 state awaiting deterministic analysis."""
 
     rules = validate_rules_map(rules_map or default_rules_map())
     generated = now or datetime.now(timezone.utc)
     if generated.tzinfo is None or generated.utcoffset() is None:
         raise ConfigError("now must include a timezone")
     generated_text = generated.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    selected_tz = timezone(timedelta(hours=7))
+    analysis_date = generated.astimezone(selected_tz).date().isoformat()
     targets = {}
     for target in TARGET_KEYS:
         digest = rules_hash(target, rules[target])
         targets[target] = {
-            "STATUS": ERROR_STATUS,
+            "ENABLED": bool(rules[target]["BUY_ENABLED"]),
+            "ANALYSIS_STATUS": "AWAITING_ANALYSIS",
+            "EXECUTION_STATUS": "DISABLED" if not rules[target]["BUY_ENABLED"] else "BLOCKED",
             "REGIME": None,
             "AMOUNT_TIER": None,
+            "SELECTED_AT": None,
             "EXECUTE_AT": None,
             "VALID_UNTIL": None,
+            "CATCHUP_APPLIED": False,
             "DECISION_ID": f"bootstrap-{target.lower()}-{digest[:12]}",
             "RULES_HASH": digest,
+            "POLICY_VERSION": TIMING_POLICY_VERSION,
+            "ANALYSIS_DATE": analysis_date,
+            "HISTORY": {"STATUS": "HISTORY_NOT_READY"},
             "SIGNALS": {"ERROR": reason},
             "TIMING": {"ANALYZED_AT": generated_text, "ERROR": reason},
+            "ERROR": reason,
         }
     return {
         "VERSION": ANALYSIS_STATE_VERSION,
         "GENERATED_AT": generated_text,
+        "POLICY_VERSION": TIMING_POLICY_VERSION,
+        "ANALYSIS_DATE": analysis_date,
         "TARGETS": targets,
     }
 
@@ -928,8 +1093,10 @@ __all__ = [
     "AMOUNT_POLICY_VERSION",
     "AMOUNT_TIERS",
     "ANALYSIS_STATE_VERSION",
+    "ANALYSIS_STATUSES",
     "ConfigError",
     "ERROR_STATUS",
+    "EXECUTION_STATUSES",
     "GIST_DELIVERY_FIELDS",
     "GIST_DELIVERY_RESERVED_JSON_BYTES",
     "GIST_DELIVERY_VERSION",
@@ -938,10 +1105,12 @@ __all__ = [
     "MAX_GIST_DELIVERY_ROW_BYTES",
     "MAX_PENDING_GIST_DELIVERIES",
     "MIN_ENABLED_AMOUNT_GBP",
+    "PORTFOLIO_EVENT_FIELDS",
     "READY_STATUS",
     "REGIMES",
     "TARGET_KEYS",
     "TARGET_SYMBOLS",
+    "TIMING_POLICY_VERSION",
     "amount_for_tier_gbp",
     "amount_tier_for_regime",
     "decision_is_usable",

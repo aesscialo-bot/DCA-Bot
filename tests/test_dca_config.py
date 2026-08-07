@@ -25,13 +25,30 @@ def gist_delivery(
             f"0.00020000 {symbol} | FUNDING-1 | {delivery_id} | "
             "optional/not saved |\n"
         )
+    target = f"{symbol}_USD"
+    event = {
+        "event_version": 2, "event_id": delivery_id, "occurred_at": created_at,
+        "target": target, "base_currency": symbol, "quote_currency": "USD",
+        "budget_currency": "GBP", "funding_order_id": "FUNDING-1",
+        "crypto_order_id": delivery_id, "gbp_debit": "10",
+        "gbp_usd_rate": "1.3", "funded_usd": "13", "crypto_cost_usd": "12.9",
+        "crypto_quantity": "0.0002", "unit_price_usd": "64500",
+        "funding_fee_usd": "0.02", "crypto_fee_usd": "0.08",
+    }
+    event["canonical_hash"] = sha256(
+        json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return {
-        "version": 1,
+        "version": 2,
         "delivery_id": delivery_id,
         "created_at": created_at,
         "symbol": symbol,
         "row": row,
         "row_sha256": sha256(row.encode("utf-8")).hexdigest(),
+        "event": event,
+        "event_sha256": sha256(
+            json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
     }
 
 
@@ -54,19 +71,28 @@ def ready_state(rules=None):
     state = dca_config.empty_analysis_state(rules, now=NOW)
     for target in dca_config.ALLOWED_TARGETS:
         state["TARGETS"][target] = {
-            "STATUS": "READY",
+            "ENABLED": bool(rules[target]["BUY_ENABLED"]),
+            "ANALYSIS_STATUS": "READY",
+            "EXECUTION_STATUS": "ARMED",
             "REGIME": "SIDEWAYS",
             "AMOUNT_TIER": "MID",
+            "SELECTED_AT": "2026-08-06T01:00:00Z",
             "EXECUTE_AT": "2026-08-06T01:00:00Z",
             "VALID_UNTIL": "2026-08-06T02:00:00Z",
+            "CATCHUP_APPLIED": False,
             "DECISION_ID": f"decision-{target.lower()}",
             "RULES_HASH": dca_config.rules_hash(target, rules[target]),
+            "POLICY_VERSION": dca_config.TIMING_POLICY_VERSION,
+            "ANALYSIS_DATE": "2026-08-06",
+            "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
             "SIGNALS": {"SMA150_SLOPE_20D": 1.2},
             "TIMING": {
                 "ANALYZED_AT": "2026-08-05T21:00:00Z",
                 "SELECTED_LOCAL_TIME": "08:00",
             },
+            "ERROR": None,
         }
+    state["ANALYSIS_DATE"] = "2026-08-06"
     return state
 
 
@@ -299,7 +325,7 @@ class StateSchemaTests(unittest.TestCase):
 
         state = ready_state()
         state["VERSION"] = 1
-        with self.assertRaisesRegex(ValueError, "VERSION must be 2"):
+        with self.assertRaisesRegex(ValueError, "VERSION must be 3"):
             dca_config.validate_analysis_state(state)
 
         state = ready_state()
@@ -317,14 +343,17 @@ class StateSchemaTests(unittest.TestCase):
         state = ready_state()
         state["TARGETS"]["BTC_USD"]["EXECUTE_AT"] = "2026-08-05T21:29:00Z"
         state["TARGETS"]["BTC_USD"]["VALID_UNTIL"] = "2026-08-05T22:29:00Z"
-        with self.assertRaisesRegex(ValueError, "at least 30 minutes"):
+        with self.assertRaisesRegex(ValueError, "match SELECTED_AT"):
             dca_config.validate_analysis_state(state)
 
     def test_error_decisions_are_complete_but_never_executable(self):
         state = dca_config.empty_analysis_state(now=NOW)
         validated = dca_config.validate_analysis_state(state)
         self.assertTrue(
-            all(item["STATUS"] == "ERROR" for item in validated["TARGETS"].values())
+            all(
+                item["ANALYSIS_STATUS"] == "AWAITING_ANALYSIS"
+                for item in validated["TARGETS"].values()
+            )
         )
         usable, reason = dca_config.decision_is_usable(
             validated["TARGETS"]["BTC_USD"],
@@ -333,7 +362,7 @@ class StateSchemaTests(unittest.TestCase):
             now=NOW,
         )
         self.assertFalse(usable)
-        self.assertIn("ERROR", reason)
+        self.assertIn("AWAITING_ANALYSIS", reason)
 
     def test_execution_window_is_inclusive_and_missed_decisions_are_stale(self):
         execute_at = "2026-08-06T01:00:00Z"
@@ -468,7 +497,7 @@ class StateSchemaTests(unittest.TestCase):
         )
 
         mutations = {
-            "version": 2,
+            "version": 1,
             "delivery_id": "unsafe order id",
             "created_at": "2026-08-06T01:05:00",
             "symbol": "SOL",
@@ -484,7 +513,7 @@ class StateSchemaTests(unittest.TestCase):
 
         bool_version = copy.deepcopy(valid)
         bool_version["version"] = True
-        with self.assertRaisesRegex(ValueError, "version must be 1"):
+        with self.assertRaisesRegex(ValueError, "version must be 2"):
             dca_config.validate_gist_delivery(bool_version, "BTC_USD")
 
         missing = copy.deepcopy(valid)

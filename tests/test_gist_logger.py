@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -8,6 +9,12 @@ from zoneinfo import ZoneInfo
 import requests
 
 import gist_logger
+
+
+def event_content(delivery):
+    return json.dumps(
+        delivery["event"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ) + "\n"
 
 
 class MockResponse:
@@ -88,7 +95,10 @@ class GistLoggerTests(unittest.TestCase):
             gist_logger.GIST_REQUEST_TIMEOUT_SECONDS,
         )
         payload_files = patch_request.call_args.kwargs["json"]["files"]
-        self.assertEqual(list(payload_files), [gist_logger.GIST_FILENAME])
+        self.assertEqual(
+            list(payload_files),
+            [gist_logger.GIST_FILENAME, gist_logger.GHOSTFOLIO_EVENTS_FILENAME],
+        )
         content = payload_files[gist_logger.GIST_FILENAME]["content"]
         self.assertIn("# Kraken USD DCA Trade Log", content)
         self.assertIn("Kraken is the source of truth", content)
@@ -173,9 +183,11 @@ class GistLoggerTests(unittest.TestCase):
                 "symbol",
                 "row",
                 "row_sha256",
+                "event",
+                "event_sha256",
             ],
         )
-        self.assertEqual(first["version"], 1)
+        self.assertEqual(first["version"], 2)
         self.assertEqual(first["delivery_id"], "KRAKEN-123")
         self.assertEqual(first["created_at"], "2026-07-12T04:34:42Z")
         self.assertEqual(first["symbol"], "BTC")
@@ -218,7 +230,10 @@ class GistLoggerTests(unittest.TestCase):
                 return_value=MockResponse(
                     body={
                         "files": {
-                            gist_logger.GIST_FILENAME: {"content": existing}
+                            gist_logger.GIST_FILENAME: {"content": existing},
+                            gist_logger.GHOSTFOLIO_EVENTS_FILENAME: {
+                                "content": event_content(delivery)
+                            },
                         }
                     }
                 ),
@@ -246,7 +261,10 @@ class GistLoggerTests(unittest.TestCase):
                 return_value=MockResponse(
                     body={
                         "files": {
-                            gist_logger.GIST_FILENAME: {"content": existing}
+                            gist_logger.GIST_FILENAME: {"content": existing},
+                            gist_logger.GHOSTFOLIO_EVENTS_FILENAME: {
+                                "content": event_content(delivery)
+                            },
                         }
                     }
                 ),
@@ -261,22 +279,28 @@ class GistLoggerTests(unittest.TestCase):
     def test_lost_patch_response_can_be_retried_without_duplicate(self):
         with patch.object(gist_logger, "SELECTED_TZ", ZoneInfo("UTC")):
             delivery = gist_logger.build_gist_delivery(self.trade, "BTC")
-        remote_content = {"value": ""}
+        remote_content = {"markdown": "", "events": ""}
 
         def get_remote(*args, **kwargs):
             return MockResponse(
                 body={
                     "files": {
                         gist_logger.GIST_FILENAME: {
-                            "content": remote_content["value"]
-                        }
+                            "content": remote_content["markdown"]
+                        },
+                        gist_logger.GHOSTFOLIO_EVENTS_FILENAME: {
+                            "content": remote_content["events"]
+                        },
                     }
                 }
             )
 
         def patch_then_lose_response(*args, **kwargs):
-            remote_content["value"] = kwargs["json"]["files"][
+            remote_content["markdown"] = kwargs["json"]["files"][
                 gist_logger.GIST_FILENAME
+            ]["content"]
+            remote_content["events"] = kwargs["json"]["files"][
+                gist_logger.GHOSTFOLIO_EVENTS_FILENAME
             ]["content"]
             raise requests.ConnectionError("response was lost")
 
@@ -295,7 +319,7 @@ class GistLoggerTests(unittest.TestCase):
         self.assertFalse(first_result)
         self.assertTrue(second_result)
         self.assertEqual(patch_request.call_count, 1)
-        self.assertEqual(remote_content["value"].count(delivery["row"]), 1)
+        self.assertEqual(remote_content["markdown"].count(delivery["row"]), 1)
 
     def test_truncated_api_content_fetches_complete_raw_file_before_patch(self):
         with patch.object(gist_logger, "SELECTED_TZ", ZoneInfo("UTC")):
@@ -379,7 +403,10 @@ class GistLoggerTests(unittest.TestCase):
                 return_value=MockResponse(
                     body={
                         "files": {
-                            gist_logger.GIST_FILENAME: {"content": existing}
+                            gist_logger.GIST_FILENAME: {"content": existing},
+                            gist_logger.GHOSTFOLIO_EVENTS_FILENAME: {
+                                "content": event_content(delivery)
+                            },
                         }
                     }
                 ),
@@ -408,7 +435,10 @@ class GistLoggerTests(unittest.TestCase):
                 return_value=MockResponse(
                     body={
                         "files": {
-                            gist_logger.GIST_FILENAME: {"content": existing}
+                            gist_logger.GIST_FILENAME: {"content": existing},
+                            gist_logger.GHOSTFOLIO_EVENTS_FILENAME: {
+                                "content": event_content(delivery)
+                            },
                         }
                     }
                 ),

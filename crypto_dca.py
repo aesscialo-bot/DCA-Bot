@@ -15,6 +15,7 @@ from dca_config import (
     ALLOWED_TARGETS,
     ConfigError,
     MAX_PENDING_GIST_DELIVERIES,
+    TIMING_POLICY_VERSION,
     decision_analyzed_on_or_after,
     decision_age_minutes,
     ensure_gist_delivery_capacity,
@@ -46,6 +47,12 @@ DCA_ANALYSIS_STATE_JSON = os.environ.get("DCA_ANALYSIS_STATE", "")
 DCA_EXECUTION_STATE_JSON = os.environ.get("DCA_EXECUTION_STATE", "")
 DCA_SYMBOLS_JSON = os.environ.get("DCA_SYMBOLS_JSON", "")
 DCA_START_DATE = os.environ.get("DCA_START_DATE", "").strip()
+DCA_TRADING_MODE = os.environ.get("DCA_TRADING_MODE", "shadow").strip().lower()
+DCA_CANARY_SYMBOL = os.environ.get("DCA_CANARY_SYMBOL", "SOL_USD").strip().upper()
+GHOSTFOLIO_DIRECT_SYNC_ENABLED = (
+    os.environ.get("GHOSTFOLIO_DIRECT_SYNC_ENABLED", "false").strip().lower()
+    == "true"
+)
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 RULES_VARIABLE = "DCA_TARGET_MAP"
@@ -561,8 +568,10 @@ def _decision_snapshot(decision):
 
 def _decision_gate(symbol, rule, decision, now):
     """Return ``(status, reason, amount)`` for one current decision."""
-    if decision["STATUS"] != "READY":
-        return "ERROR", "analysis status is ERROR", None
+    if decision["ANALYSIS_STATUS"] != "READY":
+        return "ERROR", f"analysis status is {decision['ANALYSIS_STATUS']}", None
+    if decision["ANALYSIS_DATE"] != now.astimezone(SELECTED_TZ).date().isoformat():
+        return "ERROR", "analysis decision is not for the current Bangkok date", None
     expected_hash = rules_hash(symbol, rule)
     if decision["RULES_HASH"] != expected_hash:
         return "ERROR", "analysis decision does not match the live budgets", None
@@ -584,12 +593,47 @@ def _decision_gate(symbol, rule, decision, now):
         return "NOT_DUE", "execution window has not opened", None
     if now > valid_until or not is_execution_window(now, execute_at):
         return "MISSED", "analysis decision is stale or its window was missed", None
+    if DCA_TRADING_MODE == "shadow":
+        return "SHADOW", "shadow mode blocks new Kraken orders", None
+    if DCA_TRADING_MODE == "canary" and symbol != DCA_CANARY_SYMBOL:
+        return "SHADOW", f"canary mode permits only {DCA_CANARY_SYMBOL}", None
+    if DCA_TRADING_MODE not in {"canary", "live"}:
+        return "ERROR", f"invalid DCA_TRADING_MODE {DCA_TRADING_MODE!r}", None
     amount_gbp = effective_amount(rule, decision)
     try:
         amount_gbp = _parse_amount_gbp(amount_gbp)
     except ValueError as error:
         return "ERROR", str(error), None
     return "READY", "ready", amount_gbp
+
+
+def _global_history_gate(analysis, now):
+    """Enforce the selected Kraken-only policy before any new order.
+
+    A pair-local analysis error still remains visible and retryable, but strict
+    production execution cannot proceed until all three canonical targets have
+    a current, verified decision built by the same 60-day policy.
+    """
+    today = now.astimezone(SELECTED_TZ).date().isoformat()
+    failures = []
+    if analysis.get("ANALYSIS_DATE") != today:
+        failures.append(f"state date is {analysis.get('ANALYSIS_DATE') or 'missing'}")
+    if analysis.get("POLICY_VERSION") != TIMING_POLICY_VERSION:
+        failures.append("state policy version is not current")
+    for target in ALLOWED_TARGETS:
+        decision = analysis["TARGETS"][target]
+        history = decision.get("HISTORY") or {}
+        if decision.get("ANALYSIS_DATE") != today:
+            failures.append(f"{target} analysis date is not {today}")
+        if decision.get("ANALYSIS_STATUS") != "READY":
+            failures.append(
+                f"{target} analysis is {decision.get('ANALYSIS_STATUS', 'missing')}"
+            )
+        if history.get("STATUS") != "READY":
+            failures.append(f"{target} history is {history.get('STATUS', 'missing')}")
+    if failures:
+        return False, "; ".join(failures)
+    return True, "all three Kraken histories and decisions are ready"
 
 
 def _revalidate_trade_intent(
@@ -614,6 +658,10 @@ def _revalidate_trade_intent(
     rule = live_rules[symbol]
     decision = live_analysis["TARGETS"][symbol]
     execution = live_execution.get(symbol, {"LAST_BUY_DATE": ""})
+
+    globally_ready, global_reason = _global_history_gate(live_analysis, current_time)
+    if not globally_ready:
+        raise RuntimeError(f"global Kraken history gate blocked execution: {global_reason}")
 
     if not rule["BUY_ENABLED"]:
         raise RuntimeError(f"{symbol} was disabled before order submission")
@@ -657,22 +705,23 @@ def _post_trade_logs(
 ):
     """Attempt optional mirrors after the confirmed fill is already durable."""
     ghostfolio_saved = False
-    try:
-        from portfolio_logger import get_account_id, log_to_ghostfolio
+    if GHOSTFOLIO_DIRECT_SYNC_ENABLED:
+        try:
+            from portfolio_logger import get_account_id, log_to_ghostfolio
 
-        portfolio_map = json.loads(os.environ.get("PORTFOLIO_ACCOUNT_MAP") or "{}")
-        account_id = get_account_id(base_symbol, portfolio_map)
-        if account_id:
-            ghostfolio_saved = bool(
-                log_to_ghostfolio(
-                    trade_data,
-                    base_symbol,
-                    account_id,
-                    exchange_pair=exchange_pair,
+            portfolio_map = json.loads(os.environ.get("PORTFOLIO_ACCOUNT_MAP") or "{}")
+            account_id = get_account_id(base_symbol, portfolio_map)
+            if account_id:
+                ghostfolio_saved = bool(
+                    log_to_ghostfolio(
+                        trade_data,
+                        base_symbol,
+                        account_id,
+                        exchange_pair=exchange_pair,
+                    )
                 )
-            )
-    except Exception as error:
-        print(f"Optional Ghostfolio logging failed: {type(error).__name__}", flush=True)
+        except Exception as error:
+            print(f"Optional Ghostfolio logging failed: {type(error).__name__}", flush=True)
     if gist_delivery is not None and symbol_key is not None:
         try:
             delivered = _attempt_gist_delivery(symbol_key, gist_delivery)
@@ -1044,6 +1093,18 @@ def main():
     except (json.JSONDecodeError, ConfigError, RuntimeError, ValueError) as error:
         analysis_error = str(error)
 
+    global_history_ready = False
+    global_history_reason = analysis_error or "analysis state is unavailable"
+    if analysis is not None:
+        global_history_ready, global_history_reason = _global_history_gate(analysis, now)
+    if not global_history_ready:
+        message = (
+            "New Kraken orders are globally blocked until all three pairs have "
+            f"current verified 60-day decisions: {global_history_reason}."
+        )
+        print(message, flush=True)
+        send_discord_alert(message, is_error=True)
+
     for symbol in selected_symbols:
         if _pending_order_for_symbol(execution_state, symbol) is not None:
             continue
@@ -1061,11 +1122,17 @@ def main():
             send_discord_alert(message, is_error=True)
             all_succeeded = False
             continue
+        if not global_history_ready:
+            all_succeeded = False
+            continue
 
         decision = analysis["TARGETS"][symbol]
         status, reason, amount_gbp = _decision_gate(symbol, rule, decision, now)
         if status == "NOT_DUE":
             print(f"{symbol}: {reason}.", flush=True)
+            continue
+        if status == "SHADOW":
+            print(f"{symbol}: {reason}; no Kraken order attempted.", flush=True)
             continue
         if status != "READY":
             message = f"Skipping {symbol}: {reason}."

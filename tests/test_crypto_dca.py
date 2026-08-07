@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import crypto_dca
 import dca_config
+import gist_logger
 from dca_config import (
     amount_tier_for_regime,
     default_rules_map,
@@ -15,6 +16,7 @@ from dca_config import (
 
 
 NOW = datetime(2026, 8, 5, 5, 0, tzinfo=timezone.utc)
+crypto_dca.DCA_TRADING_MODE = "live"
 
 
 def rules_with(*enabled_targets, low=10, up=20):
@@ -32,24 +34,35 @@ def ready_decision(target, rule, *, now=NOW, regime="UPTREND", offset=0):
     analyzed_at = min(now, execute_at - timedelta(minutes=30))
     tier = amount_tier_for_regime(regime)
     return {
-        "STATUS": "READY",
+        "ENABLED": bool(rule["BUY_ENABLED"]),
+        "ANALYSIS_STATUS": "READY",
+        "EXECUTION_STATUS": "ARMED",
         "REGIME": regime,
         "AMOUNT_TIER": tier,
+        "SELECTED_AT": execute_at.isoformat().replace("+00:00", "Z"),
         "EXECUTE_AT": execute_at.isoformat().replace("+00:00", "Z"),
         "VALID_UNTIL": (execute_at + timedelta(minutes=60))
         .isoformat()
         .replace("+00:00", "Z"),
         "DECISION_ID": f"decision-{target.lower()}-{int(execute_at.timestamp())}",
         "RULES_HASH": rules_hash(target, rule),
+        "POLICY_VERSION": dca_config.TIMING_POLICY_VERSION,
+        "ANALYSIS_DATE": now.astimezone(crypto_dca.SELECTED_TZ).date().isoformat(),
+        "CATCHUP_APPLIED": False,
+        "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
         "SIGNALS": {"SOURCE": "completed Kraken candles"},
         "TIMING": {
             "ANALYZED_AT": analyzed_at.isoformat().replace("+00:00", "Z")
         },
+        "ERROR": None,
     }
 
 
 def analysis_for(rules, decisions):
     state = empty_analysis_state(rules, now=NOW)
+    for target in crypto_dca.ALLOWED_TARGETS:
+        if target not in decisions:
+            state["TARGETS"][target] = ready_decision(target, rules[target])
     state["TARGETS"].update(decisions)
     return state
 
@@ -75,14 +88,26 @@ def pending_gist_delivery(
         f"{quantity} {symbol} | kraken-funding-order-id | {delivery_id} | "
         "optional/not saved |\n"
     )
-    return {
-        "version": 1,
-        "delivery_id": delivery_id,
-        "created_at": "2026-08-05T05:00:00Z",
-        "symbol": symbol,
-        "row": row,
-        "row_sha256": hashlib.sha256(row.encode("utf-8")).hexdigest(),
+    event = {
+        "event_version": 2, "event_id": delivery_id,
+        "occurred_at": "2026-08-05T05:00:00Z", "target": target,
+        "base_currency": symbol, "quote_currency": "USD", "budget_currency": "GBP",
+        "funding_order_id": "kraken-funding-order-id", "crypto_order_id": delivery_id,
+        "gbp_debit": "20", "gbp_usd_rate": "1.275", "funded_usd": "25.5",
+        "crypto_cost_usd": "25.43", "crypto_quantity": quantity,
+        "unit_price_usd": "63431.25", "funding_fee_usd": "0.02",
+        "crypto_fee_usd": "0.04",
     }
+    event["canonical_hash"] = hashlib.sha256(
+        json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    event_hash = hashlib.sha256(
+        json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {"version": 2, "delivery_id": delivery_id,
+            "created_at": "2026-08-05T05:00:00Z", "symbol": symbol,
+            "row": row, "row_sha256": hashlib.sha256(row.encode()).hexdigest(),
+            "event": event, "event_sha256": event_hash}
 
 
 class DcaConfigurationTests(unittest.TestCase):
@@ -132,6 +157,45 @@ class DcaConfigurationTests(unittest.TestCase):
 
 
 class DecisionGateTests(unittest.TestCase):
+    def test_global_history_gate_requires_all_three_current_ready_decisions(self):
+        rules = rules_with("BTC_USD", "HYPE_USD", "SOL_USD")
+        decisions = {
+            target: ready_decision(target, rules[target])
+            for target in crypto_dca.ALLOWED_TARGETS
+        }
+        analysis = analysis_for(rules, decisions)
+
+        self.assertEqual(crypto_dca._global_history_gate(analysis, NOW)[0], True)
+
+        analysis["TARGETS"]["HYPE_USD"]["ANALYSIS_STATUS"] = "ERROR"
+        analysis["TARGETS"]["HYPE_USD"]["HISTORY"] = {"STATUS": "ERROR"}
+        ready, reason = crypto_dca._global_history_gate(analysis, NOW)
+        self.assertFalse(ready)
+        self.assertIn("HYPE_USD analysis is ERROR", reason)
+        self.assertIn("HYPE_USD history is ERROR", reason)
+
+    def test_shadow_and_canary_modes_block_unapproved_new_orders(self):
+        rules = rules_with("BTC_USD", "SOL_USD")
+        btc = ready_decision("BTC_USD", rules["BTC_USD"])
+        sol = ready_decision("SOL_USD", rules["SOL_USD"])
+        with patch.object(crypto_dca, "DCA_TRADING_MODE", "shadow"):
+            self.assertEqual(
+                crypto_dca._decision_gate("BTC_USD", rules["BTC_USD"], btc, NOW)[0],
+                "SHADOW",
+            )
+        with (
+            patch.object(crypto_dca, "DCA_TRADING_MODE", "canary"),
+            patch.object(crypto_dca, "DCA_CANARY_SYMBOL", "SOL_USD"),
+        ):
+            self.assertEqual(
+                crypto_dca._decision_gate("BTC_USD", rules["BTC_USD"], btc, NOW)[0],
+                "SHADOW",
+            )
+            self.assertEqual(
+                crypto_dca._decision_gate("SOL_USD", rules["SOL_USD"], sol, NOW)[0],
+                "READY",
+            )
+
     def test_start_date_requires_same_local_day_analysis(self):
         rules = rules_with("BTC_USD", low=10, up=20)
         execute_at = datetime(2026, 8, 6, 21, 30, tzinfo=timezone.utc)
@@ -146,9 +210,11 @@ class DecisionGateTests(unittest.TestCase):
                 "BTC_USD", rules["BTC_USD"], decision, execute_at
             )
             self.assertEqual(status, "ERROR")
-            self.assertIn("predates", reason)
+            self.assertIn("current Bangkok date", reason)
 
             decision["TIMING"]["ANALYZED_AT"] = "2026-08-06T21:00:00Z"
+            decision["ANALYSIS_DATE"] = "2026-08-07"
+            decision["SELECTED_AT"] = decision["EXECUTE_AT"]
             status, _reason, amount = crypto_dca._decision_gate(
                 "BTC_USD", rules["BTC_USD"], decision, execute_at
             )

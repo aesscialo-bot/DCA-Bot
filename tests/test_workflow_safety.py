@@ -29,7 +29,7 @@ class WorkflowSafetyTests(unittest.TestCase):
         ):
             text = self._read(name)
             with self.subTest(workflow=name):
-                self.assertIn("queue: max", text)
+                self.assertIn("cancel-in-progress: false", text)
                 self.assertIn("github.ref == 'refs/heads/main'", text)
 
     def test_gist_token_is_separate_from_repo_variable_token(self):

@@ -8,7 +8,12 @@ from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
 import discord_bot
-from dca_config import ANALYSIS_STATE_VERSION, ALLOWED_TARGETS, rules_hash
+from dca_config import (
+    ANALYSIS_STATE_VERSION,
+    ALLOWED_TARGETS,
+    TIMING_POLICY_VERSION,
+    rules_hash,
+)
 
 
 NOW = datetime(2026, 8, 5, 4, 0, tzinfo=timezone.utc)
@@ -58,10 +63,16 @@ def analysis_state(
     for symbol in ALLOWED_TARGETS:
         status = status_overrides.get(symbol, "READY")
         execute_at = generated_at + timedelta(minutes=execute_offsets[symbol])
+        selected_at = execute_at
+        analysis_date = generated_at.astimezone(discord_bot.TIMEZONE).date().isoformat()
         targets[symbol] = {
-            "STATUS": status,
+            "ENABLED": bool(live_rules[symbol]["BUY_ENABLED"]),
+            "ANALYSIS_STATUS": status,
+            "EXECUTION_STATUS": "ARMED" if status == "READY" else "BLOCKED",
             "REGIME": "UPTREND" if status == "READY" else None,
             "AMOUNT_TIER": "LOW" if status == "READY" else None,
+            "SELECTED_AT": selected_at.isoformat().replace("+00:00", "Z")
+            if status == "READY" else None,
             "EXECUTE_AT": execute_at.isoformat().replace("+00:00", "Z")
             if status == "READY"
             else None,
@@ -70,16 +81,26 @@ def analysis_state(
             .replace("+00:00", "Z")
             if status == "READY"
             else None,
+            "CATCHUP_APPLIED": False,
             "DECISION_ID": f"decision-{symbol.lower()}",
             "RULES_HASH": rules_hash(symbol, live_rules[symbol]),
+            "POLICY_VERSION": TIMING_POLICY_VERSION,
+            "ANALYSIS_DATE": analysis_date,
+            "HISTORY": (
+                {"STATUS": "READY", "HASH": "a" * 64}
+                if status == "READY" else {"STATUS": "ERROR"}
+            ),
             "SIGNALS": {},
             "TIMING": {
                 "ANALYZED_AT": generated_at.isoformat().replace("+00:00", "Z")
             },
+            "ERROR": None if status == "READY" else "test analysis error",
         }
     return {
         "VERSION": ANALYSIS_STATE_VERSION,
         "GENERATED_AT": generated_at.isoformat().replace("+00:00", "Z"),
+        "POLICY_VERSION": TIMING_POLICY_VERSION,
+        "ANALYSIS_DATE": generated_at.astimezone(discord_bot.TIMEZONE).date().isoformat(),
         "TARGETS": targets,
     }
 
@@ -105,13 +126,29 @@ def gist_delivery(
         f"0.00020000 {symbol} | FUNDING-1 | {delivery_id} | "
         "optional/not saved |\n"
     )
+    target = f"{symbol}_USD"
+    event = {
+        "event_version": 2, "event_id": delivery_id, "occurred_at": created_at,
+        "target": target, "base_currency": symbol, "quote_currency": "USD",
+        "budget_currency": "GBP", "funding_order_id": "FUNDING-1",
+        "crypto_order_id": delivery_id, "gbp_debit": "10", "gbp_usd_rate": "1.3",
+        "funded_usd": "13", "crypto_cost_usd": "12.9", "crypto_quantity": "0.0002",
+        "unit_price_usd": "64500", "funding_fee_usd": "0.02", "crypto_fee_usd": "0.08",
+    }
+    event["canonical_hash"] = sha256(
+        json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return {
-        "version": 1,
+        "version": 2,
         "delivery_id": delivery_id,
         "created_at": created_at,
         "symbol": symbol,
         "row": row,
         "row_sha256": sha256(row.encode("utf-8")).hexdigest(),
+        "event": event,
+        "event_sha256": sha256(
+            json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
     }
 
 
@@ -139,6 +176,53 @@ class DiscordBotControlTests(unittest.TestCase):
             discord_bot._normalise_usd_key("BTC/GBP")
         with self.assertRaisesRegex(ValueError, "Supported assets"):
             discord_bot._normalise_usd_key("CAR")
+
+    def test_ghostfolio_health_distinguishes_pending_and_completed_receipts(self):
+        event = gist_delivery()["event"]
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"files": {
+            discord_bot.PORTFOLIO_EVENT_FILE: {
+                "content": json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+            },
+            discord_bot.GHOSTFOLIO_RECEIPT_FILE: {"content": ""},
+        }}
+        with (
+            patch.object(discord_bot, "GIST_ID", "gist-id"),
+            patch.object(discord_bot, "GIST_TOKEN", "token"),
+            patch.object(discord_bot.requests, "get", return_value=response),
+        ):
+            self.assertEqual(
+                discord_bot.get_ghostfolio_delivery_health(),
+                {"status": "PENDING", "pending": 1, "completed": 0},
+            )
+            receipt = {
+                "order_id": event["event_id"],
+                "event_hash": event["canonical_hash"],
+                "ghostfolio_activity_id": "activity-id",
+                "imported_at": "2026-08-06T01:10:00Z",
+            }
+            response.json.return_value["files"][discord_bot.GHOSTFOLIO_RECEIPT_FILE]["content"] = json.dumps(receipt) + "\n"
+            self.assertEqual(
+                discord_bot.get_ghostfolio_delivery_health(),
+                {"status": "CLEAR", "pending": 0, "completed": 1},
+            )
+
+    def test_ghostfolio_health_rejects_malformed_event_hash(self):
+        event = gist_delivery()["event"]
+        event["canonical_hash"] = "0" * 64
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"files": {
+            discord_bot.PORTFOLIO_EVENT_FILE: {"content": json.dumps(event) + "\n"},
+            discord_bot.GHOSTFOLIO_RECEIPT_FILE: {"content": ""},
+        }}
+        with (
+            patch.object(discord_bot, "GIST_ID", "gist-id"),
+            patch.object(discord_bot, "GIST_TOKEN", "token"),
+            patch.object(discord_bot.requests, "get", return_value=response),
+        ):
+            self.assertEqual(
+                discord_bot.get_ghostfolio_delivery_health()["status"], "INVALID"
+            )
 
     def test_symbols_are_derived_from_valid_three_target_map(self):
         with patch.object(
@@ -418,12 +502,16 @@ class DiscordBotControlTests(unittest.TestCase):
         analysis = deepcopy(self.analysis)
         analysis["TARGETS"]["SOL_USD"].update(
             {
-                "STATUS": "ERROR",
+                "ANALYSIS_STATUS": "ERROR",
+                "EXECUTION_STATUS": "BLOCKED",
                 "REGIME": None,
                 "AMOUNT_TIER": None,
+                "SELECTED_AT": None,
                 "EXECUTE_AT": None,
                 "VALID_UNTIL": None,
+                "HISTORY": {"STATUS": "ERROR"},
                 "SIGNALS": {"ERROR": "test"},
+                "ERROR": "test",
             }
         )
         message = MessageStub()
@@ -652,7 +740,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(discord_bot._dca_schedule, {})
         self.assertEqual(discord_bot._due_symbols_for_dispatch(NOW), [])
-        self.assertIn("VERSION must be 2", discord_bot._schedule_error)
+        self.assertIn("VERSION must be 3", discord_bot._schedule_error)
 
     def test_multiple_assets_can_share_or_use_different_absolute_times(self):
         live_rules = rules(enabled={"BTC_USD", "HYPE_USD", "SOL_USD"})
@@ -703,8 +791,8 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         decisions = analysis_state(
             live_rules, status_overrides={"BTC_USD": "ERROR"}
         )
-        before_deadline = datetime(2026, 8, 5, 21, 14, tzinfo=timezone.utc)
-        after_deadline = datetime(2026, 8, 5, 21, 15, tzinfo=timezone.utc)
+        before_deadline = datetime(2026, 8, 5, 21, 19, tzinfo=timezone.utc)
+        after_deadline = datetime(2026, 8, 5, 21, 20, tzinfo=timezone.utc)
 
         self.assertTrue(
             discord_bot.refresh_dca_schedule(
@@ -787,7 +875,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(set(discord_bot._dca_schedule), {"HYPE_USD"})
 
-    def test_enabled_error_asset_is_skipped_without_blocking_ready_asset(self):
+    def test_enabled_pair_error_blocks_all_new_order_schedules(self):
         live_rules = rules(enabled={"BTC_USD", "HYPE_USD"})
         decisions = analysis_state(
             live_rules, status_overrides={"BTC_USD": "ERROR"}
@@ -798,7 +886,8 @@ class DiscordBotSchedulerTests(unittest.TestCase):
                 json.dumps(live_rules), json.dumps(decisions), "{}", now=NOW
             )
         )
-        self.assertEqual(set(discord_bot._dca_schedule), {"HYPE_USD"})
+        self.assertEqual(discord_bot._dca_schedule, {})
+        self.assertIn("global all-three Kraken history gate", discord_bot._schedule_warning)
         self.assertIn("BTC_USD: analysis ERROR", discord_bot._schedule_warning)
 
     def test_due_assets_use_inclusive_minus_five_plus_sixty_window(self):
@@ -842,7 +931,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
                 json.dumps(live_rules), json.dumps(stale), "{}", now=NOW
             )
         )
-        self.assertIn("stale decision", discord_bot._schedule_warning)
+        self.assertIn("stale analysis date", discord_bot._schedule_warning)
 
     def test_start_date_blocks_new_dispatches_until_local_date(self):
         live_rules = rules(enabled={"BTC_USD"})

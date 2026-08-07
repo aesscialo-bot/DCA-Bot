@@ -1,9 +1,11 @@
 """Best-effort audit logging for Kraken GBP-funded USD-market purchases."""
 
 import hashlib
+import json
 import math
 import os
 from datetime import datetime, timezone
+from decimal import Decimal
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -13,8 +15,9 @@ import requests
 GIST_ID = os.environ.get("GIST_ID")
 GIST_TOKEN = os.environ.get("GIST_TOKEN")
 GIST_FILENAME = "kraken_usd_dca_trade_log.md"
+GHOSTFOLIO_EVENTS_FILENAME = "kraken_usd_dca_ghostfolio_events.jsonl"
 GIST_REQUEST_TIMEOUT_SECONDS = 10
-GIST_DELIVERY_VERSION = 1
+GIST_DELIVERY_VERSION = 2
 MAX_GIST_FILE_BYTES = 8_000_000
 
 _DELIVERY_KEYS = (
@@ -24,6 +27,8 @@ _DELIVERY_KEYS = (
     "symbol",
     "row",
     "row_sha256",
+    "event",
+    "event_sha256",
 )
 _CRYPTO_ORDER_COLUMN = 9
 
@@ -99,6 +104,11 @@ def _validated_trade_values(trade_data):
         "fee_usd": _finite(
             trade_data.get("fee_usd", 0), "USD crypto fee", allow_zero=True
         ),
+        "funding_fee_usd": _finite(
+            trade_data.get("funding_fee_usd", 0),
+            "USD funding fee",
+            allow_zero=True,
+        ),
         "amount_crypto": _finite(trade_data["amount_crypto"], "crypto amount"),
         "usd_price": _finite(
             trade_data["usd_price_per_unit"], "USD unit price"
@@ -126,6 +136,12 @@ def _validated_trade_values(trade_data):
         fee_text = f"GBP equivalent {fee_gbp:.2f}"
     values["fee_text"] = fee_text
     return values
+
+
+def _decimal_text(value):
+    """Return a stable non-exponent decimal string for signed ledger data."""
+    text = format(Decimal(str(value)).normalize(), "f")
+    return "0" if text in {"-0", ""} else text
 
 
 def _split_markdown_row(line):
@@ -189,6 +205,28 @@ def _delivery_row_status(content, delivery):
     return "conflict"
 
 
+def _delivery_event_status(content, delivery):
+    """Return ``missing``, ``duplicate``, or ``conflict`` for a JSONL event."""
+    expected = json.dumps(
+        delivery["event"], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    matches = []
+    for line in content.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError("Ghostfolio event Gist contains malformed JSONL") from error
+        if event.get("event_id") == delivery["delivery_id"]:
+            matches.append(line)
+    if not matches:
+        return "missing"
+    if all(line == expected for line in matches):
+        return "duplicate"
+    return "conflict"
+
+
 def _safe_raw_gist_url(value):
     """Accept only GitHub's authenticated raw-Gist host."""
     if not isinstance(value, str):
@@ -214,12 +252,12 @@ def _response_text(response):
     return value
 
 
-def _gist_file_content(gist, headers):
+def _gist_file_content(gist, headers, filename=GIST_FILENAME):
     """Return the complete file, fetching raw content when REST truncates it."""
     files = gist.get("files", {})
     if not isinstance(files, dict):
         raise ValueError("Gist files payload must be an object")
-    file_info = files.get(GIST_FILENAME)
+    file_info = files.get(filename)
     if file_info is None:
         return ""
     if not isinstance(file_info, dict):
@@ -273,6 +311,35 @@ def build_gist_delivery(trade_data, symbol, saved_to_ghostfolio=False):
         f"{_clean_table_value(order_id)} | {mirrored} |\n"
     )
 
+    target = f"{canonical_symbol}_USD"
+    event = {
+        "event_version": GIST_DELIVERY_VERSION,
+        "event_id": order_id,
+        "occurred_at": created_at,
+        "target": target,
+        "base_currency": canonical_symbol,
+        "quote_currency": "USD",
+        "budget_currency": "GBP",
+        "funding_order_id": funding_order_id,
+        "crypto_order_id": order_id,
+        "gbp_debit": _decimal_text(values["amount_gbp"]),
+        "gbp_usd_rate": _decimal_text(values["gbp_usd_rate"]),
+        "funded_usd": _decimal_text(values["funded_usd"]),
+        "crypto_cost_usd": _decimal_text(values["cost_usd"]),
+        "crypto_quantity": _decimal_text(values["amount_crypto"]),
+        "unit_price_usd": _decimal_text(values["usd_price"]),
+        "funding_fee_usd": _decimal_text(values["funding_fee_usd"]),
+        "crypto_fee_usd": _decimal_text(values["fee_usd"]),
+    }
+    event["canonical_hash"] = hashlib.sha256(
+        json.dumps(
+            event, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+    canonical_event = json.dumps(
+        event, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+
     return {
         "version": GIST_DELIVERY_VERSION,
         "delivery_id": order_id,
@@ -280,13 +347,15 @@ def build_gist_delivery(trade_data, symbol, saved_to_ghostfolio=False):
         "symbol": canonical_symbol,
         "row": row,
         "row_sha256": hashlib.sha256(row.encode("utf-8")).hexdigest(),
+        "event": event,
+        "event_sha256": hashlib.sha256(canonical_event.encode("utf-8")).hexdigest(),
     }
 
 
 def _validated_delivery(delivery):
     if not isinstance(delivery, dict) or set(delivery) != set(_DELIVERY_KEYS):
-        raise ValueError("Gist delivery must use the exact version 1 schema")
-    if type(delivery["version"]) is not int or delivery["version"] != 1:
+        raise ValueError("Gist delivery must use the exact version 2 schema")
+    if type(delivery["version"]) is not int or delivery["version"] != 2:
         raise ValueError("unsupported Gist delivery version")
 
     delivery_id = _canonical_external_identifier(
@@ -328,6 +397,20 @@ def _validated_delivery(delivery):
         or row_sha256 != expected_hash
     ):
         raise ValueError("delivery row SHA-256 does not match its content")
+
+    event = delivery["event"]
+    if not isinstance(event, dict) or event.get("event_version") != 2:
+        raise ValueError("delivery event must use PortfolioEventV2")
+    if event.get("event_id") != delivery_id or event.get("crypto_order_id") != delivery_id:
+        raise ValueError("delivery event identifiers must match delivery ID")
+    if event.get("occurred_at") != created_at or event.get("base_currency") != symbol:
+        raise ValueError("delivery event metadata does not match the delivery")
+    canonical_event = json.dumps(
+        event, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    event_sha256 = delivery["event_sha256"]
+    if event_sha256 != hashlib.sha256(canonical_event).hexdigest():
+        raise ValueError("delivery event SHA-256 does not match its content")
 
     return {key: delivery[key] for key in _DELIVERY_KEYS}
 
@@ -374,16 +457,20 @@ def update_gist_log(trade_data, symbol="BTC", saved_to_ghostfolio=False):
         )
         response.raise_for_status()
         gist = response.json()
-        current_content = _gist_file_content(gist, headers)
+        current_content = _gist_file_content(gist, headers, GIST_FILENAME)
+        current_events = _gist_file_content(
+            gist, headers, GHOSTFOLIO_EVENTS_FILENAME
+        )
 
         row_status = _delivery_row_status(current_content, delivery)
-        if row_status == "duplicate":
+        event_status = _delivery_event_status(current_events, delivery)
+        if row_status == "duplicate" and event_status == "duplicate":
             print(
                 f"Optional Gist audit already contains "
                 f"{delivery['symbol']} delivery."
             )
             return True
-        if row_status == "conflict":
+        if "conflict" in {row_status, event_status}:
             print("Failed to update optional Gist audit (delivery conflict).")
             return False
 
@@ -391,18 +478,36 @@ def update_gist_log(trade_data, symbol="BTC", saved_to_ghostfolio=False):
             current_content = TABLE_HEADER
         elif not current_content.endswith("\n"):
             current_content += "\n"
-        updated_content = current_content + delivery["row"]
+        updated_content = (
+            current_content + delivery["row"]
+            if row_status == "missing"
+            else current_content
+        )
         if len(updated_content.encode("utf-8")) > MAX_GIST_FILE_BYTES:
             raise ValueError("Gist file would exceed the supported audit-ledger size")
+        event_line = json.dumps(
+            delivery["event"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ) + "\n"
+        if current_events and not current_events.endswith("\n"):
+            current_events += "\n"
+        updated_events = (
+            current_events + event_line
+            if event_status == "missing"
+            else current_events
+        )
+        if len(updated_events.encode("utf-8")) > MAX_GIST_FILE_BYTES:
+            raise ValueError("Ghostfolio event file would exceed the supported size")
 
         response = requests.patch(
             url,
             headers=headers,
             json={
                 "files": {
-                    GIST_FILENAME: {
-                        "content": updated_content
-                    }
+                    GIST_FILENAME: {"content": updated_content},
+                    GHOSTFOLIO_EVENTS_FILENAME: {"content": updated_events},
                 }
             },
             timeout=GIST_REQUEST_TIMEOUT_SECONDS,

@@ -22,6 +22,21 @@ Kraken is the source of truth for balances, holdings, fees, and orders.
 | Kraken holdings report | [Portfolio Balance Check workflow](https://github.com/aesscialo-bot/DCA-Bot/actions/workflows/portfolio_check.yml) |
 | Code validation and deployment gate | [CI workflow](https://github.com/aesscialo-bot/DCA-Bot/actions/workflows/ci.yml) |
 
+## Recovery posture
+
+The bot is intentionally contained while this recovery is validated:
+
+- Railway scheduling is paused with `DCA_CRON_ENABLED=false`.
+- `DCA_TRADING_MODE=shadow` blocks every new Kraken order.
+- All pairs remain analysis-enabled, but the all-three Kraken history gate must
+  pass before even the SOL canary can submit an order.
+- The 7 August missed purchase will not be replayed.
+- Rollback at every rollout stage is `DCA_TRADING_MODE=shadow`.
+
+Do not resume Railway or choose `canary` until the history manifest shows three
+verified 60-day decisions and one complete scheduled shadow cycle has produced
+zero Kraken `AddOrder` calls.
+
 ## Production baseline
 
 The configured target set is exactly:
@@ -46,14 +61,13 @@ rules, decisions, pending state, and scheduler posture.
 
 ## What happens each day
 
-1. GitHub Actions is scheduled for 04:00 Asia/Bangkok and analyzes completed
-   Kraken candles for all configured pairs. GitHub may queue a scheduled run a
-   few minutes after 04:00.
+1. GitHub Actions runs at 04:07 Asia/Bangkok, with an idempotent 04:37 recovery.
+   Railway checks for a missing run after 04:20.
 2. Deterministic Python classifies each pair as `UPTREND`, `DOWNTREND`, or
    `SIDEWAYS`.
 3. Python selects the higher / midpoint / lower GBP spend for downtrend /
    sideways / uptrend respectively, plus the best 15-minute execution time from
-   deterministic 3-, 5-, and 7-day timing windows.
+   deterministic 14-, 30-, 45-, and 60-day timing windows.
 4. The workflow writes a fresh `DCA_ANALYSIS_STATE` and posts a readable summary
    to Discord.
 5. Railway checks the absolute execution times every five minutes and dispatches
@@ -71,6 +85,13 @@ missing.
 
 Missing, stale, insufficient, or failed analysis creates an `ERROR` decision,
 alerts Discord, and skips that purchase. The bot never reuses an old decision.
+The Daily DCA fallback also runs at minutes 02, 17, 32, and 47, but every trigger
+passes through the same durable intent and once-per-day lock.
+
+Status reports the analysis date, decision ID, selected optimal time, effective
+catch-up time, execution status, workflow ref, pending Kraken intent, Portfolio
+Compass delivery, and local Ghostfolio receipt completion. A stale decision is
+never shown as `READY` or `Next`.
 
 ## Everyday Discord controls
 
@@ -84,7 +105,7 @@ show status
 !dca health
 ```
 
-Before the configured start day or before its first 04:00 analysis, a pair may
+Before the configured start day or before its first 04:07 analysis, a pair may
 show an `ERROR` placeholder while overall health correctly reports `ARMED`.
 After a successful daily analysis, enabled pairs should show fresh `READY`
 decisions, regimes, and execution times.
@@ -268,7 +289,7 @@ For normal use, disabling is safer than a structural removal.
 These changes require a tested pull request and cannot be made through Discord:
 
 - Daily analysis time: [`.github/workflows/crypto_analysis.yml`](.github/workflows/crypto_analysis.yml#L3-L7).
-  GitHub cron uses UTC; `0 21 * * *` is 04:00 Asia/Bangkok.
+  GitHub cron uses UTC; `7,37 21 * * *` is 04:07 and 04:37 Asia/Bangkok.
 - Trend policy: [`crypto_analysis.py`](crypto_analysis.py#L229-L321).
 - Regime-to-budget policy and midpoint rounding: [`dca_config.py`](dca_config.py).
 - Best-time policy: [`crypto_analysis.py`](crypto_analysis.py#L423-L500).
@@ -287,7 +308,7 @@ Railway service environment.
 
 ### Health says `ARMED`
 
-This is expected before `DCA_START_DATE` or while waiting for the first 04:00
+This is expected before `DCA_START_DATE` or while waiting for the first 04:07
 start-day analysis. Check the start date and the Crypto Analysis workflow.
 
 ### Health says `ATTENTION REQUIRED`

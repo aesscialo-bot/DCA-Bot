@@ -15,12 +15,16 @@ class DcaConfigWriterTests(unittest.TestCase):
         decision = state["TARGETS"]["BTC_USD"]
         decision.update(
             {
-                "STATUS": "READY",
+                "ANALYSIS_STATUS": "READY",
+                "EXECUTION_STATUS": "ARMED",
                 "REGIME": "SIDEWAYS",
                 "AMOUNT_TIER": "MID",
+                "SELECTED_AT": (self.now + timedelta(hours=1)).isoformat(),
                 "EXECUTE_AT": (self.now + timedelta(hours=1)).isoformat(),
                 "VALID_UNTIL": (self.now + timedelta(hours=2)).isoformat(),
                 "SIGNALS": {"source": "test"},
+                "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
+                "ERROR": None,
             }
         )
         return state
@@ -88,13 +92,17 @@ class DcaConfigWriterTests(unittest.TestCase):
         # decision after its own budget edit; it must not block BTC's enable.
         state["TARGETS"]["HYPE_USD"].update(
             {
-                "STATUS": "READY",
+                "ANALYSIS_STATUS": "READY",
+                "EXECUTION_STATUS": "ARMED",
                 "REGIME": "SIDEWAYS",
                 "AMOUNT_TIER": "MID",
+                "SELECTED_AT": (self.now + timedelta(hours=1)).isoformat(),
                 "EXECUTE_AT": (self.now + timedelta(hours=1)).isoformat(),
                 "VALID_UNTIL": (self.now + timedelta(hours=2)).isoformat(),
                 "RULES_HASH": "0" * 64,
                 "SIGNALS": {"source": "stale-test"},
+                "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
+                "ERROR": None,
             }
         )
         updated, should_write = apply_change(
@@ -154,13 +162,17 @@ class DcaConfigWriterTests(unittest.TestCase):
         for symbol in ("BTC_USD", "HYPE_USD"):
             state["TARGETS"][symbol].update(
                 {
-                    "STATUS": "READY",
+                    "ANALYSIS_STATUS": "READY",
+                    "EXECUTION_STATUS": "ARMED",
                     "REGIME": "SIDEWAYS",
                     "AMOUNT_TIER": "MID",
+                    "SELECTED_AT": (self.now + timedelta(hours=1)).isoformat(),
                     "EXECUTE_AT": (self.now + timedelta(hours=1)).isoformat(),
                     "VALID_UNTIL": (self.now + timedelta(hours=2)).isoformat(),
                     "RULES_HASH": rules_hash(symbol, self.rules[symbol]),
                     "SIGNALS": {"source": "test"},
+                    "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
+                    "ERROR": None,
                 }
             )
         reviewed_global_hash = global_rules_pre_state_hash(self.rules)

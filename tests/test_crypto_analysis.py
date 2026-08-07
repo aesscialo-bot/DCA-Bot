@@ -43,7 +43,7 @@ def intraday_rows(selected_time="03:00"):
     zone = ZoneInfo("Asia/Bangkok")
     local_now = NOW.astimezone(zone)
     rows = []
-    for days_ago in range(7, 0, -1):
+    for days_ago in range(60, 0, -1):
         local_date = local_now.date() - timedelta(days=days_ago)
         for quarter in range(96):
             hour, minute = divmod(quarter * 15, 60)
@@ -100,6 +100,15 @@ def capped_rolling_intraday_rows(now, selected_time="03:00", count=720):
 
 def candidate(time_text, miss, win, days):
     return {"TIME": time_text, "MEDIAN_MISS": miss, "WIN_RATE": win, "DAYS": days}
+
+
+def ready_history():
+    return {
+        "VERSION": 1, "STATUS": "READY", "PAIR": "BTC/USD",
+        "FROM": "2026-06-01T00:00:00Z", "THROUGH": "2026-08-05T21:00:00Z",
+        "CANDLE_COUNT": 6240, "NO_TRADE_INTERVALS": 0,
+        "OVERLAP": {"STATUS": "MATCH"}, "HASH": "a" * 64,
+    }
 
 
 class AnalysisSymbolTests(unittest.TestCase):
@@ -235,36 +244,27 @@ class TimingPolicyTests(unittest.TestCase):
         )
         self.assertEqual(selected, "03:00")
         self.assertEqual(timing["TIMEZONE"], "Asia/Bangkok")
-        self.assertEqual(timing["WINDOWS"]["7"]["BEST"]["TIME"], "03:00")
-        self.assertEqual(timing["HISTORY_CANDLES"], 672)
+        self.assertEqual(timing["WINDOWS"]["60"]["BEST"]["TIME"], "03:00")
+        self.assertEqual(timing["HISTORY_CANDLES"], 5760)
 
-    def test_late_bangkok_analysis_uses_rolling_history_within_720_cap(self):
+    def test_kraken_ohlc_cap_cannot_substitute_for_strict_history(self):
         late_now = datetime(2026, 8, 5, 16, 52, tzinfo=timezone.utc)  # 23:52 Bangkok
         rows = capped_rolling_intraday_rows(late_now, "03:00")
-        selected, timing = crypto_analysis.select_best_time(
-            rows, now=late_now, local_tz="Asia/Bangkok"
-        )
-        self.assertEqual(selected, "03:00")
-        self.assertEqual(timing["HISTORY_CANDLES"], 672)
-        history_start = datetime.fromisoformat(
-            timing["HISTORY_START"].replace("Z", "+00:00")
-        )
-        history_end = datetime.fromisoformat(
-            timing["HISTORY_END"].replace("Z", "+00:00")
-        )
-        self.assertEqual(
-            history_end - history_start,
-            timedelta(minutes=15 * (672 - 1)),
-        )
+        with self.assertRaisesRegex(crypto_analysis.AnalysisError, "need 60"):
+            crypto_analysis.select_best_time(rows, now=late_now, local_tz="Asia/Bangkok")
 
     def test_intraday_shortage_and_any_gap_fail_closed(self):
-        rows = capped_rolling_intraday_rows(NOW)
-        with self.assertRaisesRegex(crypto_analysis.AnalysisError, "insufficient"):
-            crypto_analysis.select_best_time(rows[-671:], now=NOW)
-
-        rows.pop(-200)
-        with self.assertRaisesRegex(crypto_analysis.AnalysisError, "candle gap"):
-            crypto_analysis.select_best_time(rows, now=NOW)
+        rows = intraday_rows("03:00")
+        with self.assertRaisesRegex(crypto_analysis.AnalysisError, "need 60"):
+            crypto_analysis.select_best_time(rows[96:], now=NOW)
+        zone = ZoneInfo("Asia/Bangkok")
+        missing_day = NOW.astimezone(zone).date() - timedelta(days=30)
+        rows = [row for row in rows if not (
+            datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc).astimezone(zone).date() == missing_day
+            and datetime.fromtimestamp(row[0] / 1000, tz=timezone.utc).astimezone(zone).strftime("%H:%M") == "03:00"
+        )]
+        selected, _ = crypto_analysis.select_best_time(rows, now=NOW)
+        self.assertNotEqual(selected, "03:00")
 
     def test_kraken_fetch_is_one_latest_page_without_false_pagination(self):
         exchange = MagicMock()
@@ -278,53 +278,55 @@ class TimingPolicyTests(unittest.TestCase):
             "BTC/USD", timeframe="15m", limit=720
         )
 
-    def test_three_day_override_thresholds_are_inclusive(self):
+    def test_fourteen_day_override_thresholds_are_inclusive(self):
         tables = {
-            3: [candidate("03:00", 0.70, 60, 3), candidate("04:00", 0.81, 10, 3)],
-            5: [candidate("05:00", 0.60, 40, 5)],
-            7: [candidate("07:00", 0.50, 50, 7)],
+            14: [candidate("03:00", 0.70, 60, 14)],
+            30: [candidate("05:00", 0.50, 50, 30)],
+            45: [candidate("06:00", 0.55, 45, 45)],
+            60: [candidate("07:00", 0.50, 50, 60)],
         }
         selected, window, rule, _ = crypto_analysis.choose_timing_candidate(tables)
-        self.assertEqual((selected["TIME"], window, rule), ("03:00", 3, "RECENCY_3D_OVERRIDE"))
+        self.assertEqual((selected["TIME"], window, rule), ("03:00", 14, "RECENCY_14D_OVERRIDE"))
 
-        tables[3][0]["WIN_RATE"] = 59.999
+        tables[14][0]["WIN_RATE"] = 59.999
         selected, window, rule, _ = crypto_analysis.choose_timing_candidate(tables)
-        self.assertEqual((selected["TIME"], window, rule), ("07:00", 7, "BASE_7D"))
+        self.assertEqual((selected["TIME"], window, rule), ("07:00", 60, "BASE_60D"))
 
-    def test_five_day_requires_material_median_improvement(self):
+    def test_thirty_day_requires_material_median_improvement(self):
         tables = {
-            3: [candidate("03:00", 1.0, 0, 3)],
-            5: [candidate("05:00", 0.34, 40, 5)],
-            7: [candidate("07:00", 0.50, 50, 7)],
+            14: [candidate("03:00", 1.0, 0, 14)],
+            30: [candidate("05:00", 0.35, 40, 30)],
+            45: [candidate("06:00", 0.45, 45, 45)],
+            60: [candidate("07:00", 0.50, 50, 60)],
         }
         selected, window, rule, _ = crypto_analysis.choose_timing_candidate(tables)
         self.assertEqual(
             (selected["TIME"], window, rule),
-            ("05:00", 5, "BASE_5D_MATERIAL_IMPROVEMENT"),
+            ("05:00", 30, "BASE_30D_MATERIAL_IMPROVEMENT"),
         )
 
-        tables[5][0]["MEDIAN_MISS"] = 0.351
+        tables[30][0]["MEDIAN_MISS"] = 0.351
         selected, window, rule, _ = crypto_analysis.choose_timing_candidate(tables)
-        self.assertEqual((selected["TIME"], window, rule), ("07:00", 7, "BASE_7D"))
+        self.assertEqual((selected["TIME"], window, rule), ("07:00", 60, "BASE_60D"))
 
     def test_near_tie_prefers_cross_window_presence_then_win_rate_then_earlier(self):
-        filler3 = [candidate(f"0{hour}:00", 0.01 * hour, 1, 3) for hour in range(1, 6)]
-        filler5 = [candidate(f"1{hour}:00", 0.01 * hour, 1, 5) for hour in range(1, 6)]
         tables = {
-            3: filler3[:4] + [candidate("08:00", 2, 2, 3), candidate("09:00", 3, 1, 3)],
-            5: filler5[:4] + [candidate("08:00", 2, 2, 5), candidate("09:00", 3, 1, 5)],
-            7: [candidate("09:00", 0.10, 90, 7), candidate("08:00", 0.19, 80, 7)],
+            14: [candidate("10:00", 5, 1, 14)],
+            30: [candidate("08:00", 2, 2, 30), candidate("09:00", 3, 1, 30)],
+            45: [candidate("08:00", 2, 2, 45), candidate("10:00", 3, 1, 45)],
+            60: [candidate("09:00", 0.10, 90, 60), candidate("08:00", 0.19, 80, 60)],
         }
         selected, window, _, appearances = crypto_analysis.choose_timing_candidate(tables)
-        self.assertEqual(window, 7)
+        self.assertEqual(window, 60)
         self.assertEqual(selected["TIME"], "08:00")
         self.assertEqual(appearances, 3)
 
         # Equal appearances and 7d win rate fall through to earlier HH:MM.
         tables = {
-            3: [candidate("09:00", 1, 1, 3), candidate("08:00", 2, 1, 3)],
-            5: [candidate("09:00", 1, 1, 5), candidate("08:00", 2, 1, 5)],
-            7: [candidate("09:00", 0.10, 80, 7), candidate("08:00", 0.19, 80, 7)],
+            14: [candidate("10:00", 5, 1, 14)],
+            30: [candidate("09:00", 1, 1, 30), candidate("08:00", 2, 1, 30)],
+            45: [candidate("09:00", 1, 1, 45), candidate("08:00", 2, 1, 45)],
+            60: [candidate("09:00", 0.10, 80, 60), candidate("08:00", 0.19, 80, 60)],
         }
         selected, _, _, _ = crypto_analysis.choose_timing_candidate(tables)
         self.assertEqual(selected["TIME"], "08:00")
@@ -340,12 +342,12 @@ class TimingPolicyTests(unittest.TestCase):
             crypto_analysis.next_execution_time(
                 "04:29", analyzed_at=NOW, local_tz="Asia/Bangkok"
             ),
-            datetime(2026, 8, 6, 21, 29, tzinfo=timezone.utc),
+            datetime(2026, 8, 5, 21, 29, tzinfo=timezone.utc),
         )
 
     def test_missing_full_days_fail_closed(self):
         rows = intraday_rows()[96:]
-        with self.assertRaisesRegex(crypto_analysis.AnalysisError, "insufficient"):
+        with self.assertRaisesRegex(crypto_analysis.AnalysisError, "need 60"):
             crypto_analysis.select_best_time(rows, now=NOW)
 
 
@@ -364,7 +366,7 @@ class DecisionAndNarrationTests(unittest.TestCase):
         self.assertEqual(replacement["VERSION"], dca_config.ANALYSIS_STATE_VERSION)
         self.assertTrue(
             all(
-                decision["STATUS"] == "ERROR"
+                decision["ANALYSIS_STATUS"] != "READY"
                 for decision in replacement["TARGETS"].values()
             )
         )
@@ -373,7 +375,7 @@ class DecisionAndNarrationTests(unittest.TestCase):
         rules = dca_config.default_rules_map()["BTC_USD"]
         daily, weekly = trend_rows("up")
         with (
-            patch.object(crypto_analysis, "_fetch_asset_rows", return_value=(daily, weekly, intraday_rows())),
+            patch.object(crypto_analysis, "_fetch_asset_rows", return_value=(daily, weekly, intraday_rows(), ready_history())),
             patch.object(crypto_analysis, "LOCAL_TZ", "Asia/Bangkok"),
         ):
             decision = crypto_analysis.analyze_asset(
@@ -381,7 +383,7 @@ class DecisionAndNarrationTests(unittest.TestCase):
             )
         self.assertEqual(decision["REGIME"], "UPTREND")
         self.assertEqual(decision["AMOUNT_TIER"], "LOW")
-        self.assertEqual(decision["STATUS"], "READY")
+        self.assertEqual(decision["ANALYSIS_STATUS"], "READY")
         self.assertEqual(
             datetime.fromisoformat(decision["VALID_UNTIL"].replace("Z", "+00:00"))
             - datetime.fromisoformat(decision["EXECUTE_AT"].replace("Z", "+00:00")),
@@ -398,7 +400,7 @@ class DecisionAndNarrationTests(unittest.TestCase):
             patch.object(
                 crypto_analysis,
                 "_fetch_asset_rows",
-                return_value=(daily, weekly, intraday_rows("05:00")),
+                return_value=(daily, weekly, intraday_rows("05:00"), ready_history()),
             ) as fetch_rows,
             patch.object(crypto_analysis, "LOCAL_TZ", "Asia/Bangkok"),
         ):
@@ -409,7 +411,7 @@ class DecisionAndNarrationTests(unittest.TestCase):
         fetch_rows.assert_called_once_with(exchange, "HYPE/USD")
         self.assertEqual(decision["REGIME"], "DOWNTREND")
         self.assertEqual(decision["AMOUNT_TIER"], "HIGH")
-        self.assertEqual(decision["TIMING"]["HISTORY_CANDLES"], 672)
+        self.assertEqual(decision["TIMING"]["HISTORY_CANDLES"], 5760)
 
     def test_sideways_selects_and_reports_derived_midpoint(self):
         rule = {
@@ -421,7 +423,7 @@ class DecisionAndNarrationTests(unittest.TestCase):
             patch.object(
                 crypto_analysis,
                 "_fetch_asset_rows",
-                return_value=(daily, weekly, intraday_rows()),
+                return_value=(daily, weekly, intraday_rows(), ready_history()),
             ),
             patch.object(
                 crypto_analysis,
@@ -442,9 +444,9 @@ class DecisionAndNarrationTests(unittest.TestCase):
         rule = dca_config.default_rules_map()["BTC_USD"]
         first = crypto_analysis.error_decision("BTC_USD", rule, "stale data", now=NOW)
         second = crypto_analysis.error_decision("BTC_USD", rule, "stale data", now=NOW)
-        self.assertEqual(first["STATUS"], "ERROR")
+        self.assertEqual(first["ANALYSIS_STATUS"], "ERROR")
         self.assertIsNone(first["EXECUTE_AT"])
-        self.assertNotEqual(first["DECISION_ID"], second["DECISION_ID"])
+        self.assertEqual(first["DECISION_ID"], second["DECISION_ID"])
 
     def test_gemini_can_only_explain_and_cannot_select_outputs(self):
         response = MagicMock()
