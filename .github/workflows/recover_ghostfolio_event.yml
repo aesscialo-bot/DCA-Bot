@@ -1,0 +1,161 @@
+name: Recover Confirmed Ghostfolio Event
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Incident target (recovery is deliberately restricted)
+        required: true
+        default: HYPE_USD
+        type: choice
+        options:
+          - HYPE_USD
+      trade_date:
+        description: Bangkok trade date
+        required: true
+        default: "2026-08-07"
+        type: string
+      budget_gbp:
+        description: Exact confirmed GBP budget
+        required: true
+        default: "12.50"
+        type: string
+      mode:
+        description: Preview first; publish requires both reviewed hashes
+        required: true
+        default: preview
+        type: choice
+        options:
+          - preview
+          - publish
+      expected_event_hash:
+        description: Required in publish mode; exact hash printed by preview
+        required: false
+        default: ""
+        type: string
+      expected_row_sha256:
+        description: Required in publish mode; exact Markdown-row hash from preview
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Do not publish an historical outbox event while a purchase or holdings
+  # watermark is being committed. The recovery code itself is read-only on
+  # Kraken and cannot call AddOrder.
+  group: dca-execution-state-writers
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    name: Reconcile confirmed fill and recover event
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Validate secret order identifiers
+        env:
+          EXPECTED_CRYPTO_ORDER_ID: ${{ secrets.GHOSTFOLIO_RECOVERY_CRYPTO_ORDER_ID }}
+          EXPECTED_FUNDING_ORDER_ID: ${{ secrets.GHOSTFOLIO_RECOVERY_FUNDING_ORDER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          safe_order_id='^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$'
+          if ! [[ "$EXPECTED_CRYPTO_ORDER_ID" =~ $safe_order_id ]] ||
+             ! [[ "$EXPECTED_FUNDING_ORDER_ID" =~ $safe_order_id ]]; then
+            echo "Recovery order-ID secrets are missing or invalid." >&2
+            exit 2
+          fi
+          if [ "$EXPECTED_CRYPTO_ORDER_ID" = "$EXPECTED_FUNDING_ORDER_ID" ]; then
+            echo "Recovery order-ID secrets must be distinct." >&2
+            exit 2
+          fi
+      - name: Load protected execution state
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$(gh variable get DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY")"
+          while IFS= read -r line; do
+            [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+          done <<< "$state"
+          delimiter="DCA_RECOVERY_${GITHUB_RUN_ID}_${RANDOM}"
+          printf 'DCA_EXECUTION_STATE<<%s\n%s\n%s\n' "$delimiter" "$state" "$delimiter" >> "$GITHUB_ENV"
+      - name: Reconcile without trading and optionally publish
+        env:
+          TARGET: ${{ inputs.target }}
+          TRADE_DATE: ${{ inputs.trade_date }}
+          BUDGET_GBP: ${{ inputs.budget_gbp }}
+          EXPECTED_CRYPTO_ORDER_ID: ${{ secrets.GHOSTFOLIO_RECOVERY_CRYPTO_ORDER_ID }}
+          EXPECTED_FUNDING_ORDER_ID: ${{ secrets.GHOSTFOLIO_RECOVERY_FUNDING_ORDER_ID }}
+          RECOVERY_MODE: ${{ inputs.mode }}
+          EXPECTED_EVENT_HASH: ${{ inputs.expected_event_hash }}
+          EXPECTED_ROW_SHA256: ${{ inputs.expected_row_sha256 }}
+          TIMEZONE: Asia/Bangkok
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          # Preview requires read access to prove the exact Markdown row exists.
+          # Only the doubly hash-gated publish code path can issue a PATCH.
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          safe_order_id='^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$'
+          if ! [[ "$EXPECTED_CRYPTO_ORDER_ID" =~ $safe_order_id ]] ||
+             ! [[ "$EXPECTED_FUNDING_ORDER_ID" =~ $safe_order_id ]]; then
+            echo "Recovery order-ID secrets are missing or invalid." >&2
+            exit 2
+          fi
+          printf '::add-mask::%s\n' "$EXPECTED_CRYPTO_ORDER_ID"
+          printf '::add-mask::%s\n' "$EXPECTED_FUNDING_ORDER_ID"
+
+          # The shared concurrency lock keeps this state stable for the run.
+          # Refuse recovery while any current purchase or Gist delivery is
+          # unresolved, even though the historical Kraken query is read-only.
+          python - <<'PY'
+          import os
+          from ghostfolio.kraken_holdings_snapshot import (
+              ensure_snapshot_safe_execution_state,
+          )
+
+          ensure_snapshot_safe_execution_state(os.environ["DCA_EXECUTION_STATE"])
+          PY
+
+          args=(
+            --target "$TARGET"
+            --trade-date "$TRADE_DATE"
+            --budget-gbp "$BUDGET_GBP"
+            --expected-crypto-order-id "$EXPECTED_CRYPTO_ORDER_ID"
+            --expected-funding-order-id "$EXPECTED_FUNDING_ORDER_ID"
+          )
+          if [ "$RECOVERY_MODE" = "publish" ]; then
+            if ! [[ "$EXPECTED_EVENT_HASH" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Publish mode requires the exact lowercase event SHA-256 from preview." >&2
+              exit 2
+            fi
+            if ! [[ "$EXPECTED_ROW_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Publish mode requires the exact lowercase row SHA-256 from preview." >&2
+              exit 2
+            fi
+            args+=(
+              --publish
+              --expected-event-hash "$EXPECTED_EVENT_HASH"
+              --expected-row-sha256 "$EXPECTED_ROW_SHA256"
+            )
+          elif [ "$RECOVERY_MODE" != "preview" ]; then
+            echo "Unsupported recovery mode." >&2
+            exit 2
+          fi
+
+          python -u recover_portfolio_event.py "${args[@]}"

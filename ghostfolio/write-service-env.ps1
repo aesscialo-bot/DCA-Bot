@@ -9,12 +9,21 @@ Get-Content -LiteralPath $secretFile | ForEach-Object {
   }
 }
 
-function Write-ScopedEnvironment([string]$Name, [string[]]$Keys) {
+function Write-ScopedEnvironment(
+  [string]$Name,
+  [string[]]$Keys,
+  [string[]]$OptionalKeys = @()
+) {
   $lines = foreach ($key in $Keys) {
     if (-not $variables.ContainsKey($key) -or -not $variables[$key]) {
       throw "The local Ghostfolio secret store is missing $key"
     }
     "$key=$($variables[$key])"
+  }
+  $lines += foreach ($key in $OptionalKeys) {
+    if ($variables.ContainsKey($key) -and $variables[$key]) {
+      "$key=$($variables[$key])"
+    }
   }
   $path = Join-Path $secretRoot $Name
   $temporaryPath = "$path.new"
@@ -45,6 +54,10 @@ Write-ScopedEnvironment 'sync.env' @(
   'GIST_TOKEN',
   'GHOSTFOLIO_SECURITY_TOKEN',
   'GHOSTFOLIO_ACCOUNT_MAP'
+) @(
+  'GHOSTFOLIO_RECOVERY_CRYPTO_ORDER_ID',
+  'GHOSTFOLIO_RECOVERY_FUNDING_ORDER_ID',
+  'GHOSTFOLIO_RECOVERY_EVENT_HASH'
 )
 
 icacls $secretRoot /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F" | Out-Null

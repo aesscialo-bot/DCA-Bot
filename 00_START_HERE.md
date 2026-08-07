@@ -349,8 +349,7 @@ remains an optional mirror.
 
 1. Open `C:\Users\anand\GLaDOS\Ghostfolio\Key.txt` and use that key for the
    localhost Ghostfolio login. Do not reuse an older exported key.
-2. From the recovery repository, set `DCA_GHOSTFOLIO_SECRETS_FILE` to
-   `%LOCALAPPDATA%\dca-ghostfolio\secrets.env`, then run
+2. From the recovery repository, run
    `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ghostfolio\sync-canonical-key.ps1 -MinimumHoldings 3`.
    This fails unless the visible key and sync service resolve to the same
    populated Ghostfolio user.
@@ -377,6 +376,28 @@ newer DCA event. It rejects malformed or re-hashed event rows whose exact pair,
 route, currencies, order IDs, timestamp, or numeric values do not match the
 PortfolioEventV3 contract. This preserves automatic catch-up without allowing
 an ambiguous offline state to double-count a holding.
+
+If the confirmed 7 August HYPE purchase is missing its order-level Ghostfolio
+activity, use the GitHub `Recover Confirmed Ghostfolio Event` workflow. First
+store both exact Kraken order IDs in the temporary Actions secrets
+`GHOSTFOLIO_RECOVERY_CRYPTO_ORDER_ID` and
+`GHOSTFOLIO_RECOVERY_FUNDING_ORDER_ID`, then run `preview`. Run `publish` only
+with both the canonical event hash and Markdown-row hash returned by that
+preview. The incident-specific recovery uses Kraken reconciliation-only calls
+and cannot submit an order; it will also refuse a value set that does not
+exactly reproduce the existing ledger row.
+
+Before `publish`, add the same order IDs plus the preview event hash to the
+user-only `%LOCALAPPDATA%\dca-ghostfolio\secrets.env` as the two recovery
+order-ID keys and `GHOSTFOLIO_RECOVERY_EVENT_HASH`. Run
+`.\ghostfolio\write-service-env.ps1`, then rebuild and force-recreate the
+`sync` service. The migration changes the existing HYPE opening balance to the
+residual quantity and then imports the confirmed order; it must not create a
+synthetic sale or alter the total Kraken quantity. After sidecar health and its
+provenance state report `COMPLETE`, delete the three temporary local recovery
+keys and the two temporary Actions secrets, regenerate `sync.env`, and recreate
+`sync`. The permanent receipts make subsequent runs idempotent without those
+temporary values.
 
 ### Local Ghostfolio backup task
 
