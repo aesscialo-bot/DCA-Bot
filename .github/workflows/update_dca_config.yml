@@ -12,7 +12,7 @@ on:
           - set_enabled
           - dry_run
       symbol:
-        description: Canonical Kraken USD key (BTC_USD, HYPE_USD, or SOL_USD)
+        description: Canonical Kraken key (BTC_GBP, HYPE_USD, or SOL_GBP)
         required: true
         type: string
       low_amount_gbp_json:

@@ -2,12 +2,12 @@ name: Crypto Analysis
 
 on:
   schedule:
-    # 04:00 Asia/Bangkok. The engine discards every incomplete Kraken candle.
-    - cron: "0 21 * * *"
+    # 04:07 primary plus 04:37 idempotent recovery, Asia/Bangkok.
+    - cron: "7,37 21 * * *"
   workflow_dispatch:
     inputs:
       symbol:
-        description: BTC, HYPE, SOL, a canonical USD pair, or all
+        description: BTC, HYPE, SOL, a canonical configured pair, or all
         required: false
         default: all
         type: string
@@ -17,7 +17,6 @@ permissions:
 
 concurrency:
   group: dca-analysis-state-writers
-  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -66,12 +65,33 @@ jobs:
             printf 'DCA_ANALYSIS_STATE={}\n' >> "$GITHUB_ENV"
           fi
 
-      - name: Analyze Kraken USD markets
+      - name: Validate dedicated history storage
+        env:
+          DCA_HISTORY_GIST_ID: ${{ vars.DCA_HISTORY_GIST_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$DCA_HISTORY_GIST_ID" || {
+            echo "DCA_HISTORY_GIST_ID is not configured." >&2
+            exit 1
+          }
+
+      - name: Refresh first-party Kraken history
+        env:
+          DCA_HISTORY_GIST_ID: ${{ vars.DCA_HISTORY_GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: python -u kraken_history.py refresh --targets all
+
+      - name: Analyze configured Kraken markets
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GH_PAT_FOR_VARS: ${{ secrets.GH_PAT_FOR_VARS }}
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Bangkok' }}
           DCA_START_DATE: ${{ vars.DCA_START_DATE }}
+          DCA_TRADING_MODE: ${{ vars.DCA_TRADING_MODE || 'shadow' }}
+          DCA_CANARY_SYMBOL: ${{ vars.DCA_CANARY_SYMBOL || 'SOL_GBP' }}
+          DCA_HISTORY_GIST_ID: ${{ vars.DCA_HISTORY_GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           SYMBOL: ${{ inputs.symbol || 'all' }}
         run: python -u crypto_analysis.py

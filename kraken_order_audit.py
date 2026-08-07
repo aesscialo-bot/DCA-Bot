@@ -16,9 +16,10 @@ from kraken_client import (
     get_kraken_exchange,
     to_kraken_symbol,
 )
+from dca_config import TARGET_ROUTES
 
 
-TARGETS = ("BTC_USD", "HYPE_USD", "SOL_USD")
+TARGETS = ("BTC_GBP", "HYPE_USD", "SOL_GBP")
 FUNDING_MARKET = "GBP_USD"
 AUDIT_MARKETS = (*TARGETS, FUNDING_MARKET)
 CLIENT_ORDER_ID_PATTERN = re.compile(r"^dca-[0-9a-f]{14}$")
@@ -89,10 +90,9 @@ def _expected_leg_lookup(local_day) -> dict[str, dict[str, str]]:
     lookup = {}
     for trade_day in (local_day - timedelta(days=1), local_day):
         for target in TARGETS:
-            legs = {
-                "funding": (FUNDING_MARKET, "funding"),
-                "crypto": (target, "buy"),
-            }
+            legs = {"crypto": (target, "buy")}
+            if TARGET_ROUTES[target] == "GBP_TO_USD":
+                legs["funding"] = (FUNDING_MARKET, "funding")
             for leg_name, (market_key, purpose) in legs.items():
                 client_order_id = build_client_order_id(
                     target, trade_day, purpose=purpose
@@ -126,12 +126,13 @@ def _flow_summary(orders: list[dict], local_day) -> dict:
     complete_flow_count = 0
     incomplete_flow_count = 0
     duplicate_leg_count = 0
-    for flow in flows.values():
+    for (target, _trade_date), flow in flows.items():
         funding_count = len(flow["funding"])
         crypto_count = len(flow["crypto"])
         duplicate_leg_count += max(0, funding_count - 1)
         duplicate_leg_count += max(0, crypto_count - 1)
-        if funding_count == 1 and crypto_count == 1:
+        funding_required = TARGET_ROUTES[target] == "GBP_TO_USD"
+        if crypto_count == 1 and funding_count == (1 if funding_required else 0):
             complete_flow_count += 1
         elif funding_count or crypto_count:
             incomplete_flow_count += 1

@@ -1,4 +1,4 @@
-"""Fail-closed execution of GBP-budgeted USD spot purchases on Kraken."""
+"""Fail-closed execution of GBP-budgeted mixed spot purchases on Kraken."""
 
 from __future__ import annotations
 
@@ -13,8 +13,10 @@ import requests
 
 from dca_config import (
     ALLOWED_TARGETS,
+    TARGET_ROUTES,
     ConfigError,
     MAX_PENDING_GIST_DELIVERIES,
+    TIMING_POLICY_VERSION,
     decision_analyzed_on_or_after,
     decision_age_minutes,
     ensure_gist_delivery_capacity,
@@ -33,6 +35,7 @@ from kraken_client import (
     KrakenPreSubmissionError,
     KrakenOrderStateUnknown,
     build_client_order_id,
+    place_market_buy,
     place_gbp_funded_market_buy,
 )
 
@@ -46,6 +49,12 @@ DCA_ANALYSIS_STATE_JSON = os.environ.get("DCA_ANALYSIS_STATE", "")
 DCA_EXECUTION_STATE_JSON = os.environ.get("DCA_EXECUTION_STATE", "")
 DCA_SYMBOLS_JSON = os.environ.get("DCA_SYMBOLS_JSON", "")
 DCA_START_DATE = os.environ.get("DCA_START_DATE", "").strip()
+DCA_TRADING_MODE = os.environ.get("DCA_TRADING_MODE", "shadow").strip().lower()
+DCA_CANARY_SYMBOL = os.environ.get("DCA_CANARY_SYMBOL", "SOL_GBP").strip().upper()
+GHOSTFOLIO_DIRECT_SYNC_ENABLED = (
+    os.environ.get("GHOSTFOLIO_DIRECT_SYNC_ENABLED", "false").strip().lower()
+    == "true"
+)
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 RULES_VARIABLE = "DCA_TARGET_MAP"
@@ -64,6 +73,34 @@ def _gha_mask(value: str) -> None:
     """Mask a value in GitHub Actions logs."""
     if os.environ.get("GITHUB_ACTIONS") == "true" and value:
         print(f"::add-mask::{value}", flush=True)
+
+
+def _place_routed_market_buy(
+    key,
+    amount_gbp,
+    *,
+    client_order_id,
+    funding_client_order_id,
+    reconcile_only,
+    pre_submit_check,
+):
+    """Route only HYPE/USD through GBP/USD; native pairs spend GBP directly."""
+    if TARGET_ROUTES[key] == "DIRECT_GBP":
+        return place_market_buy(
+            key,
+            amount_gbp,
+            client_order_id=client_order_id,
+            reconcile_only=reconcile_only,
+            pre_submit_check=pre_submit_check,
+        )
+    return place_gbp_funded_market_buy(
+        key,
+        amount_gbp,
+        client_order_id=client_order_id,
+        funding_client_order_id=funding_client_order_id,
+        reconcile_only=reconcile_only,
+        pre_submit_check=pre_submit_check,
+    )
 
 
 def send_discord_alert(message, is_error=False):
@@ -561,8 +598,10 @@ def _decision_snapshot(decision):
 
 def _decision_gate(symbol, rule, decision, now):
     """Return ``(status, reason, amount)`` for one current decision."""
-    if decision["STATUS"] != "READY":
-        return "ERROR", "analysis status is ERROR", None
+    if decision["ANALYSIS_STATUS"] != "READY":
+        return "ERROR", f"analysis status is {decision['ANALYSIS_STATUS']}", None
+    if decision["ANALYSIS_DATE"] != now.astimezone(SELECTED_TZ).date().isoformat():
+        return "ERROR", "analysis decision is not for the current Bangkok date", None
     expected_hash = rules_hash(symbol, rule)
     if decision["RULES_HASH"] != expected_hash:
         return "ERROR", "analysis decision does not match the live budgets", None
@@ -584,12 +623,47 @@ def _decision_gate(symbol, rule, decision, now):
         return "NOT_DUE", "execution window has not opened", None
     if now > valid_until or not is_execution_window(now, execute_at):
         return "MISSED", "analysis decision is stale or its window was missed", None
+    if DCA_TRADING_MODE == "shadow":
+        return "SHADOW", "shadow mode blocks new Kraken orders", None
+    if DCA_TRADING_MODE == "canary" and symbol != DCA_CANARY_SYMBOL:
+        return "SHADOW", f"canary mode permits only {DCA_CANARY_SYMBOL}", None
+    if DCA_TRADING_MODE not in {"canary", "live"}:
+        return "ERROR", f"invalid DCA_TRADING_MODE {DCA_TRADING_MODE!r}", None
     amount_gbp = effective_amount(rule, decision)
     try:
         amount_gbp = _parse_amount_gbp(amount_gbp)
     except ValueError as error:
         return "ERROR", str(error), None
     return "READY", "ready", amount_gbp
+
+
+def _global_history_gate(analysis, now):
+    """Enforce the selected Kraken-only policy before any new order.
+
+    A pair-local analysis error still remains visible and retryable, but strict
+    production execution cannot proceed until all three canonical targets have
+    a current, verified decision built by the same 60-day policy.
+    """
+    today = now.astimezone(SELECTED_TZ).date().isoformat()
+    failures = []
+    if analysis.get("ANALYSIS_DATE") != today:
+        failures.append(f"state date is {analysis.get('ANALYSIS_DATE') or 'missing'}")
+    if analysis.get("POLICY_VERSION") != TIMING_POLICY_VERSION:
+        failures.append("state policy version is not current")
+    for target in ALLOWED_TARGETS:
+        decision = analysis["TARGETS"][target]
+        history = decision.get("HISTORY") or {}
+        if decision.get("ANALYSIS_DATE") != today:
+            failures.append(f"{target} analysis date is not {today}")
+        if decision.get("ANALYSIS_STATUS") != "READY":
+            failures.append(
+                f"{target} analysis is {decision.get('ANALYSIS_STATUS', 'missing')}"
+            )
+        if history.get("STATUS") != "READY":
+            failures.append(f"{target} history is {history.get('STATUS', 'missing')}")
+    if failures:
+        return False, "; ".join(failures)
+    return True, "all three Kraken histories and decisions are ready"
 
 
 def _revalidate_trade_intent(
@@ -614,6 +688,10 @@ def _revalidate_trade_intent(
     rule = live_rules[symbol]
     decision = live_analysis["TARGETS"][symbol]
     execution = live_execution.get(symbol, {"LAST_BUY_DATE": ""})
+
+    globally_ready, global_reason = _global_history_gate(live_analysis, current_time)
+    if not globally_ready:
+        raise RuntimeError(f"global Kraken history gate blocked execution: {global_reason}")
 
     if not rule["BUY_ENABLED"]:
         raise RuntimeError(f"{symbol} was disabled before order submission")
@@ -657,22 +735,23 @@ def _post_trade_logs(
 ):
     """Attempt optional mirrors after the confirmed fill is already durable."""
     ghostfolio_saved = False
-    try:
-        from portfolio_logger import get_account_id, log_to_ghostfolio
+    if GHOSTFOLIO_DIRECT_SYNC_ENABLED:
+        try:
+            from portfolio_logger import get_account_id, log_to_ghostfolio
 
-        portfolio_map = json.loads(os.environ.get("PORTFOLIO_ACCOUNT_MAP") or "{}")
-        account_id = get_account_id(base_symbol, portfolio_map)
-        if account_id:
-            ghostfolio_saved = bool(
-                log_to_ghostfolio(
-                    trade_data,
-                    base_symbol,
-                    account_id,
-                    exchange_pair=exchange_pair,
+            portfolio_map = json.loads(os.environ.get("PORTFOLIO_ACCOUNT_MAP") or "{}")
+            account_id = get_account_id(base_symbol, portfolio_map)
+            if account_id:
+                ghostfolio_saved = bool(
+                    log_to_ghostfolio(
+                        trade_data,
+                        base_symbol,
+                        account_id,
+                        exchange_pair=exchange_pair,
+                    )
                 )
-            )
-    except Exception as error:
-        print(f"Optional Ghostfolio logging failed: {type(error).__name__}", flush=True)
+        except Exception as error:
+            print(f"Optional Ghostfolio logging failed: {type(error).__name__}", flush=True)
     if gist_delivery is not None and symbol_key is not None:
         try:
             delivered = _attempt_gist_delivery(symbol_key, gist_delivery)
@@ -803,7 +882,7 @@ def execute_trade(
                     reserve_gist_delivery=True,
                 )
 
-        order_data = place_gbp_funded_market_buy(
+        order_data = _place_routed_market_buy(
             key,
             amount_gbp,
             client_order_id=client_order_id,
@@ -847,25 +926,37 @@ def execute_trade(
 
     try:
         order_id = order_data["order_id"]
-        funding_order_id = order_data["funding_order_id"]
         exchange_pair = order_data["pair"]
+        quote_currency = order_data["quote_currency"]
+        route = TARGET_ROUTES[key]
+        funding_order_id = order_data.get("funding_order_id")
         cost_gbp = float(order_data["cost_gbp"])
         fee_gbp = float(order_data["fee_gbp"])
         gbp_fee_debit = float(order_data["gbp_fee_debit"])
         fee_details = order_data["fee_details"]
         spent_gbp = float(order_data["spent_gbp"])
-        funded_usd = float(order_data["funded_usd"])
-        cost_usd = float(order_data["cost_usd"])
-        fee_usd = float(order_data["fee_usd"])
-        funding_fee_usd = float(order_data["funding_fee_usd"])
-        usd_fee_debit = float(order_data["usd_fee_debit"])
-        gbp_usd_rate = float(order_data["gbp_usd_rate"])
         received_amount = float(order_data["received"])
         market_price = float(order_data["market_gbp_price_per_unit"])
         effective_price = float(order_data["effective_gbp_price_per_unit"])
-        market_usd_price = float(order_data["market_usd_price_per_unit"])
-        effective_usd_price = float(order_data["effective_usd_price_per_unit"])
         execution_timestamp = int(order_data["timestamp"])
+        if quote_currency == "USD":
+            funded_usd = float(order_data["funded_usd"])
+            cost_quote = float(order_data["cost_usd"])
+            fee_quote = float(order_data["crypto_fee_usd"])
+            funding_fee_quote = float(order_data["funding_fee_usd"])
+            quote_fee_debit = float(order_data["usd_fee_debit"])
+            gbp_usd_rate = float(order_data["gbp_usd_rate"])
+            unit_price_quote = float(order_data["market_usd_price_per_unit"])
+            effective_price_quote = float(order_data["effective_usd_price_per_unit"])
+        else:
+            funded_usd = 0.0
+            cost_quote = float(order_data["cost_quote"])
+            fee_quote = float(order_data["fee_quote"])
+            funding_fee_quote = 0.0
+            quote_fee_debit = float(order_data["quote_fee_debit"])
+            gbp_usd_rate = 0.0
+            unit_price_quote = float(order_data["market_quote_price_per_unit"])
+            effective_price_quote = float(order_data["effective_quote_price_per_unit"])
     except (KeyError, TypeError, ValueError) as error:
         message = (
             f"CRITICAL: Kraken returned an unrecognized fill for {key}; the durable "
@@ -876,7 +967,8 @@ def execute_trade(
         return False
 
     _gha_mask(str(order_id))
-    _gha_mask(str(funding_order_id))
+    if funding_order_id:
+        _gha_mask(str(funding_order_id))
     _gha_mask(f"{cost_gbp:.2f}")
     _gha_mask(f"{fee_gbp:.2f}")
     _gha_mask(f"{spent_gbp:.2f}")
@@ -896,15 +988,16 @@ def execute_trade(
         "effective_gbp_price_per_unit": effective_price,
         "exchange_pair": exchange_pair,
         "decision_id": intent["decision_id"],
-        "quote_currency": "USD",
-        "cost_usd": cost_usd,
-        "fee_usd": fee_usd,
-        "funding_fee_usd": funding_fee_usd,
-        "usd_fee_debit": usd_fee_debit,
+        "route": route,
+        "quote_currency": quote_currency,
+        "cost_quote": cost_quote,
+        "fee_quote": fee_quote,
+        "funding_fee_quote": funding_fee_quote,
+        "quote_fee_debit": quote_fee_debit,
         "funded_usd": funded_usd,
         "gbp_usd_rate": gbp_usd_rate,
-        "usd_price_per_unit": market_usd_price,
-        "effective_usd_price_per_unit": effective_usd_price,
+        "unit_price_quote": unit_price_quote,
+        "effective_price_quote": effective_price_quote,
         "funding_order_id": funding_order_id,
     }
     completed_date = datetime.fromtimestamp(
@@ -948,20 +1041,20 @@ def execute_trade(
         "DCA buy executed and confirmed.\n"
         f"**Pair:** {exchange_pair}\n"
         f"**GBP budget/debit:** £{spent_gbp:,.2f}\n"
-        f"**USD funded:** ${funded_usd:,.2f}\n"
-        f"**Crypto order cost:** ${cost_usd:,.2f}\n"
-        f"**FX fee:** ${funding_fee_usd:,.4f}\n"
-        f"**Crypto fee (USD equivalent):** ${fee_usd:,.4f}\n"
-        f"**GBP/USD execution rate:** ${gbp_usd_rate:,.5f} per £1\n"
+        f"**Funding:** {'USD ' + format(funded_usd, ',.2f') if route == 'GBP_TO_USD' else 'not required (native GBP market)'}\n"
+        f"**Crypto order cost:** {quote_currency} {cost_quote:,.2f}\n"
+        f"**Funding fee:** {quote_currency} {funding_fee_quote:,.4f}\n"
+        f"**Crypto fee:** {quote_currency} {fee_quote:,.4f}\n"
+        f"**GBP/USD execution rate:** {('$' + format(gbp_usd_rate, ',.5f') + ' per GBP 1') if route == 'GBP_TO_USD' else 'not applicable'}\n"
         f"**Total GBP debit:** £{spent_gbp:,.2f}\n"
         f"**Received:** {received_amount:.8f} {base_symbol}\n"
-        f"**Market rate:** ${market_usd_price:,.2f} / £{market_price:,.2f}\n"
-        f"**Effective rate:** ${effective_usd_price:,.2f} / £{effective_price:,.2f}\n"
+        f"**Market rate:** {quote_currency} {unit_price_quote:,.2f} / GBP {market_price:,.2f}\n"
+        f"**Effective rate:** {quote_currency} {effective_price_quote:,.2f} / GBP {effective_price:,.2f}\n"
         f"**Regime:** {expected_decision.get('REGIME') if expected_decision else 'recovery'}\n"
         f"**Decision ID:** {intent['decision_id']}\n"
         "**Portfolio:** Saved on Kraken\n"
         f"**Time:** {execution_time}\n"
-        f"**Funding order ID:** {funding_order_id}\n"
+        f"**Funding order ID:** {funding_order_id or 'not required'}\n"
         f"**Crypto order ID:** {order_id}"
     )
     send_discord_alert(message, is_error=False)
@@ -969,7 +1062,7 @@ def execute_trade(
 
 
 def main():
-    print("--- Starting Kraken GBP-budgeted USD DCA execution ---", flush=True)
+    print("--- Starting Kraken GBP-budgeted mixed-market DCA execution ---", flush=True)
     try:
         execution_state = _initial_execution_state()
     except (json.JSONDecodeError, ConfigError, RuntimeError, ValueError) as error:
@@ -1044,6 +1137,18 @@ def main():
     except (json.JSONDecodeError, ConfigError, RuntimeError, ValueError) as error:
         analysis_error = str(error)
 
+    global_history_ready = False
+    global_history_reason = analysis_error or "analysis state is unavailable"
+    if analysis is not None:
+        global_history_ready, global_history_reason = _global_history_gate(analysis, now)
+    if not global_history_ready:
+        message = (
+            "New Kraken orders are globally blocked until all three pairs have "
+            f"current verified 60-day decisions: {global_history_reason}."
+        )
+        print(message, flush=True)
+        send_discord_alert(message, is_error=True)
+
     for symbol in selected_symbols:
         if _pending_order_for_symbol(execution_state, symbol) is not None:
             continue
@@ -1061,11 +1166,17 @@ def main():
             send_discord_alert(message, is_error=True)
             all_succeeded = False
             continue
+        if not global_history_ready:
+            all_succeeded = False
+            continue
 
         decision = analysis["TARGETS"][symbol]
         status, reason, amount_gbp = _decision_gate(symbol, rule, decision, now)
         if status == "NOT_DUE":
             print(f"{symbol}: {reason}.", flush=True)
+            continue
+        if status == "SHADOW":
+            print(f"{symbol}: {reason}; no Kraken order attempted.", flush=True)
             continue
         if status != "READY":
             message = f"Skipping {symbol}: {reason}."

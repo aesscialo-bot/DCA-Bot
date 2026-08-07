@@ -1,12 +1,12 @@
 # Copilot instructions
 
-This repository is the production Kraken GBP-funded USD-market DCA bot. Read
+This repository is the production Kraken mixed-market, GBP-budgeted DCA bot. Read
 `00_START_HERE.md`, `README.md`, and `CLAUDE.md` before changing behavior,
 schemas, workflows, or deployment configuration.
 
 ## Current production contract
 
-- Supported targets are exactly `BTC_USD`, `HYPE_USD`, and `SOL_USD` unless a
+- Supported targets are exactly `BTC_GBP`, `HYPE_USD`, and `SOL_GBP` unless a
   deliberately staged pair-membership migration changes the full system.
 - `DCA_TARGET_MAP` contains every canonical target with only
   `REGIME_AMOUNTS_GBP` (`LOW` lower endpoint and compatibility-named `UP` upper
@@ -14,8 +14,9 @@ schemas, workflows, or deployment configuration.
 - Budgets remain GBP-denominated. The target markets execute in USD.
 - The bot sells the exact GBP budget on Kraken `GBP/USD` with `fciq`, waits for
   confirmed net USD, and spends that USD on crypto/USD with `fcib`.
-- Never restore a direct crypto/GBP order path, implicit budget conversion,
-  THB, Bitkub, or the legacy `AMOUNT_GBP` / `TIME` schema.
+- BTC and SOL use direct Kraken GBP markets; HYPE uses HYPE/USD with the
+  explicit GBP/USD funding leg. Never use implicit conversion, THB, Bitkub,
+  or the legacy `AMOUNT_GBP` / `TIME` schema.
 - Counter-cyclical spend mapping is `DOWNTREND`→`HIGH`, `SIDEWAYS`→`MID`, and
   `UPTREND`→`LOW`. `MID` is `(LOW + UP) / 2`, rounded to the nearest penny with
   `ROUND_HALF_UP`; `HIGH` reads the stored `UP` endpoint. Never infer spend from
@@ -66,7 +67,10 @@ schemas, workflows, or deployment configuration.
 - Rule writers use `dca-rule-writers`; analysis writers use
   `dca-analysis-state-writers`; the trader uses its own serialized execution
   group. Preserve `queue: max` and `cancel-in-progress: false`.
-- The analysis workflow is scheduled for 04:00 Asia/Bangkok (`0 21 * * *` UTC).
+- The analysis workflow uses 3/5/7/14/30/45/60-day Bangkok windows and the
+  canonical BTC/GBP, HYPE/USD, and SOL/GBP markets.
+- Primary analysis is scheduled for 04:07 Asia/Bangkok with an idempotent
+  04:37 recovery run.
   Railway refreshes state and checks due decisions every five minutes.
 - Execution is permitted only inside the decision's absolute `-5/+60` minute
   window and after `DCA_START_DATE`, with no more than one purchase per target

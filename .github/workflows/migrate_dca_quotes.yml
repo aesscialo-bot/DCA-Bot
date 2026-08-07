@@ -1,0 +1,48 @@
+name: Migrate DCA markets to GBP-native
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type MIGRATE_TO_MIXED_GBP exactly
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dca-market-key-migration
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'MIGRATE_TO_MIXED_GBP'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Read and validate current state
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        run: |
+          set -euo pipefail
+          gh variable set DCA_TRADING_MODE --repo "$GITHUB_REPOSITORY" --body shadow
+          rules="$(gh variable get DCA_TARGET_MAP --repo "$GITHUB_REPOSITORY")"
+          execution="$(gh variable get DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY" 2>/dev/null || printf '{}')"
+          python dca_quote_migration.py --rules "$rules" --execution "$execution" --output "$RUNNER_TEMP/migration.json"
+      - name: Apply validated fail-closed state
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, subprocess
+          data=json.load(open(os.path.join(os.environ['RUNNER_TEMP'], 'migration.json'), encoding='utf-8'))
+          for name in ('DCA_TARGET_MAP','DCA_EXECUTION_STATE','DCA_ANALYSIS_STATE','DCA_CANARY_SYMBOL','DCA_TRADING_MODE'):
+              value=data[name]
+              body=value if isinstance(value,str) else json.dumps(value,separators=(',',':'))
+              subprocess.run(['gh','variable','set',name,'--repo',os.environ['GITHUB_REPOSITORY'],'--body',body],check=True)
+          PY

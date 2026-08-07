@@ -1,12 +1,12 @@
 # Repository operating rules
 
-This is the production Kraken GBP-funded USD-market DCA bot. Read
+This is the production Kraken mixed-market, GBP-budgeted DCA bot. Read
 `00_START_HERE.md` and `README.md` before changing schemas, trading behavior,
 workflows, or release configuration.
 
 ## Production invariants and current defaults
 
-- Supported targets are exactly `BTC_USD`, `HYPE_USD`, and `SOL_USD`.
+- Supported targets are exactly `BTC_GBP`, `HYPE_USD`, and `SOL_GBP`.
 - `DCA_TARGET_MAP` contains only `REGIME_AMOUNTS_GBP` (`LOW` lower endpoint and
   compatibility-named `UP` upper endpoint) and `BUY_ENABLED` for each target.
 - The current release gate is `DCA_START_DATE=2026-08-07`, interpreted as a

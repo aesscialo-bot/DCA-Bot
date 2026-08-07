@@ -149,7 +149,7 @@ class KrakenClientTests(unittest.TestCase):
         self.assertEqual(kraken_client.to_kraken_symbol("HYPE_USD"), "HYPE/USD")
         self.assertEqual(kraken_client.to_kraken_symbol("sol/usd"), "SOL/USD")
 
-        for foreign_pair in ("BTC_EUR", "BTC_JPY", "BTC_USDT"):
+        for foreign_pair in ("BTC_EUR", "BTC_JPY", "BTC_GBPT"):
             with self.subTest(pair=foreign_pair):
                 with self.assertRaisesRegex(ValueError, "Only GBP or USD Kraken pairs"):
                     kraken_client.to_kraken_symbol(foreign_pair)
@@ -924,7 +924,7 @@ class KrakenClientTests(unittest.TestCase):
         )
         buy = kraken_client._normalise_terminal_fill(
             usd_buy_fill(),
-            "BTC/USD",
+            "BTC/GBP",
             BUY_ID,
         )
 
