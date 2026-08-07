@@ -1,4 +1,4 @@
-# Kraken GBP-Funded USD DCA Bot
+# Kraken GBP-Budgeted Mixed-Market DCA Bot
 
 > [!IMPORTANT]
 > **Start here:** [DCA Bot Operating and Configuration Guide](00_START_HERE.md)
@@ -12,9 +12,10 @@ service. It tracks and buys exactly these markets:
 - `HYPE/USD`
 - `SOL/GBP` (spends GBP directly)
 
-Budgets remain denominated in GBP. At execution time the bot first sells the
-selected GBP budget on Kraken's `GBP/USD` market, then spends the confirmed net
-USD proceeds on the selected crypto/USD market. There is no THB or Bitkub path.
+Budgets remain denominated in GBP. BTC and SOL spend GBP directly on `BTC/GBP`
+and `SOL/GBP`. HYPE is the sole USD route: the bot sells its exact GBP budget on
+Kraken `GBP/USD`, then spends only the confirmed net USD proceeds on `HYPE/USD`.
+There is no THB or Bitkub trading path.
 
 Kraken is the authoritative record of cash, holdings, fees, and orders. Every
 confirmed purchase is also placed in a durable, retry-safe outbox for Portfolio
@@ -79,20 +80,24 @@ flowchart TD
     G -- "No" --> H["Skip safely"]
     G -- "Yes" --> I["Revalidate live rules, decision, minimum, and daily state"]
     I --> J["Save durable pending intent"]
-    J --> K["Kraken leg 1: sell exact GBP budget on GBP/USD; fciq"]
-    K --> L["Read confirmed net USD proceeds"]
-    L --> M["Kraken leg 2: spend net USD on crypto/USD; fcib"]
-    M --> N["Atomically save buy date and Portfolio Compass outbox row"]
-    N --> O["Deliver exact row to private Gist with idempotent retry"]
-    O --> P["Portfolio Compass imports the Markdown record"]
-    O --> S["Local sidecar imports the JSONL event into Ghostfolio"]
-    N --> Q["Discord: Saved on Kraken"]
+    J --> K{"Configured Kraken route"}
+    K -- "BTC or SOL" --> L["Buy directly on BTC/GBP or SOL/GBP"]
+    K -- "HYPE" --> M["Sell exact GBP budget on GBP/USD; fciq"]
+    M --> N["Spend confirmed net USD on HYPE/USD; fcib"]
+    L --> T["Require confirmed crypto fill"]
+    N --> T
+    T --> O["Atomically save buy date and Portfolio Compass outbox row"]
+    O --> P["Deliver exact row to private Gist with idempotent retry"]
+    P --> U["Portfolio Compass imports the Markdown record"]
+    P --> S["Local sidecar imports the JSONL event into Ghostfolio"]
+    O --> Q["Discord: Saved on Kraken"]
     Q --> R["Reporting continues independently"]
 ```
 
-`fciq` requests the GBP/USD fee in quote currency; `fcib` requests the crypto
-order fee in the purchased base asset. The bot uses confirmed Kraken fills—not
-an estimated conversion—to determine how much USD is available for leg two.
+For HYPE, `fciq` requests the GBP/USD fee in quote currency and `fcib` requests
+the HYPE fee in the purchased base asset. The bot uses confirmed Kraken
+fills—not an estimated conversion—to determine how much USD is available for
+that second leg. BTC and SOL have no funding leg or USD conversion fee.
 
 If either result is unknown, the durable intent remains pending and later runs
 reconcile it before considering another order. The bot never starts a second
@@ -299,22 +304,89 @@ The isolated `dca-ghostfolio` Compose project pins Ghostfolio 3.43.0 and keeps
 PostgreSQL 15 and Redis off host ports. Only `127.0.0.1:3333` is exposed. The
 no-port sync sidecar has no Kraken credentials and polls the durable Gist every
 five minutes. Secrets live under `%LOCALAPPDATA%\dca-ghostfolio`, outside Git,
-with user-only ACLs.
+with user-only ACLs. The setup derives separate `app.env`, `postgres.env`,
+`redis.env`, and `sync.env` files there, so each container receives only the
+credentials it needs; the reporting sidecar receives no database, Redis, JWT,
+or Kraken credentials.
 
 ```powershell
 $env:DCA_GHOSTFOLIO_SECRETS_FILE="$env:LOCALAPPDATA\dca-ghostfolio\secrets.env"
 docker compose -f .\ghostfolio\compose.yml ps
-.\ghostfolio\backup-and-restore-test.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ghostfolio\backup-and-restore-test.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ghostfolio\install-backup-task.ps1 -RetentionCount 14
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ghostfolio\sync-canonical-key.ps1 -MinimumHoldings 3
+```
+
+`DCA-Ghostfolio-Backup` runs daily at 03:15. Task Scheduler catches up a
+missed start when Windows becomes available, waits up to two minutes for Docker
+Desktop and healthy PostgreSQL, and retries a failed run up to six times at
+ten-minute intervals. Overlapping runs are ignored. Each successful run must
+pass a disposable PostgreSQL restore before retention removes old artifacts;
+the default keeps the latest 14 dump and SHA-256 pairs. The task and backup
+folders remain restricted to the current Windows user.
+
+The task writes a credential-free result marker to
+`%LOCALAPPDATA%\dca-ghostfolio\backup-task-status.json`. Verify `status` is
+`Succeeded`, the named dump has a matching `.sha256` sidecar under `backups`,
+and `Get-ScheduledTaskInfo -TaskName DCA-Ghostfolio-Backup` reports
+`LastTaskResult` 0. A missed schedule is recovered only after the user session
+and Docker Desktop are available; no Kraken credentials are used.
+
+If a local database credential is exposed, rotate it without displaying it:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ghostfolio\rotate-local-postgres-password.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ghostfolio\rotate-local-runtime-secrets.ps1
 ```
 
 Confirmed DCA fills are appended as signed `PortfolioEventV3` records and the
 localhost sidecar imports them every five minutes without Kraken credentials.
 An independent GitHub workflow publishes a signed Kraken holdings snapshot at
-minutes 11 and 41. The sidecar audits that snapshot for quantity drift. Initial
-or externally-created holdings are reconciled only by the explicit, idempotent
-`reconcile-holdings` command, which records opening-balance BUY/SELL adjustments
-at the Kraken snapshot price and publishes a receipt; normal DCA fills always
-retain their exact order-level cost and fee records.
+minutes 11 and 41. The sidecar verifies its append-only hash and automatically
+reconciles any quantity drift with idempotent opening-balance BUY/SELL
+adjustments at the signed Kraken snapshot price. It publishes a reconciliation
+receipt, so replaying the same snapshot cannot duplicate an adjustment. Normal
+DCA fills always retain their exact order-level cost and fee records. Snapshot
+quantity checks are scoped explicitly to the `Kraken DCA` account; activities
+in `Bitkub Legacy` are excluded and cannot be changed by Kraken reconciliation.
+If a DCA fill is newer than the latest holdings snapshot, reconciliation waits
+for a fresh snapshot instead of creating a compensating sale.
+
+The snapshot workflow shares the durable DCA state-writer lock and refuses to
+publish while an order intent or PortfolioEvent delivery is unresolved. Local
+health also rejects a missing snapshot, a snapshot older than two hours, a
+timestamp rollback, a changed hash at the same timestamp, or an unfinished
+reconciliation receipt. This makes a dropped GitHub schedule visible instead
+of repeatedly reporting an old Kraken balance as current.
+
+Each five-minute poll pins one immutable Gist view for event and snapshot
+processing. A local reconciliation intent embeds the exact signed Kraken
+snapshot and is recovered before any newer PortfolioEvent can be imported. If
+the old watermark is still provable, its receipt is completed even after a
+newer snapshot is published; changed or ambiguous quantities fail closed for
+review instead of synthesizing a compensating trade. PortfolioEventV3 rows must
+also match the exact target, route, currencies, identifiers, timestamp, finite
+economic values, and canonical hash before Ghostfolio can receive them.
+
+Ghostfolio runs in `Asia/Bangkok`, both custody accounts are GBP-denominated,
+and GBP is an explicit reporting currency. Before each portfolio audit, the
+sidecar refreshes Ghostfolio's native Yahoo `USDGBP` daily data, maps each close
+to its Bangkok calendar date, stores the row at canonical UTC midnight, and
+flushes the portfolio cache. This is reporting-only and cannot affect DCA
+analysis, budgets, scheduling, or Kraken execution. Sidecar health fails on a
+quantity drift, malformed FX data, non-GBP custody account, or Ghostfolio
+`hasError` portfolio calculation.
+An already-current stored `USDGBP` row is reused; Yahoo is contacted only when
+the local FX series is stale, avoiding rate-limit failures on five-minute polls.
+If Ghostfolio still reports a calculation error, the sidecar forces one full
+historical USD/GBP backfill and recalculates before it can acknowledge sync.
+
+`C:\Users\anand\GLaDOS\Ghostfolio\Key.txt` must contain the same access token
+used by the sidecar. `sync-canonical-key.ps1` verifies the target Ghostfolio
+user and holding count before replacing the visible key; a displaced key is
+retained under the user-only `%LOCALAPPDATA%\dca-ghostfolio\retired-keys`
+directory. This prevents the desktop login from opening an empty second user
+while the sync service updates the populated portfolio.
 
 Ghostfolio 3.43.0 imports BTC and SOL through CoinGecko. Its local CoinGecko
 importer rejects Hyperliquid despite returning it in lookup results, so HYPE is

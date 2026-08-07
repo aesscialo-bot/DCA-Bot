@@ -9,7 +9,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ghostfolio-holdings-snapshot
+  # Serialize balance watermarks with DCA state writers. The snapshot also
+  # refuses unresolved intents/outbox events after it acquires the lock.
+  group: dca-execution-state-writers
   cancel-in-progress: false
 
 jobs:
@@ -23,6 +25,18 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.txt
+      - name: Load protected execution state
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$(gh variable get DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY")"
+          while IFS= read -r line; do
+            [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+          done <<< "$state"
+          delimiter="DCA_SNAPSHOT_${GITHUB_RUN_ID}_${RANDOM}"
+          printf 'DCA_EXECUTION_STATE<<%s\n%s\n%s\n' "$delimiter" "$state" "$delimiter" >> "$GITHUB_ENV"
       - name: Publish signed read-only holdings snapshot
         env:
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}

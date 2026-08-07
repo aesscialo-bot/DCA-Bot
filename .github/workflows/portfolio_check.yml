@@ -77,15 +77,6 @@ jobs:
         )
         PY
 
-    - name: Publish signed Kraken holdings snapshot (non-production validation)
-      if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
-      env:
-        KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
-        KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-        GIST_ID: ${{ secrets.GIST_ID }}
-        GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-      run: python -u -m ghostfolio.kraken_holdings_snapshot
-
     - name: Load private history Gist identity (recovery validation)
       if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/recovery/dca-core' && inputs.bootstrap_history == true
       env:
