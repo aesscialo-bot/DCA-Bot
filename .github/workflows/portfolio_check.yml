@@ -13,10 +13,16 @@ on:
         required: false
         type: boolean
         default: false
+      bootstrap_history:
+        description: 'Recovery-only: rebuild canonical 65-day Kraken history'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   check_balance:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     
     steps:
     - name: Checkout repository
@@ -79,6 +85,23 @@ jobs:
         GIST_ID: ${{ secrets.GIST_ID }}
         GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       run: python -u -m ghostfolio.kraken_holdings_snapshot
+
+    - name: Load private history Gist identity (recovery validation)
+      if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/recovery/dca-core' && inputs.bootstrap_history == true
+      env:
+        GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        value="$(gh variable get DCA_HISTORY_GIST_ID --repo "$GITHUB_REPOSITORY")"
+        printf '::add-mask::%s\n' "$value"
+        printf 'DCA_HISTORY_GIST_ID=%s\n' "$value" >> "$GITHUB_ENV"
+
+    - name: Rebuild canonical 65-day Kraken history (recovery validation)
+      if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/recovery/dca-core' && inputs.bootstrap_history == true
+      env:
+        GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      run: python -u kraken_history.py bootstrap --targets BTC_GBP,HYPE_USD,SOL_GBP
 
     - name: Check Portfolio Balance
       if: github.ref == 'refs/heads/main'
