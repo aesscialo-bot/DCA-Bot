@@ -28,6 +28,59 @@ def event(identifier="ORDER-1"):
 
 
 class GhostfolioSyncTests(unittest.TestCase):
+    def test_signed_holdings_snapshot_and_drift(self):
+        snapshot = {
+            "version": 1,
+            "as_of": "2026-08-07T04:00:00Z",
+            "holdings": {
+                "BTC_GBP": {"quantity": "0.2", "quote_currency": "GBP", "unit_price_quote": "50000"},
+                "HYPE_USD": {"quantity": "2", "quote_currency": "USD", "unit_price_quote": "40"},
+                "SOL_GBP": {"quantity": "3", "quote_currency": "GBP", "unit_price_quote": "50"},
+            },
+            "unsupported_nonzero_assets": [],
+        }
+        snapshot["canonical_hash"] = hashlib.sha256(
+            ghostfolio_sync.canonical(snapshot).encode()
+        ).hexdigest()
+        parsed = ghostfolio_sync.parse_holdings_snapshot(
+            ghostfolio_sync.canonical(snapshot)
+        )
+        self.assertEqual(
+            ghostfolio_sync.holdings_drift(
+                parsed, {"BTC_GBP": 0.1, "HYPE_USD": 2, "SOL_GBP": 3}
+            ),
+            {"BTC_GBP": 0.1},
+        )
+        prior = ghostfolio_sync.os.environ.get("GHOSTFOLIO_ACCOUNT_MAP")
+        ghostfolio_sync.os.environ["GHOSTFOLIO_ACCOUNT_MAP"] = json.dumps(
+            {"BTC_GBP": "kraken-account"}
+        )
+        try:
+            activity = ghostfolio_sync.holdings_import_payload(
+                parsed, "BTC_GBP", 0.1
+            )
+            self.assertEqual(activity["activities"][0]["type"], "BUY")
+        finally:
+            if prior is None:
+                ghostfolio_sync.os.environ.pop("GHOSTFOLIO_ACCOUNT_MAP", None)
+            else:
+                ghostfolio_sync.os.environ["GHOSTFOLIO_ACCOUNT_MAP"] = prior
+
+    def test_holdings_snapshot_blocks_unmapped_assets(self):
+        snapshot = {
+            "version": 1,
+            "as_of": "2026-08-07T04:00:00Z",
+            "holdings": {},
+            "unsupported_nonzero_assets": ["ETH"],
+        }
+        snapshot["canonical_hash"] = hashlib.sha256(
+            ghostfolio_sync.canonical(snapshot).encode()
+        ).hexdigest()
+        with self.assertRaisesRegex(RuntimeError, "without a Ghostfolio mapping"):
+            ghostfolio_sync.parse_holdings_snapshot(
+                ghostfolio_sync.canonical(snapshot)
+            )
+
     def test_hash_chain_and_duplicate_event_ids_are_enforced(self):
         first = event()
         content = ghostfolio_sync.canonical(first) + "\n"

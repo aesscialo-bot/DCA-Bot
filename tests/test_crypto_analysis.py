@@ -238,6 +238,15 @@ class TrendClassificationTests(unittest.TestCase):
 
 
 class TimingPolicyTests(unittest.TestCase):
+    @staticmethod
+    def all_window_tables(overrides):
+        tables = {
+            days: [candidate(f"{days % 24:02d}:00", 9, 0, days)]
+            for days in crypto_analysis.PERIODS
+        }
+        tables.update(overrides)
+        return tables
+
     def test_completed_15m_data_selects_expected_time_and_ignores_current_candle(self):
         selected, timing = crypto_analysis.select_best_time(
             intraday_rows("03:00"), now=NOW, local_tz="Asia/Bangkok"
@@ -245,6 +254,9 @@ class TimingPolicyTests(unittest.TestCase):
         self.assertEqual(selected, "03:00")
         self.assertEqual(timing["TIMEZONE"], "Asia/Bangkok")
         self.assertEqual(timing["WINDOWS"]["60"]["BEST"]["TIME"], "03:00")
+        self.assertEqual(
+            set(timing["WINDOWS"]), {"3", "5", "7", "14", "30", "45", "60"}
+        )
         self.assertEqual(timing["HISTORY_CANDLES"], 5760)
 
     def test_kraken_ohlc_cap_cannot_substitute_for_strict_history(self):
@@ -279,12 +291,12 @@ class TimingPolicyTests(unittest.TestCase):
         )
 
     def test_fourteen_day_override_thresholds_are_inclusive(self):
-        tables = {
+        tables = self.all_window_tables({
             14: [candidate("03:00", 0.70, 60, 14)],
             30: [candidate("05:00", 0.50, 50, 30)],
             45: [candidate("06:00", 0.55, 45, 45)],
             60: [candidate("07:00", 0.50, 50, 60)],
-        }
+        })
         selected, window, rule, _ = crypto_analysis.choose_timing_candidate(tables)
         self.assertEqual((selected["TIME"], window, rule), ("03:00", 14, "RECENCY_14D_OVERRIDE"))
 
@@ -293,12 +305,12 @@ class TimingPolicyTests(unittest.TestCase):
         self.assertEqual((selected["TIME"], window, rule), ("07:00", 60, "BASE_60D"))
 
     def test_thirty_day_requires_material_median_improvement(self):
-        tables = {
+        tables = self.all_window_tables({
             14: [candidate("03:00", 1.0, 0, 14)],
             30: [candidate("05:00", 0.35, 40, 30)],
             45: [candidate("06:00", 0.45, 45, 45)],
             60: [candidate("07:00", 0.50, 50, 60)],
-        }
+        })
         selected, window, rule, _ = crypto_analysis.choose_timing_candidate(tables)
         self.assertEqual(
             (selected["TIME"], window, rule),
@@ -310,24 +322,27 @@ class TimingPolicyTests(unittest.TestCase):
         self.assertEqual((selected["TIME"], window, rule), ("07:00", 60, "BASE_60D"))
 
     def test_near_tie_prefers_cross_window_presence_then_win_rate_then_earlier(self):
-        tables = {
+        tables = self.all_window_tables({
+            3: [candidate("08:00", 2, 2, 3)],
+            5: [candidate("08:00", 2, 2, 5)],
+            7: [candidate("08:00", 2, 2, 7)],
             14: [candidate("10:00", 5, 1, 14)],
             30: [candidate("08:00", 2, 2, 30), candidate("09:00", 3, 1, 30)],
             45: [candidate("08:00", 2, 2, 45), candidate("10:00", 3, 1, 45)],
             60: [candidate("09:00", 0.10, 90, 60), candidate("08:00", 0.19, 80, 60)],
-        }
+        })
         selected, window, _, appearances = crypto_analysis.choose_timing_candidate(tables)
         self.assertEqual(window, 60)
         self.assertEqual(selected["TIME"], "08:00")
-        self.assertEqual(appearances, 3)
+        self.assertEqual(appearances, 6)
 
         # Equal appearances and 7d win rate fall through to earlier HH:MM.
-        tables = {
+        tables = self.all_window_tables({
             14: [candidate("10:00", 5, 1, 14)],
             30: [candidate("09:00", 1, 1, 30), candidate("08:00", 2, 1, 30)],
             45: [candidate("09:00", 1, 1, 45), candidate("08:00", 2, 1, 45)],
             60: [candidate("09:00", 0.10, 80, 60), candidate("08:00", 0.19, 80, 60)],
-        }
+        })
         selected, _, _, _ = crypto_analysis.choose_timing_candidate(tables)
         self.assertEqual(selected["TIME"], "08:00")
 

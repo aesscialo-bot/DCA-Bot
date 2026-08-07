@@ -49,7 +49,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 DCA_TARGET_MAP_ENV = os.environ.get("DCA_TARGET_MAP", "{}")
 DCA_ANALYSIS_STATE_ENV = os.environ.get("DCA_ANALYSIS_STATE", "")
 ANALYSIS_VARIABLE = "DCA_ANALYSIS_STATE"
-PERIODS = (14, 30, 45, 60)
+PERIODS = (3, 5, 7, 14, 30, 45, 60)
+CORE_PERIODS = (14, 30, 45, 60)
 DCA_TRADING_MODE = os.environ.get("DCA_TRADING_MODE", "shadow").strip().lower()
 DCA_CANARY_SYMBOL = os.environ.get("DCA_CANARY_SYMBOL", "SOL_GBP").strip().upper()
 
@@ -435,9 +436,11 @@ def choose_timing_candidate(
 
     if any(days not in tables or not tables[days] for days in PERIODS):
         raise AnalysisError(
-            "Timing tables must contain non-empty 14, 30, 45, and 60-day windows"
+            "Timing tables must contain non-empty 3, 5, 7, 14, 30, 45, and 60-day windows"
         )
-    best14, best30, _best45, best60 = (tables[days][0] for days in PERIODS)
+    best14, best30, _best45, best60 = (
+        tables[days][0] for days in CORE_PERIODS
+    )
     if (
         best14["WIN_RATE"] >= best30["WIN_RATE"] + 10.0
         and best14["MEDIAN_MISS"] <= best30["MEDIAN_MISS"] + 0.20
@@ -459,7 +462,9 @@ def choose_timing_candidate(
         for item in tables[selected_window]
         if item["MEDIAN_MISS"] <= initial["MEDIAN_MISS"] + 0.10
     ]
-    consistency_periods = (30, 45, 60)
+    # Short windows participate in consistency without being allowed to
+    # override the stable 14/30/60 threshold policy on their own.
+    consistency_periods = PERIODS
     top_five_times = {
         days: {item["TIME"] for item in tables[days][:5]}
         for days in consistency_periods
@@ -488,7 +493,7 @@ def select_best_time(
     now: datetime | None = None,
     local_tz: str = LOCAL_TZ,
 ) -> tuple[str, dict[str, Any]]:
-    """Select a local buy time using the original deterministic policy."""
+    """Select a local buy time using all seven deterministic windows."""
 
     reference = now or _utc_now()
     try:
@@ -554,7 +559,7 @@ def analyze_period(df: pd.DataFrame, days: int, local_tz: str):
     """
 
     if days not in PERIODS:
-        raise ValueError("days must be one of 14, 30, 45, or 60")
+        raise ValueError("days must be one of 3, 5, 7, 14, 30, 45, or 60")
     period = df.copy()
     if "local_date" not in period or "local_time" not in period:
         period["local_ts"] = period["ts"].dt.tz_convert(local_tz)

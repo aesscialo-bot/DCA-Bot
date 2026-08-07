@@ -115,11 +115,14 @@ dispatches a missing analysis when GitHub has no queued or active run.
 rounded to the nearest penny using half-up currency rounding. The configured
 lower endpoint cannot exceed the upper endpoint.
 
-The execution-time engine deterministically evaluates 14-, 30-, 45-, and
-60-day Bangkok-day windows at 15-minute resolution. It minimizes median closing
+The execution-time engine deterministically evaluates 3-, 5-, 7-, 14-, 30-,
+45-, and 60-day Bangkok-day windows at 15-minute resolution for the actual
+Kraken routes: BTC/GBP, HYPE/USD, and SOL/GBP. It minimizes median closing
 price miss from each day's absolute low, measures wins within 0.5%, applies the
 locked 14-day override and 30-versus-60 thresholds, and resolves close candidates
-using Top-5 appearances, 60-day win rate, then earlier local time. Gemini may
+using Top-5 appearances across all seven windows, 60-day win rate, then earlier
+local time. The 3/5/7-day windows therefore influence consistency but cannot by
+themselves displace the stable long-window threshold result. Gemini may
 explain the result but cannot choose, change, or block it.
 
 History is built exclusively from Kraken's first-party PostTrade API into
@@ -297,6 +300,15 @@ $env:DCA_GHOSTFOLIO_SECRETS_FILE="$env:LOCALAPPDATA\dca-ghostfolio\secrets.env"
 docker compose -f .\ghostfolio\compose.yml ps
 .\ghostfolio\backup-and-restore-test.ps1
 ```
+
+Confirmed DCA fills are appended as signed `PortfolioEventV3` records and the
+localhost sidecar imports them every five minutes without Kraken credentials.
+An independent GitHub workflow publishes a signed Kraken holdings snapshot at
+minutes 11 and 41. The sidecar audits that snapshot for quantity drift. Initial
+or externally-created holdings are reconciled only by the explicit, idempotent
+`reconcile-holdings` command, which records opening-balance BUY/SELL adjustments
+at the Kraken snapshot price and publishes a receipt; normal DCA fills always
+retain their exact order-level cost and fee records.
 
 `ghostfolio/reconcile_legacy.py` is dry-run only. It maps recovered trades to
 fresh logical accounts and blocks migration if the hosted export is missing or

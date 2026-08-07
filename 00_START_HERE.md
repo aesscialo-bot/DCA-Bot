@@ -67,7 +67,8 @@ rules, decisions, pending state, and scheduler posture.
    `SIDEWAYS`.
 3. Python selects the higher / midpoint / lower GBP spend for downtrend /
    sideways / uptrend respectively, plus the best 15-minute execution time from
-   deterministic 14-, 30-, 45-, and 60-day timing windows.
+   deterministic 3-, 5-, 7-, 14-, 30-, 45-, and 60-day timing windows on
+   BTC/GBP, HYPE/USD, and SOL/GBP.
 4. The workflow writes a fresh `DCA_ANALYSIS_STATE` and posts a readable summary
    to Discord.
 5. Railway checks the absolute execution times every five minutes and dispatches

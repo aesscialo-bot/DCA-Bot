@@ -15,8 +15,11 @@ from urllib.request import Request, urlopen
 
 EVENT_FILE = "kraken_usd_dca_ghostfolio_events.jsonl"
 RECEIPT_FILE = "ghostfolio_sync_receipts.jsonl"
+HOLDINGS_SNAPSHOT_FILE = "kraken_holdings_snapshot_v1.json"
+HOLDINGS_RECEIPT_FILE = "ghostfolio_holdings_receipts.jsonl"
 STATE_PATH = Path("/receipts/state.json")
 SYMBOLS = {"BTC_GBP": "bitcoin", "HYPE_USD": "hyperliquid", "SOL_GBP": "solana"}
+QUANTITY_TOLERANCE = {"BTC_GBP": 1e-10, "HYPE_USD": 1e-8, "SOL_GBP": 1e-8}
 
 
 def canonical(value):
@@ -99,6 +102,26 @@ def parse_events(content):
     return events
 
 
+def parse_holdings_snapshot(content):
+    if not content.strip():
+        return None
+    snapshot = json.loads(content)
+    supplied = snapshot.get("canonical_hash")
+    unhashed = {key: value for key, value in snapshot.items() if key != "canonical_hash"}
+    actual = hashlib.sha256(canonical(unhashed).encode("utf-8")).hexdigest()
+    if supplied != actual or snapshot.get("version") != 1:
+        raise RuntimeError("Kraken holdings snapshot has an invalid hash or version")
+    if snapshot.get("unsupported_nonzero_assets"):
+        raise RuntimeError(
+            "Kraken has non-zero crypto assets without a Ghostfolio mapping: "
+            + ", ".join(snapshot["unsupported_nonzero_assets"])
+        )
+    holdings = snapshot.get("holdings")
+    if not isinstance(holdings, dict) or set(holdings) != set(SYMBOLS):
+        raise RuntimeError("Kraken holdings snapshot does not contain the exact target set")
+    return snapshot
+
+
 def ghostfolio_token():
     status, payload = request_json(
         os.environ.get("GHOSTFOLIO_URL", "http://app:3333") + "/api/v1/auth/anonymous",
@@ -136,6 +159,58 @@ def import_payload(event):
     }
 
 
+def ghostfolio_quantities(token):
+    status, payload = request_json(
+        os.environ.get("GHOSTFOLIO_URL", "http://app:3333") + "/api/v1/portfolio/holdings",
+        token=token,
+    )
+    if status != 200:
+        raise RuntimeError(f"Ghostfolio holdings read failed with HTTP {status}")
+    result = {target: 0.0 for target in SYMBOLS}
+    reverse = {symbol: target for target, symbol in SYMBOLS.items()}
+    for holding in payload.get("holdings", []):
+        symbol = str((holding.get("assetProfile") or {}).get("symbol") or "")
+        target = reverse.get(symbol)
+        if target:
+            result[target] = float(holding.get("quantity") or 0)
+    return result
+
+
+def holdings_drift(snapshot, actual):
+    drift = {}
+    for target in SYMBOLS:
+        expected = float(snapshot["holdings"][target]["quantity"])
+        difference = expected - float(actual.get(target, 0))
+        if abs(difference) > QUANTITY_TOLERANCE[target]:
+            drift[target] = difference
+    return drift
+
+
+def holdings_import_payload(snapshot, target, difference):
+    accounts = json.loads(os.environ.get("GHOSTFOLIO_ACCOUNT_MAP", "{}"))
+    account_id = accounts.get(target)
+    if not account_id:
+        raise RuntimeError(f"no local custody account configured for {target}")
+    item = snapshot["holdings"][target]
+    return {
+        "activities": [{
+            "accountId": account_id,
+            "comment": (
+                "Kraken opening-balance reconciliation; "
+                f"snapshot={snapshot['canonical_hash']}; target={target}"
+            ),
+            "currency": item["quote_currency"],
+            "dataSource": "COINGECKO",
+            "date": snapshot["as_of"],
+            "fee": 0,
+            "quantity": abs(difference),
+            "symbol": SYMBOLS[target],
+            "type": "BUY" if difference > 0 else "SELL",
+            "unitPrice": float(item["unit_price_quote"]),
+        }]
+    }
+
+
 def is_exact_duplicate(payload):
     messages = payload.get("message", []) if isinstance(payload, dict) else []
     if isinstance(messages, str):
@@ -159,6 +234,65 @@ def append_receipt(gist_payload, receipt):
     if status != 200:
         raise RuntimeError(f"receipt publish failed with HTTP {status}")
     return True
+
+
+def append_named_receipt(gist_payload, filename, identity_field, receipt):
+    existing = file_content(gist_payload, filename)
+    for line in existing.splitlines():
+        row = json.loads(line)
+        if row.get(identity_field) == receipt[identity_field]:
+            return row == receipt
+    updated = existing + ("" if not existing or existing.endswith("\n") else "\n") + canonical(receipt) + "\n"
+    status, _ = request_json(
+        f"https://api.github.com/gists/{os.environ['GIST_ID']}",
+        method="PATCH",
+        token=os.environ["GIST_TOKEN"],
+        payload={"files": {filename: {"content": updated}}},
+    )
+    if status != 200:
+        raise RuntimeError(f"{filename} publish failed with HTTP {status}")
+    return True
+
+
+def reconcile_holdings_snapshot(*, commit=False):
+    payload = gist()
+    snapshot = parse_holdings_snapshot(file_content(payload, HOLDINGS_SNAPSHOT_FILE))
+    if snapshot is None:
+        return {"status": "NO_SNAPSHOT", "drift": {}}
+    token = ghostfolio_token()
+    drift = holdings_drift(snapshot, ghostfolio_quantities(token))
+    if not commit or not drift:
+        return {"status": "DRIFT" if drift else "IN_SYNC", "drift": drift}
+
+    base = os.environ.get("GHOSTFOLIO_URL", "http://app:3333") + "/api/v1/import"
+    adjustments = []
+    for target, difference in drift.items():
+        activity = holdings_import_payload(snapshot, target, difference)
+        dry_status, dry_result = request_json(
+            base + "?" + urlencode({"dryRun": "true"}),
+            method="POST", token=token, payload=activity,
+        )
+        duplicate = dry_status == 400 and is_exact_duplicate(dry_result)
+        if dry_status not in {200, 201} and not duplicate:
+            raise RuntimeError(f"Ghostfolio holdings dry-run conflict for {target}")
+        if not duplicate:
+            status, result = request_json(base, method="POST", token=token, payload=activity)
+            if status not in {200, 201} and not (
+                status == 400 and is_exact_duplicate(result)
+            ):
+                raise RuntimeError(f"Ghostfolio holdings import failed for {target}")
+        adjustments.append({"target": target, "quantity_delta": format(difference, ".16g")})
+
+    receipt = {
+        "snapshot_hash": snapshot["canonical_hash"],
+        "reconciled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "adjustments": adjustments,
+    }
+    if not append_named_receipt(
+        gist(), HOLDINGS_RECEIPT_FILE, "snapshot_hash", receipt
+    ):
+        raise RuntimeError("holdings receipt conflict")
+    return {"status": "RECONCILED", "drift": drift}
 
 
 def sync_once():
@@ -203,11 +337,14 @@ def sync_once():
         if not append_receipt(gist(), receipt):
             raise RuntimeError(f"receipt conflict for {event['event_id']}")
         receipts.add(event["event_id"])
+    holdings = reconcile_holdings_snapshot(commit=False)
     STATE_PATH.write_text(
         canonical({
             "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "event_count": len(events),
             "receipt_count": len(receipts),
+            "holdings_status": holdings["status"],
+            "holdings_drift_targets": sorted(holdings["drift"]),
         }),
         encoding="utf-8",
     )
@@ -222,6 +359,13 @@ def main():
         return 0 if time.time() - STATE_PATH.stat().st_mtime <= maximum_age else 1
     if command == "once":
         sync_once()
+        return 0
+    if command == "reconcile-holdings":
+        result = reconcile_holdings_snapshot(commit=True)
+        print(canonical({
+            "status": result["status"],
+            "targets": sorted(result["drift"]),
+        }))
         return 0
     interval = int(os.environ.get("SYNC_INTERVAL_SECONDS", "300"))
     while True:
