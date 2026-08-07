@@ -187,7 +187,7 @@ class GistLoggerTests(unittest.TestCase):
                 "event_sha256",
             ],
         )
-        self.assertEqual(first["version"], 2)
+        self.assertEqual(first["version"], 3)
         self.assertEqual(first["delivery_id"], "KRAKEN-123")
         self.assertEqual(first["created_at"], "2026-07-12T04:34:42Z")
         self.assertEqual(first["symbol"], "BTC")

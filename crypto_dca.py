@@ -1,4 +1,4 @@
-"""Fail-closed execution of GBP-budgeted USD spot purchases on Kraken."""
+"""Fail-closed execution of GBP-budgeted mixed spot purchases on Kraken."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import requests
 
 from dca_config import (
     ALLOWED_TARGETS,
+    TARGET_ROUTES,
     ConfigError,
     MAX_PENDING_GIST_DELIVERIES,
     TIMING_POLICY_VERSION,
@@ -34,6 +35,7 @@ from kraken_client import (
     KrakenPreSubmissionError,
     KrakenOrderStateUnknown,
     build_client_order_id,
+    place_market_buy,
     place_gbp_funded_market_buy,
 )
 
@@ -48,7 +50,7 @@ DCA_EXECUTION_STATE_JSON = os.environ.get("DCA_EXECUTION_STATE", "")
 DCA_SYMBOLS_JSON = os.environ.get("DCA_SYMBOLS_JSON", "")
 DCA_START_DATE = os.environ.get("DCA_START_DATE", "").strip()
 DCA_TRADING_MODE = os.environ.get("DCA_TRADING_MODE", "shadow").strip().lower()
-DCA_CANARY_SYMBOL = os.environ.get("DCA_CANARY_SYMBOL", "SOL_USD").strip().upper()
+DCA_CANARY_SYMBOL = os.environ.get("DCA_CANARY_SYMBOL", "SOL_GBP").strip().upper()
 GHOSTFOLIO_DIRECT_SYNC_ENABLED = (
     os.environ.get("GHOSTFOLIO_DIRECT_SYNC_ENABLED", "false").strip().lower()
     == "true"
@@ -71,6 +73,34 @@ def _gha_mask(value: str) -> None:
     """Mask a value in GitHub Actions logs."""
     if os.environ.get("GITHUB_ACTIONS") == "true" and value:
         print(f"::add-mask::{value}", flush=True)
+
+
+def _place_routed_market_buy(
+    key,
+    amount_gbp,
+    *,
+    client_order_id,
+    funding_client_order_id,
+    reconcile_only,
+    pre_submit_check,
+):
+    """Route only HYPE/USD through GBP/USD; native pairs spend GBP directly."""
+    if TARGET_ROUTES[key] == "DIRECT_GBP":
+        return place_market_buy(
+            key,
+            amount_gbp,
+            client_order_id=client_order_id,
+            reconcile_only=reconcile_only,
+            pre_submit_check=pre_submit_check,
+        )
+    return place_gbp_funded_market_buy(
+        key,
+        amount_gbp,
+        client_order_id=client_order_id,
+        funding_client_order_id=funding_client_order_id,
+        reconcile_only=reconcile_only,
+        pre_submit_check=pre_submit_check,
+    )
 
 
 def send_discord_alert(message, is_error=False):
@@ -852,7 +882,7 @@ def execute_trade(
                     reserve_gist_delivery=True,
                 )
 
-        order_data = place_gbp_funded_market_buy(
+        order_data = _place_routed_market_buy(
             key,
             amount_gbp,
             client_order_id=client_order_id,
@@ -896,25 +926,37 @@ def execute_trade(
 
     try:
         order_id = order_data["order_id"]
-        funding_order_id = order_data["funding_order_id"]
         exchange_pair = order_data["pair"]
+        quote_currency = order_data["quote_currency"]
+        route = TARGET_ROUTES[key]
+        funding_order_id = order_data.get("funding_order_id")
         cost_gbp = float(order_data["cost_gbp"])
         fee_gbp = float(order_data["fee_gbp"])
         gbp_fee_debit = float(order_data["gbp_fee_debit"])
         fee_details = order_data["fee_details"]
         spent_gbp = float(order_data["spent_gbp"])
-        funded_usd = float(order_data["funded_usd"])
-        cost_usd = float(order_data["cost_usd"])
-        fee_usd = float(order_data["fee_usd"])
-        funding_fee_usd = float(order_data["funding_fee_usd"])
-        usd_fee_debit = float(order_data["usd_fee_debit"])
-        gbp_usd_rate = float(order_data["gbp_usd_rate"])
         received_amount = float(order_data["received"])
         market_price = float(order_data["market_gbp_price_per_unit"])
         effective_price = float(order_data["effective_gbp_price_per_unit"])
-        market_usd_price = float(order_data["market_usd_price_per_unit"])
-        effective_usd_price = float(order_data["effective_usd_price_per_unit"])
         execution_timestamp = int(order_data["timestamp"])
+        if quote_currency == "USD":
+            funded_usd = float(order_data["funded_usd"])
+            cost_quote = float(order_data["cost_usd"])
+            fee_quote = float(order_data["crypto_fee_usd"])
+            funding_fee_quote = float(order_data["funding_fee_usd"])
+            quote_fee_debit = float(order_data["usd_fee_debit"])
+            gbp_usd_rate = float(order_data["gbp_usd_rate"])
+            unit_price_quote = float(order_data["market_usd_price_per_unit"])
+            effective_price_quote = float(order_data["effective_usd_price_per_unit"])
+        else:
+            funded_usd = 0.0
+            cost_quote = float(order_data["cost_quote"])
+            fee_quote = float(order_data["fee_quote"])
+            funding_fee_quote = 0.0
+            quote_fee_debit = float(order_data["quote_fee_debit"])
+            gbp_usd_rate = 0.0
+            unit_price_quote = float(order_data["market_quote_price_per_unit"])
+            effective_price_quote = float(order_data["effective_quote_price_per_unit"])
     except (KeyError, TypeError, ValueError) as error:
         message = (
             f"CRITICAL: Kraken returned an unrecognized fill for {key}; the durable "
@@ -925,7 +967,8 @@ def execute_trade(
         return False
 
     _gha_mask(str(order_id))
-    _gha_mask(str(funding_order_id))
+    if funding_order_id:
+        _gha_mask(str(funding_order_id))
     _gha_mask(f"{cost_gbp:.2f}")
     _gha_mask(f"{fee_gbp:.2f}")
     _gha_mask(f"{spent_gbp:.2f}")
@@ -945,15 +988,16 @@ def execute_trade(
         "effective_gbp_price_per_unit": effective_price,
         "exchange_pair": exchange_pair,
         "decision_id": intent["decision_id"],
-        "quote_currency": "USD",
-        "cost_usd": cost_usd,
-        "fee_usd": fee_usd,
-        "funding_fee_usd": funding_fee_usd,
-        "usd_fee_debit": usd_fee_debit,
+        "route": route,
+        "quote_currency": quote_currency,
+        "cost_quote": cost_quote,
+        "fee_quote": fee_quote,
+        "funding_fee_quote": funding_fee_quote,
+        "quote_fee_debit": quote_fee_debit,
         "funded_usd": funded_usd,
         "gbp_usd_rate": gbp_usd_rate,
-        "usd_price_per_unit": market_usd_price,
-        "effective_usd_price_per_unit": effective_usd_price,
+        "unit_price_quote": unit_price_quote,
+        "effective_price_quote": effective_price_quote,
         "funding_order_id": funding_order_id,
     }
     completed_date = datetime.fromtimestamp(
@@ -997,20 +1041,20 @@ def execute_trade(
         "DCA buy executed and confirmed.\n"
         f"**Pair:** {exchange_pair}\n"
         f"**GBP budget/debit:** £{spent_gbp:,.2f}\n"
-        f"**USD funded:** ${funded_usd:,.2f}\n"
-        f"**Crypto order cost:** ${cost_usd:,.2f}\n"
-        f"**FX fee:** ${funding_fee_usd:,.4f}\n"
-        f"**Crypto fee (USD equivalent):** ${fee_usd:,.4f}\n"
-        f"**GBP/USD execution rate:** ${gbp_usd_rate:,.5f} per £1\n"
+        f"**Funding:** {'USD ' + format(funded_usd, ',.2f') if route == 'GBP_TO_USD' else 'not required (native GBP market)'}\n"
+        f"**Crypto order cost:** {quote_currency} {cost_quote:,.2f}\n"
+        f"**Funding fee:** {quote_currency} {funding_fee_quote:,.4f}\n"
+        f"**Crypto fee:** {quote_currency} {fee_quote:,.4f}\n"
+        f"**GBP/USD execution rate:** {('$' + format(gbp_usd_rate, ',.5f') + ' per GBP 1') if route == 'GBP_TO_USD' else 'not applicable'}\n"
         f"**Total GBP debit:** £{spent_gbp:,.2f}\n"
         f"**Received:** {received_amount:.8f} {base_symbol}\n"
-        f"**Market rate:** ${market_usd_price:,.2f} / £{market_price:,.2f}\n"
-        f"**Effective rate:** ${effective_usd_price:,.2f} / £{effective_price:,.2f}\n"
+        f"**Market rate:** {quote_currency} {unit_price_quote:,.2f} / GBP {market_price:,.2f}\n"
+        f"**Effective rate:** {quote_currency} {effective_price_quote:,.2f} / GBP {effective_price:,.2f}\n"
         f"**Regime:** {expected_decision.get('REGIME') if expected_decision else 'recovery'}\n"
         f"**Decision ID:** {intent['decision_id']}\n"
         "**Portfolio:** Saved on Kraken\n"
         f"**Time:** {execution_time}\n"
-        f"**Funding order ID:** {funding_order_id}\n"
+        f"**Funding order ID:** {funding_order_id or 'not required'}\n"
         f"**Crypto order ID:** {order_id}"
     )
     send_discord_alert(message, is_error=False)
@@ -1018,7 +1062,7 @@ def execute_trade(
 
 
 def main():
-    print("--- Starting Kraken GBP-budgeted USD DCA execution ---", flush=True)
+    print("--- Starting Kraken GBP-budgeted mixed-market DCA execution ---", flush=True)
     try:
         execution_state = _initial_execution_state()
     except (json.JSONDecodeError, ConfigError, RuntimeError, ValueError) as error:

@@ -43,9 +43,9 @@ The configured target set is exactly:
 
 | Pair | `UPTREND` lower | `SIDEWAYS` midpoint | `DOWNTREND` higher | Intended state |
 | --- | ---: | ---: | ---: | --- |
-| `BTC/USD` | £10 | £15 | £20 | Enabled |
+| `BTC/GBP` | £10 | £15 | £20 | Enabled |
 | `HYPE/USD` | £10 | £12.50 | £15 | Enabled |
-| `SOL/USD` | £5 | £10 | £15 | Enabled |
+| `SOL/GBP` | £5 | £10 | £15 | Enabled |
 
 - The bot deliberately buys more in a `DOWNTREND`, the midpoint in a
   `SIDEWAYS` market, and less in an `UPTREND`.
@@ -143,7 +143,7 @@ and maximum aggregate daily exposure. Within five minutes, copy the exact
 confirmation returned by the bot, for example:
 
 ```text
-!dca confirm enable BTC_USD
+!dca confirm enable BTC_GBP
 ```
 
 Wait for the final **Update DCA Configuration** run to succeed. Railway can take
@@ -187,7 +187,7 @@ The user-owned repository variable is `DCA_TARGET_MAP`. Its approved shape is:
 
 ```json
 {
-  "BTC_USD": {
+  "BTC_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 20},
     "BUY_ENABLED": true
   },
@@ -195,7 +195,7 @@ The user-owned repository variable is `DCA_TARGET_MAP`. Its approved shape is:
     "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 15},
     "BUY_ENABLED": true
   },
-  "SOL_USD": {
+  "SOL_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 5, "UP": 15},
     "BUY_ENABLED": true
   }
@@ -241,8 +241,8 @@ Run fresh analysis after a budget change before trying to re-enable or trade.
 ## Adding or permanently removing a pair
 
 Pair membership is a maintainer/Codex code-and-state migration, not a beginner
-JSON setting. The current schema requires exactly `BTC_USD`, `HYPE_USD`, and
-`SOL_USD`; an extra or missing key fails closed.
+JSON setting. The current schema requires exactly `BTC_GBP`, `HYPE_USD`, and
+`SOL_GBP`; an extra or missing key fails closed.
 
 For a permanent pair change:
 
@@ -295,7 +295,7 @@ These changes require a tested pull request and cannot be made through Discord:
 - Best-time policy: [`crypto_analysis.py`](crypto_analysis.py#L423-L500).
 - Gemini explanation contract and model fallback:
   [`crypto_analysis.py`](crypto_analysis.py#L665-L688).
-- GBP-funded USD execution and Kraken reconciliation:
+- mixed direct-GBP / GBP-funded-USD execution and Kraken reconciliation:
   [`kraken_client.py`](kraken_client.py).
 
 `DCA_CRON_ENABLED` is a Railway runtime variable, not a GitHub repository

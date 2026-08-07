@@ -7,7 +7,7 @@ import unittest
 import kraken_history
 
 
-def trade(identifier, timestamp, price="100", quantity="1", pair="BTC/USD"):
+def trade(identifier, timestamp, price="100", quantity="1", pair="BTC/GBP"):
     return {
         "trade_id": identifier,
         "trade_ts": timestamp,
@@ -35,10 +35,10 @@ class KrakenHistoryTests(unittest.TestCase):
     def test_trade_aggregation_is_canonical_ohlcvt(self):
         candles = {}
         kraken_history._add_trade(
-            candles, trade("A", "2026-08-07T00:01:00.000000001Z", "100", "2"), "BTC/USD"
+            candles, trade("A", "2026-08-07T00:01:00.000000001Z", "100", "2"), "BTC/GBP"
         )
         kraken_history._add_trade(
-            candles, trade("B", "2026-08-07T00:14:59.999999999Z", "90", "3"), "BTC/USD"
+            candles, trade("B", "2026-08-07T00:14:59.999999999Z", "90", "3"), "BTC/GBP"
         )
         candle = next(iter(candles.values()))
         self.assertEqual(
@@ -48,15 +48,15 @@ class KrakenHistoryTests(unittest.TestCase):
 
     def test_wrong_pair_and_missing_trade_id_fail_closed(self):
         with self.assertRaisesRegex(kraken_history.HistoryError, "different currency pair"):
-            kraken_history._add_trade({}, trade("A", "2026-08-07T00:00:00Z", pair="SOL/USD"), "BTC/USD")
+            kraken_history._add_trade({}, trade("A", "2026-08-07T00:00:00Z", pair="SOL/GBP"), "BTC/GBP")
         with self.assertRaisesRegex(kraken_history.HistoryError, "trade_id"):
-            kraken_history._add_trade({}, trade("", "2026-08-07T00:00:00Z"), "BTC/USD")
+            kraken_history._add_trade({}, trade("", "2026-08-07T00:00:00Z"), "BTC/GBP")
 
     def test_monthly_partitions_are_sorted_and_hashed(self):
         candles = {}
         for identifier, timestamp in (("B", "2026-08-01T00:00:00Z"), ("A", "2026-07-31T23:45:00Z")):
-            kraken_history._add_trade(candles, trade(identifier, timestamp), "BTC/USD")
-        contents, hashes = kraken_history._serialize_partitions("BTC_USD", candles)
+            kraken_history._add_trade(candles, trade(identifier, timestamp), "BTC/GBP")
+        contents, hashes = kraken_history._serialize_partitions("BTC_GBP", candles)
         self.assertEqual(len(contents), 2)
         for name, content in contents.items():
             self.assertEqual(hashes[name], sha256(content.encode()).hexdigest())
@@ -66,7 +66,7 @@ class KrakenHistoryTests(unittest.TestCase):
             datetime(2026, 8, 1, tzinfo=timezone.utc), Decimal("100"), Decimal("1")
         )
         content = json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
-        filename = "kraken_history_v1_BTC_USD_2026-08.jsonl"
+        filename = "kraken_history_v1_BTC_GBP_2026-08.jsonl"
         manifest = {"PARTITIONS": {filename: sha256(content.encode()).hexdigest()}}
         self.assertEqual(len(kraken_history._load_candles(MemoryStore({filename: content}), manifest)), 1)
         with self.assertRaisesRegex(kraken_history.HistoryError, "hash mismatch"):
@@ -98,14 +98,14 @@ class KrakenHistoryTests(unittest.TestCase):
             candles[epoch] = kraken_history._new_candle(timestamp, Decimal("100"), Decimal("1"))
             rows.append([epoch, "100", "100", "100", "100", "1", "1", 1])
         client = type("Client", (), {"ohlc": lambda self, pair: rows})()
-        overlap = kraken_history.validate_ohlc_overlap(client, "BTC/USD", candles, cutoff)
+        overlap = kraken_history.validate_ohlc_overlap(client, "BTC/GBP", candles, cutoff)
         self.assertEqual(overlap["STATUS"], "VERIFIED")
         rows[0][4] = "101"
         with self.assertRaisesRegex(kraken_history.HistoryError, "overlap mismatch"):
-            kraken_history.validate_ohlc_overlap(client, "BTC/USD", candles, cutoff)
+            kraken_history.validate_ohlc_overlap(client, "BTC/GBP", candles, cutoff)
 
     def test_target_parser_is_strict_and_deduplicated(self):
-        self.assertEqual(kraken_history._parse_targets("btc/usd,BTC_USD,sol_usd"), ["BTC_USD", "SOL_USD"])
+        self.assertEqual(kraken_history._parse_targets("btc/gbp,BTC_GBP,sol_gbp"), ["BTC_GBP", "SOL_GBP"])
         with self.assertRaisesRegex(kraken_history.HistoryError, "unsupported"):
             kraken_history._parse_targets("ETH_USD")
 

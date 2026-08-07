@@ -1,4 +1,4 @@
-"""Shared schemas and safety checks for the Kraken USD-market DCA service.
+"""Shared schemas and safety checks for the mixed-market Kraken DCA service.
 
 The module deliberately contains no network calls.  GitHub Actions, Railway,
 Discord, analysis, and order execution can therefore validate exactly the same
@@ -16,9 +16,18 @@ import re
 from typing import Any, Callable, Mapping
 
 
-TARGET_KEYS = ("BTC_USD", "HYPE_USD", "SOL_USD")
+TARGET_KEYS = ("BTC_GBP", "HYPE_USD", "SOL_GBP")
 ALLOWED_TARGETS = TARGET_KEYS
-TARGET_SYMBOLS = {key: key.replace("_", "/") for key in TARGET_KEYS}
+TARGET_SYMBOLS = {
+    "BTC_GBP": "BTC/GBP",
+    "HYPE_USD": "HYPE/USD",
+    "SOL_GBP": "SOL/GBP",
+}
+TARGET_ROUTES = {
+    "BTC_GBP": "DIRECT_GBP",
+    "HYPE_USD": "GBP_TO_USD",
+    "SOL_GBP": "DIRECT_GBP",
+}
 RULE_FIELDS = frozenset({"REGIME_AMOUNTS_GBP", "BUY_ENABLED"})
 REGIME_AMOUNT_FIELDS = frozenset({"LOW", "UP"})
 TIMING_POLICY_VERSION = "original-14-30-45-60-v1"
@@ -48,7 +57,7 @@ ANALYSIS_DECISION_FIELDS = frozenset(
 )
 ANALYSIS_STATE_VERSION = 3
 AMOUNT_POLICY_VERSION = 2
-GIST_DELIVERY_VERSION = 2
+GIST_DELIVERY_VERSION = 3
 MAX_PENDING_GIST_DELIVERIES = 16
 MAX_GIST_DELIVERY_ROW_BYTES = 2_048
 MAX_EXECUTION_STATE_JSON_BYTES = 40_000
@@ -84,12 +93,23 @@ PORTFOLIO_EVENT_FIELDS = frozenset(
         "gbp_debit",
         "gbp_usd_rate",
         "funded_usd",
-        "crypto_cost_usd",
+        "route",
+        "crypto_cost_quote",
         "crypto_quantity",
-        "unit_price_usd",
-        "funding_fee_usd",
-        "crypto_fee_usd",
+        "unit_price_quote",
+        "funding_fee_quote",
+        "crypto_fee_quote",
         "canonical_hash",
+    }
+)
+PORTFOLIO_EVENT_V2_FIELDS = frozenset(
+    {
+        "event_version", "event_id", "occurred_at", "target",
+        "base_currency", "quote_currency", "budget_currency",
+        "funding_order_id", "crypto_order_id", "gbp_debit",
+        "gbp_usd_rate", "funded_usd", "crypto_cost_usd",
+        "crypto_quantity", "unit_price_usd", "funding_fee_usd",
+        "crypto_fee_usd", "canonical_hash",
     }
 )
 MIN_ENABLED_AMOUNT_GBP = 5.0
@@ -176,9 +196,9 @@ def validate_target_map(
 
     Disabled targets may use zero as an explicit unconfigured placeholder.
     Enabled targets require both endpoints to be within £5–£1,000 and not below a
-    supplied live Kraken market minimum. Only the three production USD market
-    keys and the final two-field rule schema are accepted. Budget policy values
-    remain GBP-denominated even though Kraken executes the target pairs in USD.
+        supplied live Kraken market minimum. Only the three production mixed-market
+        keys and the final two-field rule schema are accepted. All budget values
+        remain GBP-denominated.
     """
 
     raw_map = _json_object(value, "DCA_TARGET_MAP")
@@ -438,9 +458,9 @@ def validate_gist_delivery(value: Mapping[str, Any], target: str) -> dict[str, A
     if (
         isinstance(version, bool)
         or not isinstance(version, int)
-        or version != GIST_DELIVERY_VERSION
+        or version not in {2, GIST_DELIVERY_VERSION}
     ):
-        raise ConfigError(f"{label}.version must be {GIST_DELIVERY_VERSION}")
+        raise ConfigError(f"{label}.version must be 2 or {GIST_DELIVERY_VERSION}")
 
     delivery_id = delivery["delivery_id"]
     if not isinstance(delivery_id, str) or not re.fullmatch(
@@ -502,29 +522,51 @@ def validate_gist_delivery(value: Mapping[str, Any], target: str) -> dict[str, A
     if not isinstance(event, Mapping):
         raise ConfigError(f"{label}.event must be an object")
     event = dict(event)
-    _unexpected_fields(event, PORTFOLIO_EVENT_FIELDS, f"{label}.event")
-    if event["event_version"] != GIST_DELIVERY_VERSION:
-        raise ConfigError(f"{label}.event.event_version must be {GIST_DELIVERY_VERSION}")
+    event_version = event.get("event_version")
+    expected_event_fields = (
+        PORTFOLIO_EVENT_V2_FIELDS if event_version == 2 else PORTFOLIO_EVENT_FIELDS
+    )
+    _unexpected_fields(event, expected_event_fields, f"{label}.event")
+    if event_version != version:
+        raise ConfigError(f"{label}.event.event_version must match delivery version")
     if event["event_id"] != delivery_id or event["crypto_order_id"] != delivery_id:
         raise ConfigError(f"{label}.event identifiers must match delivery_id")
     if event["target"] != target:
         raise ConfigError(f"{label}.event.target must be {target}")
     if event["base_currency"] != expected_symbol:
         raise ConfigError(f"{label}.event.base_currency must be {expected_symbol}")
-    if event["quote_currency"] != "USD" or event["budget_currency"] != "GBP":
-        raise ConfigError(f"{label}.event currencies must be GBP-funded USD")
+    if event_version == 2:
+        if event["quote_currency"] != "USD" or event["budget_currency"] != "GBP":
+            raise ConfigError(f"{label}.event v2 currencies must be GBP-funded USD")
+        quote_currency = "USD"
+        expected_route = "GBP_TO_USD"
+    else:
+        quote_currency = TARGET_SYMBOLS[target].split("/", 1)[1]
+        expected_route = TARGET_ROUTES[target]
+    if event["quote_currency"] != quote_currency or event["budget_currency"] != "GBP":
+        raise ConfigError(f"{label}.event currencies do not match {TARGET_SYMBOLS[target]}")
+    if event_version == 3 and event["route"] != expected_route:
+        raise ConfigError(f"{label}.event.route must be {expected_route}")
     if event["occurred_at"] != created_at:
         raise ConfigError(f"{label}.event.occurred_at must match created_at")
-    for field in (
+    decimal_fields = (
+        (
+            "gbp_debit", "gbp_usd_rate", "funded_usd", "crypto_cost_usd",
+            "crypto_quantity", "unit_price_usd", "funding_fee_usd", "crypto_fee_usd",
+        )
+        if event_version == 2
+        else (
         "gbp_debit",
         "gbp_usd_rate",
         "funded_usd",
-        "crypto_cost_usd",
+        "crypto_cost_quote",
         "crypto_quantity",
-        "unit_price_usd",
-        "funding_fee_usd",
-        "crypto_fee_usd",
-    ):
+        "unit_price_quote",
+        "funding_fee_quote",
+        "crypto_fee_quote",
+        )
+    )
+    for field in decimal_fields:
         raw = event[field]
         if not isinstance(raw, str):
             raise ConfigError(f"{label}.event.{field} must be a decimal string")
@@ -535,8 +577,11 @@ def validate_gist_delivery(value: Mapping[str, Any], target: str) -> dict[str, A
         if not number.is_finite() or number < 0:
             raise ConfigError(f"{label}.event.{field} must be non-negative")
     funding_order_id = event["funding_order_id"]
-    if not isinstance(funding_order_id, str) or not funding_order_id.strip():
-        raise ConfigError(f"{label}.event.funding_order_id must be non-empty")
+    if event_version == 2 or expected_route == "GBP_TO_USD":
+        if not isinstance(funding_order_id, str) or not funding_order_id.strip():
+            raise ConfigError(f"{label}.event.funding_order_id must be non-empty")
+    elif funding_order_id is not None:
+        raise ConfigError(f"{label}.event.funding_order_id must be null for direct GBP")
     canonical_hash = event["canonical_hash"]
     event_without_hash = {key: value for key, value in event.items() if key != "canonical_hash"}
     expected_canonical_hash = sha256(

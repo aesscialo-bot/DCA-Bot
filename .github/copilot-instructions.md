@@ -1,12 +1,12 @@
 # Copilot instructions
 
-This repository is the production Kraken GBP-funded USD-market DCA bot. Read
+This repository is the production Kraken mixed-market, GBP-budgeted DCA bot. Read
 `00_START_HERE.md`, `README.md`, and `CLAUDE.md` before changing behavior,
 schemas, workflows, or deployment configuration.
 
 ## Current production contract
 
-- Supported targets are exactly `BTC_USD`, `HYPE_USD`, and `SOL_USD` unless a
+- Supported targets are exactly `BTC_GBP`, `HYPE_USD`, and `SOL_GBP` unless a
   deliberately staged pair-membership migration changes the full system.
 - `DCA_TARGET_MAP` contains every canonical target with only
   `REGIME_AMOUNTS_GBP` (`LOW` lower endpoint and compatibility-named `UP` upper

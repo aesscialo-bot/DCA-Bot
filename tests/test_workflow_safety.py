@@ -80,15 +80,15 @@ class WorkflowSafetyTests(unittest.TestCase):
                         f"{name} does not load {variable}",
                     )
 
-    def test_workflow_inputs_and_steps_describe_usd_targets_only(self):
+    def test_workflow_inputs_and_steps_describe_mixed_targets_only(self):
         analysis = self._read("crypto_analysis.yml")
         writer = self._read("update_dca_config.yml")
-        self.assertIn("BTC, HYPE, SOL, a canonical USD pair, or all", analysis)
-        self.assertIn("Analyze Kraken USD markets", analysis)
+        self.assertIn("BTC, HYPE, SOL, a canonical configured pair, or all", analysis)
+        self.assertIn("Analyze configured Kraken markets", analysis)
         self.assertNotIn("ETH", analysis)
         self.assertNotIn("ADA", analysis)
-        self.assertIn("BTC_USD, HYPE_USD, or SOL_USD", writer)
-        self.assertNotIn("Canonical Kraken GBP key", writer)
+        self.assertIn("BTC_GBP, HYPE_USD, or SOL_GBP", writer)
+        self.assertIn("Canonical Kraken key", writer)
 
     def test_start_date_gate_is_passed_to_analysis_and_trader(self):
         for name in ("crypto_analysis.yml", "daily_dca.yml"):

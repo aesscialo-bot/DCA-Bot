@@ -1,4 +1,4 @@
-"""Deterministic Kraken USD-market regime and execution-time analysis.
+"""Deterministic Kraken mixed-market regime and execution-time analysis.
 
 Gemini is an optional narrator only.  All spend-affecting outputs (regime,
 amount tier, and execution time) are calculated locally from completed Kraken
@@ -51,7 +51,7 @@ DCA_ANALYSIS_STATE_ENV = os.environ.get("DCA_ANALYSIS_STATE", "")
 ANALYSIS_VARIABLE = "DCA_ANALYSIS_STATE"
 PERIODS = (14, 30, 45, 60)
 DCA_TRADING_MODE = os.environ.get("DCA_TRADING_MODE", "shadow").strip().lower()
-DCA_CANARY_SYMBOL = os.environ.get("DCA_CANARY_SYMBOL", "SOL_USD").strip().upper()
+DCA_CANARY_SYMBOL = os.environ.get("DCA_CANARY_SYMBOL", "SOL_GBP").strip().upper()
 
 DAILY_TIMEFRAME_MS = 24 * 60 * 60 * 1000
 WEEKLY_TIMEFRAME_MS = 7 * DAILY_TIMEFRAME_MS
@@ -87,17 +87,19 @@ def _iso_utc(value: datetime) -> str:
 def _target_from_symbol(value: str) -> str:
     candidate = value.strip().strip("\"'").upper().replace("_", "/")
     if "/" not in candidate:
-        candidate = f"{candidate}/USD"
+        candidate = {"BTC": "BTC/GBP", "HYPE": "HYPE/USD", "SOL": "SOL/GBP"}.get(
+            candidate, candidate
+        )
     target = candidate.replace("/", "_")
     if target not in TARGET_KEYS:
         raise ValueError(
-            f"Only BTC/USD, HYPE/USD, and SOL/USD are supported: {value}"
+            f"Only BTC/GBP, HYPE/USD, and SOL/GBP are supported: {value}"
         )
     return target
 
 
 def _parse_symbols(symbols_env: str, dca_map_env: str) -> list[str]:
-    """Return a deterministic list of supported Kraken USD pair strings."""
+    """Return the deterministic mixed Kraken pair strings."""
 
     if symbols_env.strip() and symbols_env.strip().lower() != "all":
         try:
@@ -113,7 +115,7 @@ def _parse_symbols(symbols_env: str, dca_map_env: str) -> list[str]:
             if target not in targets:
                 targets.append(target)
         if not targets:
-            raise ValueError("SYMBOL did not contain a supported Kraken USD pair")
+            raise ValueError("SYMBOL did not contain a supported Kraken DCA pair")
         return [TARGET_SYMBOLS[target] for target in targets]
 
     try:
@@ -127,7 +129,7 @@ def get_analysis_exchange(exchange_id: str = EXCHANGE_ID):
     """Create the one supported public market-data client."""
 
     if str(exchange_id).strip().lower() != "kraken":
-        raise ValueError("Crypto analysis supports Kraken USD markets only")
+        raise ValueError("Crypto analysis supports the configured Kraken markets only")
     return ccxt.kraken({"enableRateLimit": True})
 
 

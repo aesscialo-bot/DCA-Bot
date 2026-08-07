@@ -104,7 +104,7 @@ def candidate(time_text, miss, win, days):
 
 def ready_history():
     return {
-        "VERSION": 1, "STATUS": "READY", "PAIR": "BTC/USD",
+        "VERSION": 1, "STATUS": "READY", "PAIR": "BTC/GBP",
         "FROM": "2026-06-01T00:00:00Z", "THROUGH": "2026-08-05T21:00:00Z",
         "CANDLE_COUNT": 6240, "NO_TRADE_INTERVALS": 0,
         "OVERLAP": {"STATUS": "MATCH"}, "HASH": "a" * 64,
@@ -113,34 +113,34 @@ def ready_history():
 
 class AnalysisSymbolTests(unittest.TestCase):
     def test_analysis_exchange_is_kraken_only(self):
-        with self.assertRaisesRegex(ValueError, "Kraken USD markets only"):
+        with self.assertRaisesRegex(ValueError, "configured Kraken markets only"):
             crypto_analysis.get_analysis_exchange("coinbase")
 
     def test_derives_exact_three_kraken_usd_pairs_from_rules(self):
         rules = dca_config.default_rules_map()
         self.assertEqual(
             crypto_analysis._parse_symbols("", json.dumps(rules)),
-            ["BTC/USD", "HYPE/USD", "SOL/USD"],
+            ["BTC/GBP", "HYPE/USD", "SOL/GBP"],
         )
         self.assertEqual(
             crypto_analysis._parse_symbols("all", json.dumps(rules)),
-            ["BTC/USD", "HYPE/USD", "SOL/USD"],
+            ["BTC/GBP", "HYPE/USD", "SOL/GBP"],
         )
 
     def test_explicit_supported_subset_is_normalized(self):
         self.assertEqual(
-            crypto_analysis._parse_symbols('BTC,HYPE_USD,"SOL/USD"', "{}"),
-            ["BTC/USD", "HYPE/USD", "SOL/USD"],
+            crypto_analysis._parse_symbols('BTC,HYPE_USD,"SOL/GBP"', "{}"),
+            ["BTC/GBP", "HYPE/USD", "SOL/GBP"],
         )
 
     def test_nonproduction_and_legacy_quote_pairs_are_rejected(self):
-        for symbol in ("BTC/GBP", "ETH/USD", "LINK/USD", "BTC_THB"):
+        for symbol in ("BTC/USD", "ETH/USD", "LINK/USD", "BTC_THB"):
             with self.subTest(symbol=symbol):
-                with self.assertRaisesRegex(ValueError, "Only BTC/USD"):
+                with self.assertRaisesRegex(ValueError, "Only BTC/GBP"):
                     crypto_analysis._parse_symbols(symbol, "{}")
 
     def test_rules_source_rejects_legacy_schema(self):
-        with self.assertRaisesRegex(ValueError, "unsupported targets.*BTC_GBP"):
+        with self.assertRaisesRegex(ValueError, "missing production targets"):
             crypto_analysis._parse_symbols(
                 "", '{"BTC_GBP":{"TIME":"02:45","AMOUNT_GBP":10}}'
             )
@@ -271,11 +271,11 @@ class TimingPolicyTests(unittest.TestCase):
         expected = capped_rolling_intraday_rows(NOW)
         exchange.fetch_ohlcv.return_value = expected
         actual = crypto_analysis.fetch_ohlcv_last_n_days(
-            exchange, "BTC/USD", "15m", 7
+            exchange, "BTC/GBP", "15m", 7
         )
         self.assertEqual(actual, expected)
         exchange.fetch_ohlcv.assert_called_once_with(
-            "BTC/USD", timeframe="15m", limit=720
+            "BTC/GBP", timeframe="15m", limit=720
         )
 
     def test_fourteen_day_override_thresholds_are_inclusive(self):
@@ -372,14 +372,14 @@ class DecisionAndNarrationTests(unittest.TestCase):
         )
 
     def test_uptrend_selects_lower_budget_tier(self):
-        rules = dca_config.default_rules_map()["BTC_USD"]
+        rules = dca_config.default_rules_map()["BTC_GBP"]
         daily, weekly = trend_rows("up")
         with (
             patch.object(crypto_analysis, "_fetch_asset_rows", return_value=(daily, weekly, intraday_rows(), ready_history())),
             patch.object(crypto_analysis, "LOCAL_TZ", "Asia/Bangkok"),
         ):
             decision = crypto_analysis.analyze_asset(
-                MagicMock(), "BTC_USD", rules, now=NOW
+                MagicMock(), "BTC_GBP", rules, now=NOW
             )
         self.assertEqual(decision["REGIME"], "UPTREND")
         self.assertEqual(decision["AMOUNT_TIER"], "LOW")
@@ -392,7 +392,7 @@ class DecisionAndNarrationTests(unittest.TestCase):
 
     def test_hype_analysis_uses_completed_kraken_hype_usd_history(self):
         rule = dca_config.default_rules_map()["HYPE_USD"]
-        # HYPE/USD is newer than BTC/USD and SOL/USD but has more than the
+        # HYPE/USD is newer than BTC/GBP and SOL/GBP but has more than the
         # exact 170 candles required by SMA150's 20-day slope.
         daily, weekly = trend_rows("down", count=190)
         exchange = MagicMock()
@@ -441,9 +441,9 @@ class DecisionAndNarrationTests(unittest.TestCase):
         self.assertIn("`MID` tier (`£12.5` configured)", report)
 
     def test_analysis_failure_creates_fresh_non_executable_error(self):
-        rule = dca_config.default_rules_map()["BTC_USD"]
-        first = crypto_analysis.error_decision("BTC_USD", rule, "stale data", now=NOW)
-        second = crypto_analysis.error_decision("BTC_USD", rule, "stale data", now=NOW)
+        rule = dca_config.default_rules_map()["BTC_GBP"]
+        first = crypto_analysis.error_decision("BTC_GBP", rule, "stale data", now=NOW)
+        second = crypto_analysis.error_decision("BTC_GBP", rule, "stale data", now=NOW)
         self.assertEqual(first["ANALYSIS_STATUS"], "ERROR")
         self.assertIsNone(first["EXECUTE_AT"])
         self.assertEqual(first["DECISION_ID"], second["DECISION_ID"])
@@ -460,7 +460,7 @@ class DecisionAndNarrationTests(unittest.TestCase):
             patch.object(crypto_analysis.genai, "Client", return_value=client),
         ):
             summary, selected_time, model = crypto_analysis.get_ai_summary(
-                "UPTREND at 03:00", "BTC/USD"
+                "UPTREND at 03:00", "BTC/GBP"
             )
 
         self.assertIsNone(selected_time)

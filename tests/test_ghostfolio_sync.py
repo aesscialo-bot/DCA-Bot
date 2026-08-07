@@ -13,13 +13,13 @@ SPEC.loader.exec_module(ghostfolio_sync)
 
 def event(identifier="ORDER-1"):
     value = {
-        "event_version": 2, "event_id": identifier,
-        "occurred_at": "2026-08-06T01:00:00Z", "target": "SOL_USD",
-        "base_currency": "SOL", "quote_currency": "USD", "budget_currency": "GBP",
-        "funding_order_id": "FUND-1", "crypto_order_id": identifier,
-        "gbp_debit": "10", "gbp_usd_rate": "1.3", "funded_usd": "13",
-        "crypto_cost_usd": "12.9", "crypto_quantity": "0.1",
-        "unit_price_usd": "129", "funding_fee_usd": "0.02", "crypto_fee_usd": "0.03",
+        "event_version": 3, "event_id": identifier,
+        "occurred_at": "2026-08-06T01:00:00Z", "target": "SOL_GBP",
+        "base_currency": "SOL", "quote_currency": "GBP", "budget_currency": "GBP",
+        "funding_order_id": None, "crypto_order_id": identifier,
+        "gbp_debit": "10", "gbp_usd_rate": "0", "funded_usd": "0",
+        "route": "DIRECT_GBP", "crypto_cost_quote": "10", "crypto_quantity": "0.1",
+        "unit_price_quote": "100", "funding_fee_quote": "0", "crypto_fee_quote": "0.03",
     }
     value["canonical_hash"] = hashlib.sha256(
         ghostfolio_sync.canonical(value).encode()
@@ -48,7 +48,7 @@ class GhostfolioSyncTests(unittest.TestCase):
 
     def test_import_payload_uses_local_custody_account_and_separate_fee_comment(self):
         prior = ghostfolio_sync.os.environ.get("GHOSTFOLIO_ACCOUNT_MAP")
-        ghostfolio_sync.os.environ["GHOSTFOLIO_ACCOUNT_MAP"] = json.dumps({"SOL_USD": "local-sol"})
+        ghostfolio_sync.os.environ["GHOSTFOLIO_ACCOUNT_MAP"] = json.dumps({"SOL_GBP": "local-sol"})
         try:
             activity = ghostfolio_sync.import_payload(event())["activities"][0]
         finally:
@@ -58,8 +58,8 @@ class GhostfolioSyncTests(unittest.TestCase):
                 ghostfolio_sync.os.environ["GHOSTFOLIO_ACCOUNT_MAP"] = prior
         self.assertEqual(activity["accountId"], "local-sol")
         self.assertEqual(activity["symbol"], "solana")
-        self.assertIn("funding fee USD 0.02", activity["comment"])
-        self.assertIn("crypto fee USD 0.03", activity["comment"])
+        self.assertIn("funding fee GBP 0", activity["comment"])
+        self.assertIn("crypto fee GBP 0.03", activity["comment"])
 
 
 if __name__ == "__main__":

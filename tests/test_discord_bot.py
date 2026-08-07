@@ -126,20 +126,21 @@ def gist_delivery(
         f"0.00020000 {symbol} | FUNDING-1 | {delivery_id} | "
         "optional/not saved |\n"
     )
-    target = f"{symbol}_USD"
+    target = f"{symbol}_GBP"
     event = {
-        "event_version": 2, "event_id": delivery_id, "occurred_at": created_at,
-        "target": target, "base_currency": symbol, "quote_currency": "USD",
-        "budget_currency": "GBP", "funding_order_id": "FUNDING-1",
+        "event_version": 3, "event_id": delivery_id, "occurred_at": created_at,
+        "target": target, "base_currency": symbol, "quote_currency": "GBP",
+        "budget_currency": "GBP", "funding_order_id": None,
         "crypto_order_id": delivery_id, "gbp_debit": "10", "gbp_usd_rate": "1.3",
-        "funded_usd": "13", "crypto_cost_usd": "12.9", "crypto_quantity": "0.0002",
-        "unit_price_usd": "64500", "funding_fee_usd": "0.02", "crypto_fee_usd": "0.08",
+        "funded_usd": "0", "route": "DIRECT_GBP", "crypto_cost_quote": "10",
+        "crypto_quantity": "0.0002", "unit_price_quote": "50000",
+        "funding_fee_quote": "0", "crypto_fee_quote": "0.08",
     }
     event["canonical_hash"] = sha256(
         json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return {
-        "version": 2,
+        "version": 3,
         "delivery_id": delivery_id,
         "created_at": created_at,
         "symbol": symbol,
@@ -170,10 +171,9 @@ class DiscordBotControlTests(unittest.TestCase):
         self.analysis = analysis_state(self.rules)
 
     def test_only_three_production_usd_assets_are_accepted(self):
-        self.assertEqual(discord_bot._normalise_usd_key("bitcoin"), "BTC_USD")
+        self.assertEqual(discord_bot._normalise_usd_key("bitcoin"), "BTC_GBP")
         self.assertEqual(discord_bot._normalise_usd_key("HYPE/USD"), "HYPE_USD")
-        with self.assertRaisesRegex(ValueError, "Only BTC/USD"):
-            discord_bot._normalise_usd_key("BTC/GBP")
+        self.assertEqual(discord_bot._normalise_usd_key("BTC/GBP"), "BTC_GBP")
         with self.assertRaisesRegex(ValueError, "Supported assets"):
             discord_bot._normalise_usd_key("CAR")
 
@@ -232,7 +232,7 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             self.assertEqual(
                 discord_bot._symbols_from_dca_map(),
-                "BTC/USD, HYPE/USD, SOL/USD",
+                "BTC/GBP, HYPE/USD, SOL/GBP",
             )
 
     def test_amount_update_is_atomic_and_requires_disabled_target(self):
@@ -248,7 +248,7 @@ class DiscordBotControlTests(unittest.TestCase):
             "update_dca_config.yml",
             {
                 "action": "set_amounts",
-                "symbol": "BTC_USD",
+                "symbol": "BTC_GBP",
                 "low_amount_gbp_json": "10.0",
                 "up_amount_gbp_json": "20.0",
             },
@@ -256,7 +256,7 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("atomic budgets", message.replies[-1])
         self.assertIn("sideways midpoint £15", message.replies[-1])
 
-        enabled_rules = rules(enabled={"BTC_USD"})
+        enabled_rules = rules(enabled={"BTC_GBP"})
         blocked = MessageStub()
         with (
             patch.object(
@@ -363,7 +363,7 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("Decision age", reply)
         self.assertIn("Maximum aggregate daily exposure", reply)
         self.assertIn("Kraken's current market minimum", reply)
-        self.assertIn("!dca confirm enable BTC_USD", reply)
+        self.assertIn("!dca confirm enable BTC_GBP", reply)
 
     def test_enable_requires_nonzero_budgets_and_fresh_matching_decision(self):
         zero_rules = rules(low=0, up=0)
@@ -403,17 +403,17 @@ class DiscordBotControlTests(unittest.TestCase):
             dispatch.assert_not_called()
             asyncio.run(
                 discord_bot._handle_enable_confirmation(
-                    message, "!dca confirm enable BTC_USD"
+                    message, "!dca confirm enable BTC_GBP"
                 )
             )
         dispatch.assert_called_once_with(
             "update_dca_config.yml",
             {
                 "action": "set_enabled",
-                "symbol": "BTC_USD",
+                "symbol": "BTC_GBP",
                 "enabled_json": "true",
-                "expected_rules_hash": rules_hash("BTC_USD", self.rules["BTC_USD"]),
-                "expected_decision_id": "decision-btc_usd",
+                "expected_rules_hash": rules_hash("BTC_GBP", self.rules["BTC_GBP"]),
+                "expected_decision_id": "decision-btc_gbp",
                 "expected_global_rules_hash": discord_bot.global_rules_pre_state_hash(
                     self.rules
                 ),
@@ -424,7 +424,7 @@ class DiscordBotControlTests(unittest.TestCase):
 
     def test_enable_review_rejects_pending_order_for_any_asset(self):
         execution = {
-            "SOL_USD": {
+            "SOL_GBP": {
                 "LAST_BUY_DATE": "",
                 "PENDING_ORDER": {
                     "client_order_id": "dca-1234567890abcd",
@@ -448,11 +448,11 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             asyncio.run(discord_bot.handle_enable("BTC", message))
         dispatch.assert_not_called()
-        self.assertIn("reconciliation is pending for SOL_USD", message.replies[-1])
+        self.assertIn("reconciliation is pending for SOL_GBP", message.replies[-1])
 
     def test_enable_review_allows_pending_portfolio_ledger_delivery(self):
         execution = {
-            "SOL_USD": {
+            "SOL_GBP": {
                 "LAST_BUY_DATE": "2026-08-05",
                 "PENDING_GIST_DELIVERIES": [
                     gist_delivery("ORDER-SOL-1", symbol="SOL")
@@ -461,14 +461,14 @@ class DiscordBotControlTests(unittest.TestCase):
         }
 
         review = discord_bot._enable_review(
-            "BTC_USD",
+            "BTC_GBP",
             self.rules,
             self.analysis,
             execution,
             now=NOW,
         )
 
-        self.assertEqual(review["symbol"], "BTC_USD")
+        self.assertEqual(review["symbol"], "BTC_GBP")
 
     def test_confirmation_fails_if_live_decision_changes(self):
         message = MessageStub()
@@ -480,7 +480,7 @@ class DiscordBotControlTests(unittest.TestCase):
             asyncio.run(discord_bot.handle_enable("BTC", message))
 
         changed = deepcopy(self.analysis)
-        changed["TARGETS"]["BTC_USD"]["DECISION_ID"] = "different-decision"
+        changed["TARGETS"]["BTC_GBP"]["DECISION_ID"] = "different-decision"
         with (
             patch.object(
                 discord_bot,
@@ -492,7 +492,7 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             asyncio.run(
                 discord_bot._handle_enable_confirmation(
-                    message, "!dca confirm enable BTC_USD"
+                    message, "!dca confirm enable BTC_GBP"
                 )
             )
         dispatch.assert_not_called()
@@ -500,7 +500,7 @@ class DiscordBotControlTests(unittest.TestCase):
 
     def test_confirmation_rejects_global_rule_change_with_same_target_exposure(self):
         analysis = deepcopy(self.analysis)
-        analysis["TARGETS"]["SOL_USD"].update(
+        analysis["TARGETS"]["SOL_GBP"].update(
             {
                 "ANALYSIS_STATUS": "ERROR",
                 "EXECUTION_STATUS": "BLOCKED",
@@ -529,7 +529,7 @@ class DiscordBotControlTests(unittest.TestCase):
         # SOL remains disabled and its maximum budget remains £20, so aggregate
         # exposure and every BTC-bound field are unchanged. Only the global
         # canonical pre-state detects this concurrent edit.
-        changed_rules["SOL_USD"]["REGIME_AMOUNTS_GBP"]["LOW"] = 11
+        changed_rules["SOL_GBP"]["REGIME_AMOUNTS_GBP"]["LOW"] = 11
         with (
             patch.object(
                 discord_bot,
@@ -541,7 +541,7 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             asyncio.run(
                 discord_bot._handle_enable_confirmation(
-                    message, "!dca confirm enable BTC_USD"
+                    message, "!dca confirm enable BTC_GBP"
                 )
             )
         dispatch.assert_not_called()
@@ -554,7 +554,7 @@ class DiscordBotControlTests(unittest.TestCase):
             asyncio.run(discord_bot.handle_analyze({"symbol": "all"}, message))
         self.assertEqual(
             dispatch.call_args_list[0].args,
-            ("crypto_analysis.yml", {"symbol": "SOL/USD"}),
+            ("crypto_analysis.yml", {"symbol": "SOL/GBP"}),
         )
         self.assertEqual(
             dispatch.call_args_list[1].args,
@@ -571,7 +571,7 @@ class DiscordBotControlTests(unittest.TestCase):
             patch.object(discord_bot, "DCA_CRON_ENABLED", True),
         ):
             asyncio.run(discord_bot.handle_status({}, status_message))
-        self.assertIn("BTC_USD", status_message.replies[-1])
+        self.assertIn("BTC_GBP", status_message.replies[-1])
         self.assertIn("UPTREND/lower £10", status_message.replies[-1])
         self.assertIn("SIDEWAYS/midpoint £15", status_message.replies[-1])
         self.assertIn("DOWNTREND/higher £20", status_message.replies[-1])
@@ -593,7 +593,7 @@ class DiscordBotControlTests(unittest.TestCase):
 
     def test_status_and_health_separate_portfolio_delivery_from_kraken_recovery(self):
         execution = {
-            "BTC_USD": {
+            "BTC_GBP": {
                 "LAST_BUY_DATE": "2026-08-05",
                 "PENDING_GIST_DELIVERIES": [
                     gist_delivery(),
@@ -725,7 +725,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         discord_bot._schedule_start_date = None
 
     def test_v1_analysis_state_clears_schedule_and_fails_closed(self):
-        live_rules = rules(enabled={"BTC_USD", "HYPE_USD", "SOL_USD"})
+        live_rules = rules(enabled={"BTC_GBP", "HYPE_USD", "SOL_GBP"})
         decisions = analysis_state(live_rules)
         decisions["VERSION"] = 1
 
@@ -743,13 +743,13 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         self.assertIn("VERSION must be 3", discord_bot._schedule_error)
 
     def test_multiple_assets_can_share_or_use_different_absolute_times(self):
-        live_rules = rules(enabled={"BTC_USD", "HYPE_USD", "SOL_USD"})
+        live_rules = rules(enabled={"BTC_GBP", "HYPE_USD", "SOL_GBP"})
         decisions = analysis_state(
             live_rules,
             execute_offsets={
-                "BTC_USD": 30,
+                "BTC_GBP": 30,
                 "HYPE_USD": 30,
-                "SOL_USD": 45,
+                "SOL_GBP": 45,
             },
         )
         self.assertTrue(
@@ -759,19 +759,19 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(
             set(discord_bot._dca_schedule),
-            {"BTC_USD", "HYPE_USD", "SOL_USD"},
+            {"BTC_GBP", "HYPE_USD", "SOL_GBP"},
         )
         self.assertEqual(
-            discord_bot._dca_schedule["BTC_USD"]["execute_at"],
+            discord_bot._dca_schedule["BTC_GBP"]["execute_at"],
             discord_bot._dca_schedule["HYPE_USD"]["execute_at"],
         )
         self.assertNotEqual(
-            discord_bot._dca_schedule["BTC_USD"]["execute_at"],
-            discord_bot._dca_schedule["SOL_USD"]["execute_at"],
+            discord_bot._dca_schedule["BTC_GBP"]["execute_at"],
+            discord_bot._dca_schedule["SOL_GBP"]["execute_at"],
         )
 
     def test_scheduler_arms_without_warning_before_start_day_analysis(self):
-        live_rules = rules(enabled={"BTC_USD"})
+        live_rules = rules(enabled={"BTC_GBP"})
         decisions = analysis_state(live_rules)
 
         self.assertTrue(
@@ -787,9 +787,9 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         self.assertIsNone(discord_bot._schedule_warning)
 
     def test_missing_start_day_analysis_alerts_after_bounded_grace(self):
-        live_rules = rules(enabled={"BTC_USD"})
+        live_rules = rules(enabled={"BTC_GBP"})
         decisions = analysis_state(
-            live_rules, status_overrides={"BTC_USD": "ERROR"}
+            live_rules, status_overrides={"BTC_GBP": "ERROR"}
         )
         before_deadline = datetime(2026, 8, 5, 21, 19, tzinfo=timezone.utc)
         after_deadline = datetime(2026, 8, 5, 21, 20, tzinfo=timezone.utc)
@@ -814,10 +814,10 @@ class DiscordBotSchedulerTests(unittest.TestCase):
                 now=after_deadline,
             )
         )
-        self.assertIn("BTC_USD: analysis ERROR", discord_bot._schedule_warning)
+        self.assertIn("BTC_GBP: analysis ERROR", discord_bot._schedule_warning)
 
     def test_fresh_start_day_analysis_schedules_during_grace(self):
-        live_rules = rules(enabled={"BTC_USD"})
+        live_rules = rules(enabled={"BTC_GBP"})
         analysis_time = datetime(2026, 8, 5, 21, 1, tzinfo=timezone.utc)
         decisions = analysis_state(live_rules, generated_at=analysis_time)
 
@@ -830,7 +830,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
                 now=analysis_time,
             )
         )
-        self.assertEqual(set(discord_bot._dca_schedule), {"BTC_USD"})
+        self.assertEqual(set(discord_bot._dca_schedule), {"BTC_GBP"})
         self.assertIsNone(discord_bot._schedule_warning)
 
         with patch.object(discord_bot, "datetime", FrozenDateTime):
@@ -843,12 +843,12 @@ class DiscordBotSchedulerTests(unittest.TestCase):
                 FrozenDateTime.current = NOW
 
     def test_fresh_start_day_analysis_error_alerts_during_grace(self):
-        live_rules = rules(enabled={"BTC_USD"})
+        live_rules = rules(enabled={"BTC_GBP"})
         analysis_time = datetime(2026, 8, 5, 21, 1, tzinfo=timezone.utc)
         decisions = analysis_state(
             live_rules,
             generated_at=analysis_time,
-            status_overrides={"BTC_USD": "ERROR"},
+            status_overrides={"BTC_GBP": "ERROR"},
         )
 
         self.assertTrue(
@@ -860,13 +860,13 @@ class DiscordBotSchedulerTests(unittest.TestCase):
                 now=analysis_time,
             )
         )
-        self.assertIn("BTC_USD: analysis ERROR", discord_bot._schedule_warning)
+        self.assertIn("BTC_GBP: analysis ERROR", discord_bot._schedule_warning)
         self.assertEqual(discord_bot._awaiting_start_day_symbols, set())
 
     def test_disabled_asset_rules_mismatch_does_not_block_enabled_asset(self):
         live_rules = rules(enabled={"HYPE_USD"})
         decisions = analysis_state(live_rules)
-        live_rules["BTC_USD"]["REGIME_AMOUNTS_GBP"] = {"LOW": 11, "UP": 21}
+        live_rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 11, "UP": 21}
 
         self.assertTrue(
             discord_bot.refresh_dca_schedule(
@@ -876,9 +876,9 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         self.assertEqual(set(discord_bot._dca_schedule), {"HYPE_USD"})
 
     def test_enabled_pair_error_blocks_all_new_order_schedules(self):
-        live_rules = rules(enabled={"BTC_USD", "HYPE_USD"})
+        live_rules = rules(enabled={"BTC_GBP", "HYPE_USD"})
         decisions = analysis_state(
-            live_rules, status_overrides={"BTC_USD": "ERROR"}
+            live_rules, status_overrides={"BTC_GBP": "ERROR"}
         )
 
         self.assertTrue(
@@ -888,10 +888,10 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(discord_bot._dca_schedule, {})
         self.assertIn("global all-three Kraken history gate", discord_bot._schedule_warning)
-        self.assertIn("BTC_USD: analysis ERROR", discord_bot._schedule_warning)
+        self.assertIn("BTC_GBP: analysis ERROR", discord_bot._schedule_warning)
 
     def test_due_assets_use_inclusive_minus_five_plus_sixty_window(self):
-        live_rules = rules(enabled={"BTC_USD", "HYPE_USD"})
+        live_rules = rules(enabled={"BTC_GBP", "HYPE_USD"})
         decisions = analysis_state(
             live_rules,
             execute_offsets={symbol: 30 for symbol in ALLOWED_TARGETS},
@@ -901,7 +901,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(
             discord_bot._due_symbols_for_dispatch(NOW + timedelta(minutes=25)),
-            ["BTC_USD", "HYPE_USD"],
+            ["BTC_GBP", "HYPE_USD"],
         )
         self.assertEqual(
             discord_bot._due_symbols_for_dispatch(NOW + timedelta(minutes=91)), []
@@ -912,9 +912,9 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         self.assertEqual(discord_bot._dca_schedule, {})
         self.assertIsNotNone(discord_bot._schedule_error)
 
-        live_rules = rules(enabled={"BTC_USD"})
+        live_rules = rules(enabled={"BTC_GBP"})
         decisions = analysis_state(
-            live_rules, status_overrides={"BTC_USD": "ERROR"}
+            live_rules, status_overrides={"BTC_GBP": "ERROR"}
         )
         self.assertTrue(
             discord_bot.refresh_dca_schedule(
@@ -934,7 +934,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         self.assertIn("stale analysis date", discord_bot._schedule_warning)
 
     def test_start_date_blocks_new_dispatches_until_local_date(self):
-        live_rules = rules(enabled={"BTC_USD"})
+        live_rules = rules(enabled={"BTC_GBP"})
         decisions = analysis_state(
             live_rules,
             execute_offsets={symbol: 30 for symbol in ALLOWED_TARGETS},
@@ -954,7 +954,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         self.assertEqual(discord_bot._schedule_start_date.isoformat(), "2026-08-06")
 
     def test_invalid_start_date_fails_closed(self):
-        live_rules = rules(enabled={"BTC_USD"})
+        live_rules = rules(enabled={"BTC_GBP"})
         decisions = analysis_state(live_rules)
         self.assertFalse(
             discord_bot.refresh_dca_schedule(
@@ -971,7 +971,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         live_rules = rules()
         decisions = analysis_state(live_rules)
         execution = {
-            "SOL_USD": {
+            "SOL_GBP": {
                 "LAST_BUY_DATE": "",
                 "PENDING_ORDER": {
                     "decision_id": "decision-sol_usd",
@@ -989,13 +989,13 @@ class DiscordBotSchedulerTests(unittest.TestCase):
             json.dumps(execution),
             now=NOW,
         )
-        self.assertEqual(discord_bot._due_symbols_for_dispatch(NOW), ["SOL_USD"])
+        self.assertEqual(discord_bot._due_symbols_for_dispatch(NOW), ["SOL_GBP"])
 
     def test_pending_gist_delivery_dispatches_without_kraken_recovery(self):
         live_rules = rules()
         decisions = analysis_state(live_rules)
         execution = {
-            "SOL_USD": {
+            "SOL_GBP": {
                 "LAST_BUY_DATE": "2026-08-05",
                 "PENDING_GIST_DELIVERIES": [
                     gist_delivery("ORDER-SOL-1", symbol="SOL")
@@ -1013,14 +1013,14 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         )
 
         self.assertEqual(discord_bot._pending_recovery_symbols, set())
-        self.assertEqual(discord_bot._pending_gist_delivery_symbols, {"SOL_USD"})
-        self.assertEqual(discord_bot._due_symbols_for_dispatch(NOW), ["SOL_USD"])
+        self.assertEqual(discord_bot._pending_gist_delivery_symbols, {"SOL_GBP"})
+        self.assertEqual(discord_bot._due_symbols_for_dispatch(NOW), ["SOL_GBP"])
 
     def test_pending_gist_delivery_does_not_block_new_order_schedule(self):
-        live_rules = rules(enabled={"BTC_USD"})
+        live_rules = rules(enabled={"BTC_GBP"})
         decisions = analysis_state(live_rules)
         execution = {
-            "SOL_USD": {
+            "SOL_GBP": {
                 "LAST_BUY_DATE": "2026-08-05",
                 "PENDING_GIST_DELIVERIES": [
                     gist_delivery("ORDER-SOL-1", symbol="SOL")
@@ -1037,13 +1037,13 @@ class DiscordBotSchedulerTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(set(discord_bot._dca_schedule), {"BTC_USD"})
+        self.assertEqual(set(discord_bot._dca_schedule), {"BTC_GBP"})
         self.assertIsNone(discord_bot._schedule_warning)
 
     def test_pending_gist_delivery_survives_invalid_analysis_and_dispatches(self):
         live_rules = rules()
         execution = {
-            "BTC_USD": {
+            "BTC_GBP": {
                 "LAST_BUY_DATE": "2026-08-05",
                 "PENDING_GIST_DELIVERIES": [gist_delivery()],
             }
@@ -1054,7 +1054,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
             )
         )
         self.assertEqual(discord_bot._pending_recovery_symbols, set())
-        self.assertEqual(discord_bot._pending_gist_delivery_symbols, {"BTC_USD"})
+        self.assertEqual(discord_bot._pending_gist_delivery_symbols, {"BTC_GBP"})
         with patch.object(discord_bot, "DCA_CRON_ENABLED", True):
             self.assertIn(
                 "portfolio ledger delivery", discord_bot._format_cron_status()
@@ -1068,14 +1068,14 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         ):
             asyncio.run(discord_bot.dca_scheduler_tick.coro())
         dispatch.assert_called_once_with(
-            "daily_dca.yml", {"symbols_json": '["BTC_USD"]'}
+            "daily_dca.yml", {"symbols_json": '["BTC_GBP"]'}
         )
 
     def test_pending_gist_delivery_uses_thirty_minute_dispatch_guard(self):
         live_rules = rules()
         decisions = analysis_state(live_rules)
         execution = {
-            "BTC_USD": {
+            "BTC_GBP": {
                 "LAST_BUY_DATE": "2026-08-05",
                 "PENDING_GIST_DELIVERIES": [gist_delivery()],
             }
@@ -1103,13 +1103,13 @@ class DiscordBotSchedulerTests(unittest.TestCase):
 
         self.assertEqual(dispatch.call_count, 2)
         dispatch.assert_called_with(
-            "daily_dca.yml", {"symbols_json": '["BTC_USD"]'}
+            "daily_dca.yml", {"symbols_json": '["BTC_GBP"]'}
         )
 
     def test_pending_recovery_survives_invalid_analysis_state(self):
         live_rules = rules()
         execution = {
-            "BTC_USD": {
+            "BTC_GBP": {
                 "LAST_BUY_DATE": "",
                 "PENDING_ORDER": {
                     "decision_id": "decision-btc_usd",
@@ -1126,7 +1126,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
                 json.dumps(live_rules), "{}", json.dumps(execution), now=NOW
             )
         )
-        self.assertEqual(discord_bot._pending_recovery_symbols, {"BTC_USD"})
+        self.assertEqual(discord_bot._pending_recovery_symbols, {"BTC_GBP"})
 
         FrozenDateTime.current = NOW
         with (
@@ -1136,7 +1136,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         ):
             asyncio.run(discord_bot.dca_scheduler_tick.coro())
         dispatch.assert_called_once_with(
-            "daily_dca.yml", {"symbols_json": '["BTC_USD"]'}
+            "daily_dca.yml", {"symbols_json": '["BTC_GBP"]'}
         )
 
     def test_scheduler_dispatches_only_due_symbols_and_sets_guard(self):
@@ -1144,13 +1144,13 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         FrozenDateTime.current = now
         discord_bot._dca_schedule.update(
             {
-                "BTC_USD": {
+                "BTC_GBP": {
                     "execute_at": now.isoformat(),
                     "valid_until": (now + timedelta(minutes=60)).isoformat(),
                     "decision_id": "btc-decision",
                     "last_buy_date": "",
                 },
-                "SOL_USD": {
+                "SOL_GBP": {
                     "execute_at": (now + timedelta(hours=2)).isoformat(),
                     "valid_until": (now + timedelta(hours=3)).isoformat(),
                     "decision_id": "sol-decision",
@@ -1165,9 +1165,9 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         ):
             asyncio.run(discord_bot.dca_scheduler_tick.coro())
         dispatch.assert_called_once_with(
-            "daily_dca.yml", {"symbols_json": '["BTC_USD"]'}
+            "daily_dca.yml", {"symbols_json": '["BTC_GBP"]'}
         )
-        self.assertIn(("BTC_USD", "btc-decision"), discord_bot._dca_dispatch_guard)
+        self.assertIn(("BTC_GBP", "btc-decision"), discord_bot._dca_dispatch_guard)
 
 
 class DiscordBotWorkflowAndGeminiTests(unittest.TestCase):

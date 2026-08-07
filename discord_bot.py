@@ -59,7 +59,7 @@ CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
 ALLOWED_USERS = os.environ.get("DISCORD_ALLOWED_USERS", "")
 DCA_CRON_ENABLED = os.environ.get("DCA_CRON_ENABLED", "false").lower() == "true"
 DCA_TRADING_MODE = os.environ.get("DCA_TRADING_MODE", "shadow").strip().lower()
-DCA_CANARY_SYMBOL = os.environ.get("DCA_CANARY_SYMBOL", "SOL_USD").strip().upper()
+DCA_CANARY_SYMBOL = os.environ.get("DCA_CANARY_SYMBOL", "SOL_GBP").strip().upper()
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 
 RULES_VARIABLE = "DCA_TARGET_MAP"
@@ -153,16 +153,14 @@ def _normalise_usd_key(value: str) -> str:
     raw = value.strip()
     lowered = raw.lower()
     raw = _FULL_NAMES.get(lowered, raw).upper().replace("/", "_")
-    parts = raw.split("_")
-    if len(parts) == 2 and parts[1] != "USD":
-        raise ValueError("Only BTC/USD, HYPE/USD, and SOL/USD are supported")
-    if len(parts) > 2:
-        raise ValueError("Only BTC/USD, HYPE/USD, and SOL/USD are supported")
-    symbol = parts[0]
-    key = f"{symbol}_USD"
+    aliases = {
+        "BTC": "BTC_GBP", "BTC_GBP": "BTC_GBP",
+        "HYPE": "HYPE_USD", "HYPE_USD": "HYPE_USD",
+        "SOL": "SOL_GBP", "SOL_GBP": "SOL_GBP",
+    }
+    key = aliases.get(raw)
     if key not in ALLOWED_TARGETS:
-        available = ", ".join(target.removesuffix("_USD") for target in ALLOWED_TARGETS)
-        raise ValueError(f"Supported assets are {available}")
+        raise ValueError("Supported assets are BTC/GBP, HYPE/USD, SOL/GBP")
     return key
 
 
@@ -731,7 +729,7 @@ async def handle_analyze(params: dict[str, Any], message: discord.Message) -> No
     raw_symbol = str(params.get("symbol") or params.get("symbols") or "all").strip()
     if raw_symbol.lower() == "all":
         workflow_symbol = "all"
-        label = "all three Kraken USD targets"
+        label = "all three Kraken DCA targets"
     else:
         try:
             workflow_symbol = _to_usd_pair(raw_symbol)
@@ -825,7 +823,7 @@ def _pending_gist_delivery_count(execution: Mapping[str, Any]) -> int:
 
 
 def get_ghostfolio_delivery_health() -> dict[str, Any]:
-    """Compare durable PortfolioEventV2 rows with local sync receipts."""
+    """Compare durable portfolio events with local sync receipts."""
     if not GIST_ID or not GIST_TOKEN:
         return {"status": "UNAVAILABLE", "pending": None, "completed": None}
     response = requests.get(
@@ -1061,7 +1059,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     )
     lines = [
         f"**DCA health: {posture}**",
-        f"- Rules: valid ({len(rules)}/3 USD targets; GBP budgets)",
+        f"- Rules: valid ({len(rules)}/3 mixed targets; GBP budgets)",
         (
             "- Analysis: awaiting 04:07 start-day analysis"
             if awaiting_start_analysis

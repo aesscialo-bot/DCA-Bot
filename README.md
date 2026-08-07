@@ -6,11 +6,11 @@
 > JSON ownership rules, pair-change procedure, and troubleshooting steps.
 
 This repository is the production source for a fail-closed Kraken spot DCA
-service. It tracks and buys exactly these USD markets:
+service. It tracks and buys exactly these markets:
 
-- `BTC/USD`
+- `BTC/GBP` (spends GBP directly)
 - `HYPE/USD`
-- `SOL/USD`
+- `SOL/GBP` (spends GBP directly)
 
 Budgets remain denominated in GBP. At execution time the bot first sells the
 selected GBP budget on Kraken's `GBP/USD` market, then spends the confirmed net
@@ -41,7 +41,7 @@ The requested enabled rules are:
 
 ```json
 {
-  "BTC_USD": {
+  "BTC_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 20},
     "BUY_ENABLED": true
   },
@@ -49,7 +49,7 @@ The requested enabled rules are:
     "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 15},
     "BUY_ENABLED": true
   },
-  "SOL_USD": {
+  "SOL_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 5, "UP": 15},
     "BUY_ENABLED": true
   }
@@ -126,7 +126,7 @@ History is built exclusively from Kraken's first-party PostTrade API into
 append-only monthly Gist partitions. The resumable bootstrap checkpoints every
 page, globally rate-limits requests, records explicit no-trade gaps and partition
 hashes, and verifies the overlapping recent 7.5 days against Kraken OHLC. No new
-order is permitted unless BTC/USD, HYPE/USD, and SOL/USD all have current,
+order is permitted unless BTC/GBP, HYPE/USD, and SOL/GBP all have current,
 verified history and decisions.
 
 If analysis finishes after its selected time, the explicit legacy catch-up time
@@ -186,7 +186,7 @@ Required repository variables:
 - `DCA_START_DATE` (`2026-08-07` for this rollout)
 - `TIMEZONE` (`Asia/Bangkok`)
 - `DCA_TRADING_MODE` (`shadow`, `canary`, or `live`; default `shadow`)
-- `DCA_CANARY_SYMBOL` (`SOL_USD`)
+- `DCA_CANARY_SYMBOL` (`SOL_GBP`)
 - `DCA_HISTORY_GIST_ID` (dedicated private history Gist)
 
 `DCA_CRON_ENABLED` is a Railway runtime variable, not a GitHub repository
@@ -205,7 +205,7 @@ Required Railway runtime variables:
 - `DCA_CRON_ENABLED` (`true` for normal operation)
 - `TIMEZONE` (`Asia/Bangkok`, matching the GitHub repository variable)
 - `DCA_TRADING_MODE` (must match the repository variable)
-- `DCA_CANARY_SYMBOL` (`SOL_USD`)
+- `DCA_CANARY_SYMBOL` (`SOL_GBP`)
 - `GIST_ID` and `GIST_TOKEN` for receipt-aware status
 
 Railway may also contain `GEMINI_API_KEY` for optional read-only conversational
@@ -237,13 +237,13 @@ must never print a complete rules, analysis, or execution-state document.
 
 ## Discord controls
 
-Examples use canonical USD targets:
+Examples use the canonical mixed-market targets:
 
 ```text
 !dca set BTC amounts to 10 low and 20 high
 !dca disable BTC
 !dca enable BTC
-!dca confirm enable BTC_USD
+!dca confirm enable BTC_GBP
 !dca analyze BTC
 !dca analyze all
 show status
@@ -262,7 +262,7 @@ maximum daily exposure.
 | `crypto_analysis.yml` | 04:07 and 04:37 Bangkok or manual | Refresh strict Kraken history and build idempotent deterministic decisions. |
 | `kraken_history_bootstrap.yml` | Manual | Resume the 65-day PostTrade history bootstrap and publish verified partitions. |
 | `daily_dca.yml` | Minutes 02/17/32/47 plus Railway | Revalidate the global history gate and execute due two-leg purchases exactly once. |
-| `portfolio_check.yml` | Monthly or manual | Read-only Kraken holdings and USD-market history, valued in GBP with live Kraken GBP/USD. |
+| `portfolio_check.yml` | Monthly or manual | Read-only Kraken holdings and mixed-market history, valued in GBP with live Kraken GBP/USD where required. |
 | `update_dca_config.yml` | Manual/Discord dispatch | Serialize atomic GBP budget and enable-state updates. |
 | `ci.yml` | Pull request and `main` | Compile, test, validate workflows, and build the Railway image. |
 

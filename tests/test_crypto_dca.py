@@ -67,7 +67,7 @@ def analysis_for(rules, decisions):
     return state
 
 
-def pending_intent(target="BTC_USD", *, amount=20, trade_date="2026-08-05"):
+def pending_intent(target="BTC_GBP", *, amount=20, trade_date="2026-08-05"):
     return {
         "client_order_id": "dca-1234567890abcd",
         "funding_client_order_id": "dca-fedcba09876543",
@@ -79,7 +79,7 @@ def pending_intent(target="BTC_USD", *, amount=20, trade_date="2026-08-05"):
 
 
 def pending_gist_delivery(
-    target="BTC_USD", *, delivery_id="kraken-order-id", quantity="0.00040000"
+    target="BTC_GBP", *, delivery_id="kraken-order-id", quantity="0.00040000"
 ):
     symbol = target.split("_", maxsplit=1)[0]
     row = (
@@ -89,14 +89,14 @@ def pending_gist_delivery(
         "optional/not saved |\n"
     )
     event = {
-        "event_version": 2, "event_id": delivery_id,
+        "event_version": 3, "event_id": delivery_id,
         "occurred_at": "2026-08-05T05:00:00Z", "target": target,
-        "base_currency": symbol, "quote_currency": "USD", "budget_currency": "GBP",
-        "funding_order_id": "kraken-funding-order-id", "crypto_order_id": delivery_id,
-        "gbp_debit": "20", "gbp_usd_rate": "1.275", "funded_usd": "25.5",
-        "crypto_cost_usd": "25.43", "crypto_quantity": quantity,
-        "unit_price_usd": "63431.25", "funding_fee_usd": "0.02",
-        "crypto_fee_usd": "0.04",
+        "base_currency": symbol, "quote_currency": "GBP", "budget_currency": "GBP",
+        "funding_order_id": None, "crypto_order_id": delivery_id,
+        "gbp_debit": "20", "gbp_usd_rate": "0", "funded_usd": "0",
+        "route": "DIRECT_GBP", "crypto_cost_quote": "20",
+        "crypto_quantity": quantity, "unit_price_quote": "50000",
+        "funding_fee_quote": "0", "crypto_fee_quote": "0.04",
     }
     event["canonical_hash"] = hashlib.sha256(
         json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
@@ -104,7 +104,7 @@ def pending_gist_delivery(
     event_hash = hashlib.sha256(
         json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    return {"version": 2, "delivery_id": delivery_id,
+    return {"version": 3, "delivery_id": delivery_id,
             "created_at": "2026-08-05T05:00:00Z", "symbol": symbol,
             "row": row, "row_sha256": hashlib.sha256(row.encode()).hexdigest(),
             "event": event, "event_sha256": event_hash}
@@ -112,10 +112,10 @@ def pending_gist_delivery(
 
 class DcaConfigurationTests(unittest.TestCase):
     def test_reads_final_rule_and_separate_execution_state(self):
-        rules = rules_with("BTC_USD")
-        state = {"BTC_USD": {"LAST_BUY_DATE": "2026-08-04"}}
+        rules = rules_with("BTC_GBP")
+        state = {"BTC_GBP": {"LAST_BUY_DATE": "2026-08-04"}}
 
-        config = crypto_dca.get_config_for_symbol("BTC_USD", rules, state)
+        config = crypto_dca.get_config_for_symbol("BTC_GBP", rules, state)
 
         self.assertEqual(config["REGIME_AMOUNTS_GBP"], {"LOW": 10, "UP": 20})
         self.assertEqual(config["LAST_BUY_DATE"], "2026-08-04")
@@ -131,18 +131,18 @@ class DcaConfigurationTests(unittest.TestCase):
             },
         ):
             with self.subTest(legacy=legacy), self.assertRaises(ValueError):
-                crypto_dca.get_config_for_symbol("BTC_USD", {"BTC_USD": legacy})
+                crypto_dca.get_config_for_symbol("BTC_GBP", {"BTC_GBP": legacy})
 
     def test_pending_intent_requires_originating_decision_id(self):
         pending = pending_intent()
         pending.pop("decision_id")
         with self.assertRaisesRegex(ValueError, "decision_id"):
-            crypto_dca._normalise_pending_order(pending, "BTC_USD")
+            crypto_dca._normalise_pending_order(pending, "BTC_GBP")
 
     def test_optional_symbol_filter_is_strict_and_deduplicated(self):
         self.assertEqual(
-            crypto_dca._parse_symbol_filter('["BTC/USD", "BTC_USD", "HYPE_USD"]'),
-            ("BTC_USD", "HYPE_USD"),
+            crypto_dca._parse_symbol_filter('["BTC/GBP", "BTC_GBP", "HYPE_USD"]'),
+            ("BTC_GBP", "HYPE_USD"),
         )
         self.assertEqual(crypto_dca._parse_symbol_filter("[]"), ())
         with self.assertRaisesRegex(ValueError, "Unsupported"):
@@ -153,12 +153,12 @@ class DcaConfigurationTests(unittest.TestCase):
         pending["funding_client_order_id"] = pending["client_order_id"]
 
         with self.assertRaisesRegex(ValueError, "funding client order ID"):
-            crypto_dca._normalise_pending_order(pending, "BTC_USD")
+            crypto_dca._normalise_pending_order(pending, "BTC_GBP")
 
 
 class DecisionGateTests(unittest.TestCase):
     def test_global_history_gate_requires_all_three_current_ready_decisions(self):
-        rules = rules_with("BTC_USD", "HYPE_USD", "SOL_USD")
+        rules = rules_with("BTC_GBP", "HYPE_USD", "SOL_GBP")
         decisions = {
             target: ready_decision(target, rules[target])
             for target in crypto_dca.ALLOWED_TARGETS
@@ -175,31 +175,31 @@ class DecisionGateTests(unittest.TestCase):
         self.assertIn("HYPE_USD history is ERROR", reason)
 
     def test_shadow_and_canary_modes_block_unapproved_new_orders(self):
-        rules = rules_with("BTC_USD", "SOL_USD")
-        btc = ready_decision("BTC_USD", rules["BTC_USD"])
-        sol = ready_decision("SOL_USD", rules["SOL_USD"])
+        rules = rules_with("BTC_GBP", "SOL_GBP")
+        btc = ready_decision("BTC_GBP", rules["BTC_GBP"])
+        sol = ready_decision("SOL_GBP", rules["SOL_GBP"])
         with patch.object(crypto_dca, "DCA_TRADING_MODE", "shadow"):
             self.assertEqual(
-                crypto_dca._decision_gate("BTC_USD", rules["BTC_USD"], btc, NOW)[0],
+                crypto_dca._decision_gate("BTC_GBP", rules["BTC_GBP"], btc, NOW)[0],
                 "SHADOW",
             )
         with (
             patch.object(crypto_dca, "DCA_TRADING_MODE", "canary"),
-            patch.object(crypto_dca, "DCA_CANARY_SYMBOL", "SOL_USD"),
+            patch.object(crypto_dca, "DCA_CANARY_SYMBOL", "SOL_GBP"),
         ):
             self.assertEqual(
-                crypto_dca._decision_gate("BTC_USD", rules["BTC_USD"], btc, NOW)[0],
+                crypto_dca._decision_gate("BTC_GBP", rules["BTC_GBP"], btc, NOW)[0],
                 "SHADOW",
             )
             self.assertEqual(
-                crypto_dca._decision_gate("SOL_USD", rules["SOL_USD"], sol, NOW)[0],
+                crypto_dca._decision_gate("SOL_GBP", rules["SOL_GBP"], sol, NOW)[0],
                 "READY",
             )
 
     def test_start_date_requires_same_local_day_analysis(self):
-        rules = rules_with("BTC_USD", low=10, up=20)
+        rules = rules_with("BTC_GBP", low=10, up=20)
         execute_at = datetime(2026, 8, 6, 21, 30, tzinfo=timezone.utc)
-        decision = ready_decision("BTC_USD", rules["BTC_USD"])
+        decision = ready_decision("BTC_GBP", rules["BTC_GBP"])
         decision["EXECUTE_AT"] = execute_at.isoformat().replace("+00:00", "Z")
         decision["VALID_UNTIL"] = (
             execute_at + timedelta(minutes=60)
@@ -207,7 +207,7 @@ class DecisionGateTests(unittest.TestCase):
 
         with patch.object(crypto_dca, "DCA_START_DATE", "2026-08-07"):
             status, reason, _amount = crypto_dca._decision_gate(
-                "BTC_USD", rules["BTC_USD"], decision, execute_at
+                "BTC_GBP", rules["BTC_GBP"], decision, execute_at
             )
             self.assertEqual(status, "ERROR")
             self.assertIn("current Bangkok date", reason)
@@ -216,37 +216,37 @@ class DecisionGateTests(unittest.TestCase):
             decision["ANALYSIS_DATE"] = "2026-08-07"
             decision["SELECTED_AT"] = decision["EXECUTE_AT"]
             status, _reason, amount = crypto_dca._decision_gate(
-                "BTC_USD", rules["BTC_USD"], decision, execute_at
+                "BTC_GBP", rules["BTC_GBP"], decision, execute_at
             )
             self.assertEqual((status, amount), ("READY", 10.0))
 
     def test_uptrend_uses_lower_budget(self):
-        rules = rules_with("BTC_USD", low=10, up=20)
-        decision = ready_decision("BTC_USD", rules["BTC_USD"])
+        rules = rules_with("BTC_GBP", low=10, up=20)
+        decision = ready_decision("BTC_GBP", rules["BTC_GBP"])
 
         status, _reason, amount = crypto_dca._decision_gate(
-            "BTC_USD", rules["BTC_USD"], decision, NOW
+            "BTC_GBP", rules["BTC_GBP"], decision, NOW
         )
 
         self.assertEqual((status, amount), ("READY", 10.0))
 
     def test_sideways_uses_midpoint_and_downtrend_uses_higher_budget(self):
-        rules = rules_with("BTC_USD", low=10, up=20)
+        rules = rules_with("BTC_GBP", low=10, up=20)
         expected = {"SIDEWAYS": 15.0, "DOWNTREND": 20.0}
         for regime, expected_amount in expected.items():
             decision = ready_decision(
-                "BTC_USD", rules["BTC_USD"], regime=regime
+                "BTC_GBP", rules["BTC_GBP"], regime=regime
             )
             with self.subTest(regime=regime):
                 status, _reason, amount = crypto_dca._decision_gate(
-                    "BTC_USD", rules["BTC_USD"], decision, NOW
+                    "BTC_GBP", rules["BTC_GBP"], decision, NOW
                 )
                 self.assertEqual((status, amount), ("READY", expected_amount))
 
     def test_window_is_five_minutes_early_through_sixty_minutes_late(self):
-        rules = rules_with("BTC_USD")
+        rules = rules_with("BTC_GBP")
         decision = ready_decision(
-            "BTC_USD", rules["BTC_USD"], now=NOW, offset=30
+            "BTC_GBP", rules["BTC_GBP"], now=NOW, offset=30
         )
         before = NOW + timedelta(minutes=24, seconds=59)
         opens = NOW + timedelta(minutes=25)
@@ -255,44 +255,44 @@ class DecisionGateTests(unittest.TestCase):
 
         self.assertEqual(
             crypto_dca._decision_gate(
-                "BTC_USD", rules["BTC_USD"], decision, before
+                "BTC_GBP", rules["BTC_GBP"], decision, before
             )[0],
             "NOT_DUE",
         )
         self.assertEqual(
             crypto_dca._decision_gate(
-                "BTC_USD", rules["BTC_USD"], decision, opens
+                "BTC_GBP", rules["BTC_GBP"], decision, opens
             )[0],
             "READY",
         )
         self.assertEqual(
             crypto_dca._decision_gate(
-                "BTC_USD", rules["BTC_USD"], decision, closes
+                "BTC_GBP", rules["BTC_GBP"], decision, closes
             )[0],
             "READY",
         )
         self.assertEqual(
             crypto_dca._decision_gate(
-                "BTC_USD", rules["BTC_USD"], decision, after
+                "BTC_GBP", rules["BTC_GBP"], decision, after
             )[0],
             "MISSED",
         )
 
     def test_error_and_rules_hash_mismatch_fail_closed(self):
-        rules = rules_with("BTC_USD")
-        error_decision = empty_analysis_state(rules, now=NOW)["TARGETS"]["BTC_USD"]
+        rules = rules_with("BTC_GBP")
+        error_decision = empty_analysis_state(rules, now=NOW)["TARGETS"]["BTC_GBP"]
         self.assertEqual(
             crypto_dca._decision_gate(
-                "BTC_USD", rules["BTC_USD"], error_decision, NOW
+                "BTC_GBP", rules["BTC_GBP"], error_decision, NOW
             )[0],
             "ERROR",
         )
 
-        decision = ready_decision("BTC_USD", rules["BTC_USD"])
+        decision = ready_decision("BTC_GBP", rules["BTC_GBP"])
         decision["RULES_HASH"] = "0" * 64
         self.assertEqual(
             crypto_dca._decision_gate(
-                "BTC_USD", rules["BTC_USD"], decision, NOW
+                "BTC_GBP", rules["BTC_GBP"], decision, NOW
             )[0],
             "ERROR",
         )
@@ -308,7 +308,7 @@ class DurableIntentTests(unittest.TestCase):
             patch.object(crypto_dca, "_utc_now", return_value=NOW),
         ):
             intent, existed = crypto_dca.prepare_order_intent(
-                "BTC_USD",
+                "BTC_GBP",
                 "dca-1234567890abcd",
                 "dca-fedcba09876543",
                 "2026-08-05",
@@ -322,11 +322,11 @@ class DurableIntentTests(unittest.TestCase):
         self.assertEqual(intent["funding_client_order_id"], "dca-fedcba09876543")
         written = write.call_args.args[1]
         self.assertEqual(
-            written["BTC_USD"]["PENDING_ORDER"]["decision_id"], "decision-btc"
+            written["BTC_GBP"]["PENDING_ORDER"]["decision_id"], "decision-btc"
         )
 
     def test_prepare_rejects_same_day_duplicate_without_writing(self):
-        state = {"BTC_USD": {"LAST_BUY_DATE": "2026-08-05"}}
+        state = {"BTC_GBP": {"LAST_BUY_DATE": "2026-08-05"}}
         with (
             patch.object(
                 crypto_dca, "_fetch_repo_json_variable", return_value=(state, True)
@@ -335,7 +335,7 @@ class DurableIntentTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "already marked"),
         ):
             crypto_dca.prepare_order_intent(
-                "BTC_USD",
+                "BTC_GBP",
                 "dca-1234567890abcd",
                 "dca-fedcba09876543",
                 "2026-08-05",
@@ -348,7 +348,7 @@ class DurableIntentTests(unittest.TestCase):
         intent = pending_intent()
         delivery = pending_gist_delivery()
         state = {
-            "BTC_USD": {"LAST_BUY_DATE": "", "PENDING_ORDER": intent},
+            "BTC_GBP": {"LAST_BUY_DATE": "", "PENDING_ORDER": intent},
             "HYPE_USD": {"LAST_BUY_DATE": "2026-08-04"},
         }
         with (
@@ -358,7 +358,7 @@ class DurableIntentTests(unittest.TestCase):
             patch.object(crypto_dca, "_write_repo_json_variable") as write,
         ):
             crypto_dca.complete_order_intent(
-                "BTC_USD",
+                "BTC_GBP",
                 intent["client_order_id"],
                 intent["trade_date"],
                 intent["decision_id"],
@@ -366,18 +366,18 @@ class DurableIntentTests(unittest.TestCase):
             )
 
         written = write.call_args.args[1]
-        self.assertEqual(written["BTC_USD"]["LAST_BUY_DATE"], "2026-08-05")
+        self.assertEqual(written["BTC_GBP"]["LAST_BUY_DATE"], "2026-08-05")
         self.assertEqual(
-            written["BTC_USD"]["PENDING_GIST_DELIVERIES"], [delivery]
+            written["BTC_GBP"]["PENDING_GIST_DELIVERIES"], [delivery]
         )
-        self.assertNotIn("PENDING_ORDER", written["BTC_USD"])
+        self.assertNotIn("PENDING_ORDER", written["BTC_GBP"])
         self.assertEqual(written["HYPE_USD"], {"LAST_BUY_DATE": "2026-08-04"})
 
     def test_completion_atomically_enqueues_confirmed_fill_delivery(self):
         intent = pending_intent()
         delivery = pending_gist_delivery()
         state = {
-            "BTC_USD": {"LAST_BUY_DATE": "", "PENDING_ORDER": intent},
+            "BTC_GBP": {"LAST_BUY_DATE": "", "PENDING_ORDER": intent},
         }
         with (
             patch.object(
@@ -386,7 +386,7 @@ class DurableIntentTests(unittest.TestCase):
             patch.object(crypto_dca, "_write_repo_json_variable") as write,
         ):
             crypto_dca.complete_order_intent(
-                "BTC_USD",
+                "BTC_GBP",
                 intent["client_order_id"],
                 intent["trade_date"],
                 intent["decision_id"],
@@ -394,17 +394,17 @@ class DurableIntentTests(unittest.TestCase):
             )
 
         written = write.call_args.args[1]
-        self.assertEqual(written["BTC_USD"]["LAST_BUY_DATE"], "2026-08-05")
-        self.assertNotIn("PENDING_ORDER", written["BTC_USD"])
+        self.assertEqual(written["BTC_GBP"]["LAST_BUY_DATE"], "2026-08-05")
+        self.assertNotIn("PENDING_ORDER", written["BTC_GBP"])
         self.assertEqual(
-            written["BTC_USD"]["PENDING_GIST_DELIVERIES"], [delivery]
+            written["BTC_GBP"]["PENDING_GIST_DELIVERIES"], [delivery]
         )
 
     def test_completion_requires_durable_delivery_evidence(self):
         intent = pending_intent()
         with self.assertRaisesRegex(TypeError, "gist_delivery"):
             crypto_dca.complete_order_intent(
-                "BTC_USD",
+                "BTC_GBP",
                 intent["client_order_id"],
                 intent["trade_date"],
                 intent["decision_id"],
@@ -414,11 +414,11 @@ class DurableIntentTests(unittest.TestCase):
         first = pending_gist_delivery(delivery_id="kraken-order-one")
         second = pending_gist_delivery(delivery_id="kraken-order-two")
         state = {
-            "BTC_USD": {
+            "BTC_GBP": {
                 "LAST_BUY_DATE": "2026-08-05",
                 "PENDING_GIST_DELIVERIES": [first, second],
             },
-            "SOL_USD": {"LAST_BUY_DATE": "2026-08-04"},
+            "SOL_GBP": {"LAST_BUY_DATE": "2026-08-04"},
         }
         with (
             patch.object(
@@ -428,20 +428,20 @@ class DurableIntentTests(unittest.TestCase):
         ):
             self.assertTrue(
                 crypto_dca.acknowledge_gist_delivery(
-                    "BTC_USD", first["delivery_id"], first["row_sha256"]
+                    "BTC_GBP", first["delivery_id"], first["row_sha256"]
                 )
             )
 
         written = write.call_args.args[1]
         self.assertEqual(
-            written["BTC_USD"]["PENDING_GIST_DELIVERIES"], [second]
+            written["BTC_GBP"]["PENDING_GIST_DELIVERIES"], [second]
         )
-        self.assertEqual(written["SOL_USD"]["LAST_BUY_DATE"], "2026-08-04")
+        self.assertEqual(written["SOL_GBP"]["LAST_BUY_DATE"], "2026-08-04")
 
     def test_failed_delivery_stays_queued_and_never_calls_kraken(self):
         delivery = pending_gist_delivery()
         state = {
-            "BTC_USD": {
+            "BTC_GBP": {
                 "LAST_BUY_DATE": "2026-08-05",
                 "PENDING_GIST_DELIVERIES": [delivery],
             }
@@ -449,7 +449,7 @@ class DurableIntentTests(unittest.TestCase):
         with (
             patch.object(crypto_dca, "update_gist_log", return_value=False),
             patch.object(crypto_dca, "acknowledge_gist_delivery") as acknowledge,
-            patch.object(crypto_dca, "place_gbp_funded_market_buy") as place,
+            patch.object(crypto_dca, "place_market_buy") as place,
         ):
             self.assertFalse(crypto_dca.retry_pending_gist_deliveries(state))
 
@@ -463,7 +463,7 @@ class DurableIntentTests(unittest.TestCase):
             for index in range(crypto_dca.MAX_PENDING_GIST_DELIVERIES)
         ]
         state = {
-            "BTC_USD": {
+            "BTC_GBP": {
                 "LAST_BUY_DATE": "",
                 "PENDING_ORDER": intent,
                 "PENDING_GIST_DELIVERIES": deliveries,
@@ -477,7 +477,7 @@ class DurableIntentTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "queue is full"),
         ):
             crypto_dca.complete_order_intent(
-                "BTC_USD",
+                "BTC_GBP",
                 intent["client_order_id"],
                 intent["trade_date"],
                 intent["decision_id"],
@@ -502,7 +502,7 @@ class DurableIntentTests(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "no delivery capacity"),
         ):
             crypto_dca.prepare_order_intent(
-                "BTC_USD",
+                "BTC_GBP",
                 "dca-1234567890abcd",
                 "dca-fedcba09876543",
                 "2026-08-05",
@@ -511,14 +511,14 @@ class DurableIntentTests(unittest.TestCase):
             )
 
         reserve.assert_called_once_with(
-            {"BTC_USD": {"LAST_BUY_DATE": ""}}, "BTC_USD"
+            {"BTC_GBP": {"LAST_BUY_DATE": ""}}, "BTC_GBP"
         )
         write.assert_not_called()
 
     def test_retry_acknowledges_delivery_without_calling_kraken(self):
         delivery = pending_gist_delivery()
         state = {
-            "BTC_USD": {
+            "BTC_GBP": {
                 "LAST_BUY_DATE": "2026-08-05",
                 "PENDING_GIST_DELIVERIES": [delivery],
             }
@@ -528,26 +528,26 @@ class DurableIntentTests(unittest.TestCase):
             patch.object(
                 crypto_dca, "acknowledge_gist_delivery", return_value=True
             ) as acknowledge,
-            patch.object(crypto_dca, "place_gbp_funded_market_buy") as place,
+            patch.object(crypto_dca, "place_market_buy") as place,
         ):
             self.assertTrue(crypto_dca.retry_pending_gist_deliveries(state))
 
         acknowledge.assert_called_once_with(
-            "BTC_USD", delivery["delivery_id"], delivery["row_sha256"]
+            "BTC_GBP", delivery["delivery_id"], delivery["row_sha256"]
         )
         place.assert_not_called()
 
 
 class LiveRevalidationTests(unittest.TestCase):
     def setUp(self):
-        self.rules = rules_with("BTC_USD")
-        self.decision = ready_decision("BTC_USD", self.rules["BTC_USD"])
-        self.analysis = analysis_for(self.rules, {"BTC_USD": self.decision})
+        self.rules = rules_with("BTC_GBP")
+        self.decision = ready_decision("BTC_GBP", self.rules["BTC_GBP"])
+        self.analysis = analysis_for(self.rules, {"BTC_GBP": self.decision})
 
     def test_revalidation_rejects_live_budget_change(self):
-        changed = rules_with("BTC_USD", low=11, up=21)
-        changed_decision = ready_decision("BTC_USD", changed["BTC_USD"])
-        changed_analysis = analysis_for(changed, {"BTC_USD": changed_decision})
+        changed = rules_with("BTC_GBP", low=11, up=21)
+        changed_decision = ready_decision("BTC_GBP", changed["BTC_GBP"])
+        changed_analysis = analysis_for(changed, {"BTC_GBP": changed_decision})
         with (
             patch.object(crypto_dca, "fetch_live_target_map", return_value=changed),
             patch.object(
@@ -557,8 +557,8 @@ class LiveRevalidationTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "budgets or enable state changed"),
         ):
             crypto_dca._revalidate_trade_intent(
-                "BTC_USD",
-                self.rules["BTC_USD"],
+                "BTC_GBP",
+                self.rules["BTC_GBP"],
                 self.decision,
                 "2026-08-05",
                 now=NOW,
@@ -574,8 +574,8 @@ class LiveRevalidationTests(unittest.TestCase):
             ),
         ):
             crypto_dca._revalidate_trade_intent(
-                "BTC_USD",
-                self.rules["BTC_USD"],
+                "BTC_GBP",
+                self.rules["BTC_GBP"],
                 self.decision,
                 "2026-08-05",
                 now=NOW,
@@ -585,7 +585,7 @@ class LiveRevalidationTests(unittest.TestCase):
 
     def test_revalidation_rejects_live_disable_before_add_order(self):
         disabled = json.loads(json.dumps(self.rules))
-        disabled["BTC_USD"]["BUY_ENABLED"] = False
+        disabled["BTC_GBP"]["BUY_ENABLED"] = False
         with (
             patch.object(crypto_dca, "fetch_live_target_map", return_value=disabled),
             patch.object(
@@ -595,8 +595,8 @@ class LiveRevalidationTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "disabled before order submission"),
         ):
             crypto_dca._revalidate_trade_intent(
-                "BTC_USD",
-                self.rules["BTC_USD"],
+                "BTC_GBP",
+                self.rules["BTC_GBP"],
                 self.decision,
                 "2026-08-05",
                 now=NOW,
@@ -605,7 +605,7 @@ class LiveRevalidationTests(unittest.TestCase):
     def test_revalidation_rejects_new_analysis_decision(self):
         newer = dict(self.decision)
         newer["DECISION_ID"] = "replacement-decision"
-        newer_analysis = analysis_for(self.rules, {"BTC_USD": newer})
+        newer_analysis = analysis_for(self.rules, {"BTC_GBP": newer})
         with (
             patch.object(
                 crypto_dca, "fetch_live_target_map", return_value=self.rules
@@ -617,8 +617,8 @@ class LiveRevalidationTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "analysis decision changed"),
         ):
             crypto_dca._revalidate_trade_intent(
-                "BTC_USD",
-                self.rules["BTC_USD"],
+                "BTC_GBP",
+                self.rules["BTC_GBP"],
                 self.decision,
                 "2026-08-05",
                 now=NOW,
@@ -627,7 +627,7 @@ class LiveRevalidationTests(unittest.TestCase):
     def test_revalidation_rejects_analyzed_at_mutation(self):
         changed = json.loads(json.dumps(self.decision))
         changed["TIMING"]["ANALYZED_AT"] = "2026-08-05T04:29:00Z"
-        changed_analysis = analysis_for(self.rules, {"BTC_USD": changed})
+        changed_analysis = analysis_for(self.rules, {"BTC_GBP": changed})
         with (
             patch.object(crypto_dca, "fetch_live_target_map", return_value=self.rules),
             patch.object(
@@ -639,8 +639,8 @@ class LiveRevalidationTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "analysis decision changed"),
         ):
             crypto_dca._revalidate_trade_intent(
-                "BTC_USD",
-                self.rules["BTC_USD"],
+                "BTC_GBP",
+                self.rules["BTC_GBP"],
                 self.decision,
                 "2026-08-05",
                 now=NOW,
@@ -648,10 +648,10 @@ class LiveRevalidationTests(unittest.TestCase):
 
     def test_revalidation_rejects_duplicate_and_conflicting_pending(self):
         for state, pattern in (
-            ({"BTC_USD": {"LAST_BUY_DATE": "2026-08-05"}}, "already marked"),
+            ({"BTC_GBP": {"LAST_BUY_DATE": "2026-08-05"}}, "already marked"),
             (
                 {
-                    "BTC_USD": {
+                    "BTC_GBP": {
                         "LAST_BUY_DATE": "",
                         "PENDING_ORDER": pending_intent(),
                     }
@@ -675,8 +675,8 @@ class LiveRevalidationTests(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, pattern),
             ):
                 crypto_dca._revalidate_trade_intent(
-                    "BTC_USD",
-                    self.rules["BTC_USD"],
+                    "BTC_GBP",
+                    self.rules["BTC_GBP"],
                     self.decision,
                     "2026-08-05",
                     now=NOW,
@@ -684,7 +684,7 @@ class LiveRevalidationTests(unittest.TestCase):
 
     def test_revalidation_rejects_pending_from_another_decision(self):
         pending = pending_intent()
-        state = {"BTC_USD": {"LAST_BUY_DATE": "", "PENDING_ORDER": pending}}
+        state = {"BTC_GBP": {"LAST_BUY_DATE": "", "PENDING_ORDER": pending}}
         with (
             patch.object(
                 crypto_dca, "fetch_live_target_map", return_value=self.rules
@@ -698,8 +698,8 @@ class LiveRevalidationTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "another decision"),
         ):
             crypto_dca._revalidate_trade_intent(
-                "BTC_USD",
-                self.rules["BTC_USD"],
+                "BTC_GBP",
+                self.rules["BTC_GBP"],
                 self.decision,
                 "2026-08-05",
                 expected_pending=pending,
@@ -709,38 +709,34 @@ class LiveRevalidationTests(unittest.TestCase):
 
 class TradeExecutionTests(unittest.TestCase):
     def setUp(self):
-        self.rules = rules_with("BTC_USD")
-        self.decision = ready_decision("BTC_USD", self.rules["BTC_USD"])
+        self.rules = rules_with("BTC_GBP")
+        self.decision = ready_decision("BTC_GBP", self.rules["BTC_GBP"])
         self.intent = pending_intent()
         self.intent["decision_id"] = self.decision["DECISION_ID"]
         self.order_data = {
             "order_id": "kraken-order-id",
-            "funding_order_id": "kraken-funding-order-id",
-            "pair": "BTC/USD",
-            "quote_currency": "USD",
-            "cost_gbp": 19.90,
+            "pair": "BTC/GBP",
+            "quote_currency": "GBP",
+            "cost_gbp": 20.0,
             "fee_gbp": 0.04,
             "gbp_fee_debit": 0.0,
             "fee_details": [
                 {
-                    "currency": "USD",
-                    "amount": 0.05,
-                    "usd_equivalent": 0.05,
+                    "currency": "BTC",
+                    "amount": 0.0000008,
+                    "quote_equivalent": 0.04,
                     "gbp_equivalent": 0.04,
                 }
             ],
             "spent_gbp": 20.0,
-            "funded_usd": 25.5,
-            "cost_usd": 25.43,
-            "fee_usd": 0.05,
-            "funding_fee_usd": 0.02,
-            "usd_fee_debit": 0.05,
-            "gbp_usd_rate": 1.275,
+            "cost_quote": 20.0,
+            "fee_quote": 0.04,
+            "quote_fee_debit": 0.0,
             "received": 0.0004,
             "market_gbp_price_per_unit": 49_750.0,
             "effective_gbp_price_per_unit": 50_000.0,
-            "market_usd_price_per_unit": 63_431.25,
-            "effective_usd_price_per_unit": 63_750.0,
+            "market_quote_price_per_unit": 49_750.0,
+            "effective_quote_price_per_unit": 50_000.0,
             "timestamp": int(NOW.timestamp()),
         }
 
@@ -787,16 +783,16 @@ class TradeExecutionTests(unittest.TestCase):
             id_patch as build_id,
             intent_patch,
             patch.object(
-                crypto_dca, "place_gbp_funded_market_buy", side_effect=place
+                crypto_dca, "place_market_buy", side_effect=place
             ) as place_order,
             patch.object(crypto_dca, "complete_order_intent") as complete,
             patch.object(crypto_dca, "_post_trade_logs", return_value=False),
             patch.object(crypto_dca, "send_discord_alert"),
         ):
             succeeded = crypto_dca.execute_trade(
-                "BTC_USD",
+                "BTC_GBP",
                 20,
-                expected_rule=self.rules["BTC_USD"],
+                expected_rule=self.rules["BTC_GBP"],
                 expected_decision=self.decision,
             )
 
@@ -812,15 +808,12 @@ class TradeExecutionTests(unittest.TestCase):
         self.assertEqual(build_id.call_count, 2)
         self.assertEqual(build_id.call_args_list[0].kwargs, {"purpose": "buy"})
         self.assertEqual(build_id.call_args_list[1].kwargs, {"purpose": "funding"})
-        self.assertEqual(
-            place_order.call_args.kwargs["funding_client_order_id"],
-            self.intent["funding_client_order_id"],
-        )
+        self.assertNotIn("funding_client_order_id", place_order.call_args.kwargs)
         complete.assert_called_once()
         self.assertEqual(
             complete.call_args.args,
             (
-                "BTC_USD",
+                "BTC_GBP",
                 self.intent["client_order_id"],
                 self.intent["trade_date"],
                 self.intent["decision_id"],
@@ -841,13 +834,13 @@ class TradeExecutionTests(unittest.TestCase):
                 return_value=(self.rules, {}, {}, 20.0),
             ),
             patch.object(crypto_dca, "prepare_order_intent") as prepare,
-            patch.object(crypto_dca, "place_gbp_funded_market_buy") as place,
+            patch.object(crypto_dca, "place_market_buy") as place,
             patch.object(crypto_dca, "send_discord_alert"),
         ):
             succeeded = crypto_dca.execute_trade(
-                "BTC_USD",
+                "BTC_GBP",
                 10,
-                expected_rule=self.rules["BTC_USD"],
+                expected_rule=self.rules["BTC_GBP"],
                 expected_decision=self.decision,
             )
 
@@ -861,13 +854,13 @@ class TradeExecutionTests(unittest.TestCase):
             for index in range(dca_config.MAX_PENDING_GIST_DELIVERIES)
         ]
         state = {
-            "BTC_USD": {
+            "BTC_GBP": {
                 "LAST_BUY_DATE": "",
                 "PENDING_GIST_DELIVERIES": deliveries,
             }
         }
         analysis = analysis_for(
-            self.rules, {"BTC_USD": self.decision}
+            self.rules, {"BTC_GBP": self.decision}
         )
         with (
             patch.object(crypto_dca, "_utc_now", return_value=NOW),
@@ -881,13 +874,13 @@ class TradeExecutionTests(unittest.TestCase):
                 crypto_dca, "fetch_live_analysis_state", return_value=analysis
             ),
             patch.object(crypto_dca, "prepare_order_intent") as prepare,
-            patch.object(crypto_dca, "place_gbp_funded_market_buy") as place,
+            patch.object(crypto_dca, "place_market_buy") as place,
             patch.object(crypto_dca, "send_discord_alert"),
         ):
             succeeded = crypto_dca.execute_trade(
-                "BTC_USD",
+                "BTC_GBP",
                 20,
-                expected_rule=self.rules["BTC_USD"],
+                expected_rule=self.rules["BTC_GBP"],
                 expected_decision=self.decision,
             )
 
@@ -907,7 +900,7 @@ class TradeExecutionTests(unittest.TestCase):
             intent_patch,
             patch.object(
                 crypto_dca,
-                "place_gbp_funded_market_buy",
+                "place_market_buy",
                 side_effect=crypto_dca.KrakenPreSubmissionError("rules changed"),
             ),
             patch.object(crypto_dca, "clear_order_intent") as clear,
@@ -915,15 +908,15 @@ class TradeExecutionTests(unittest.TestCase):
             patch.object(crypto_dca, "send_discord_alert"),
         ):
             succeeded = crypto_dca.execute_trade(
-                "BTC_USD",
+                "BTC_GBP",
                 20,
-                expected_rule=self.rules["BTC_USD"],
+                expected_rule=self.rules["BTC_GBP"],
                 expected_decision=self.decision,
             )
 
         self.assertFalse(succeeded)
         clear.assert_called_once_with(
-            "BTC_USD", self.intent["client_order_id"], self.intent["decision_id"]
+            "BTC_GBP", self.intent["client_order_id"], self.intent["decision_id"]
         )
         complete.assert_not_called()
 
@@ -939,7 +932,7 @@ class TradeExecutionTests(unittest.TestCase):
             intent_patch,
             patch.object(
                 crypto_dca,
-                "place_gbp_funded_market_buy",
+                "place_market_buy",
                 side_effect=RuntimeError("ambiguous response"),
             ),
             patch.object(crypto_dca, "clear_order_intent") as clear,
@@ -947,9 +940,9 @@ class TradeExecutionTests(unittest.TestCase):
             patch.object(crypto_dca, "send_discord_alert") as alert,
         ):
             succeeded = crypto_dca.execute_trade(
-                "BTC_USD",
+                "BTC_GBP",
                 20,
-                expected_rule=self.rules["BTC_USD"],
+                expected_rule=self.rules["BTC_GBP"],
                 expected_decision=self.decision,
             )
 
@@ -960,7 +953,7 @@ class TradeExecutionTests(unittest.TestCase):
 
     def test_pending_recovery_never_creates_a_new_intent(self):
         old = pending_intent(amount=10, trade_date="2026-08-04")
-        state = {"BTC_USD": {"LAST_BUY_DATE": "", "PENDING_ORDER": old}}
+        state = {"BTC_GBP": {"LAST_BUY_DATE": "", "PENDING_ORDER": old}}
         with (
             patch.object(crypto_dca, "_utc_now", return_value=NOW),
             patch.object(
@@ -974,45 +967,42 @@ class TradeExecutionTests(unittest.TestCase):
             ) as reserve,
             patch.object(
                 crypto_dca,
-                "place_gbp_funded_market_buy",
+                "place_market_buy",
                 side_effect=crypto_dca.KrakenOrderStateUnknown("not visible"),
             ) as place,
             patch.object(crypto_dca, "clear_order_intent") as clear,
             patch.object(crypto_dca, "send_discord_alert"),
         ):
-            succeeded = crypto_dca.execute_trade("BTC_USD", 20)
+            succeeded = crypto_dca.execute_trade("BTC_GBP", 20)
 
         self.assertFalse(succeeded)
         prepare.assert_not_called()
         reserve.assert_not_called()
         clear.assert_not_called()
-        self.assertEqual(place.call_args.args, ("BTC_USD", 10.0))
-        self.assertEqual(
-            place.call_args.kwargs["funding_client_order_id"],
-            old["funding_client_order_id"],
-        )
+        self.assertEqual(place.call_args.args, ("BTC_GBP", 10.0))
+        self.assertNotIn("funding_client_order_id", place.call_args.kwargs)
         self.assertTrue(place.call_args.kwargs["reconcile_only"])
 
     def test_cross_midnight_recovery_records_confirmed_fill_day(self):
         old = pending_intent(amount=10, trade_date="2026-08-04")
-        state = {"BTC_USD": {"LAST_BUY_DATE": "", "PENDING_ORDER": old}}
+        state = {"BTC_GBP": {"LAST_BUY_DATE": "", "PENDING_ORDER": old}}
         recovered = dict(self.order_data)
         recovered["timestamp"] = int(NOW.timestamp())
         with (
             patch.object(crypto_dca, "_utc_now", return_value=NOW),
             patch.object(crypto_dca, "fetch_live_execution_state", return_value=state),
-            patch.object(crypto_dca, "place_gbp_funded_market_buy", return_value=recovered),
+            patch.object(crypto_dca, "place_market_buy", return_value=recovered),
             patch.object(crypto_dca, "complete_order_intent") as complete,
             patch.object(crypto_dca, "_post_trade_logs", return_value=False),
             patch.object(crypto_dca, "send_discord_alert"),
         ):
-            self.assertTrue(crypto_dca.execute_trade("BTC_USD", 20))
+            self.assertTrue(crypto_dca.execute_trade("BTC_GBP", 20))
 
         complete.assert_called_once()
         self.assertEqual(
             complete.call_args.args,
             (
-                "BTC_USD",
+                "BTC_GBP",
                 old["client_order_id"],
                 "2026-08-05",
                 old["decision_id"],
@@ -1026,9 +1016,9 @@ class TradeExecutionTests(unittest.TestCase):
 
 class MainSchedulingTests(unittest.TestCase):
     def test_future_start_date_allows_analysis_but_blocks_new_orders(self):
-        rules = rules_with("BTC_USD")
+        rules = rules_with("BTC_GBP")
         analysis = analysis_for(
-            rules, {"BTC_USD": ready_decision("BTC_USD", rules["BTC_USD"])}
+            rules, {"BTC_GBP": ready_decision("BTC_GBP", rules["BTC_GBP"])}
         )
         with (
             patch.object(crypto_dca, "DCA_TARGET_MAP_JSON", json.dumps(rules)),
@@ -1046,9 +1036,9 @@ class MainSchedulingTests(unittest.TestCase):
         execute.assert_not_called()
 
     def test_start_date_is_inclusive_in_bangkok(self):
-        rules = rules_with("BTC_USD")
+        rules = rules_with("BTC_GBP")
         analysis = analysis_for(
-            rules, {"BTC_USD": ready_decision("BTC_USD", rules["BTC_USD"])}
+            rules, {"BTC_GBP": ready_decision("BTC_GBP", rules["BTC_GBP"])}
         )
         with (
             patch.object(crypto_dca, "DCA_TARGET_MAP_JSON", json.dumps(rules)),
@@ -1086,7 +1076,7 @@ class MainSchedulingTests(unittest.TestCase):
 
     def test_pending_recovery_runs_before_invalid_rules_block_new_orders(self):
         pending = pending_intent(amount=10, trade_date="2026-08-04")
-        state = {"BTC_USD": {"LAST_BUY_DATE": "", "PENDING_ORDER": pending}}
+        state = {"BTC_GBP": {"LAST_BUY_DATE": "", "PENDING_ORDER": pending}}
         with (
             patch.object(crypto_dca, "DCA_TARGET_MAP_JSON", "not-json"),
             patch.object(crypto_dca, "DCA_ANALYSIS_STATE_JSON", "not-json"),
@@ -1097,12 +1087,12 @@ class MainSchedulingTests(unittest.TestCase):
         ):
             self.assertFalse(crypto_dca.main())
 
-        execute.assert_called_once_with("BTC_USD", 10.0, map_key="BTC_USD")
+        execute.assert_called_once_with("BTC_GBP", 10.0, map_key="BTC_GBP")
 
     def test_pending_recovery_runs_even_when_analysis_is_invalid(self):
         rules = default_rules_map()
         pending = pending_intent(amount=10, trade_date="2026-08-04")
-        state = {"BTC_USD": {"LAST_BUY_DATE": "", "PENDING_ORDER": pending}}
+        state = {"BTC_GBP": {"LAST_BUY_DATE": "", "PENDING_ORDER": pending}}
         with (
             patch.object(crypto_dca, "DCA_TARGET_MAP_JSON", json.dumps(rules)),
             patch.object(crypto_dca, "DCA_ANALYSIS_STATE_JSON", "not-json"),
@@ -1112,7 +1102,7 @@ class MainSchedulingTests(unittest.TestCase):
         ):
             self.assertTrue(crypto_dca.main())
 
-        execute.assert_called_once_with("BTC_USD", 10.0, map_key="BTC_USD")
+        execute.assert_called_once_with("BTC_GBP", 10.0, map_key="BTC_GBP")
 
     def test_all_disabled_succeeds_even_with_no_analysis_and_never_trades(self):
         rules = default_rules_map()
@@ -1127,11 +1117,11 @@ class MainSchedulingTests(unittest.TestCase):
         execute.assert_not_called()
 
     def test_same_day_purchase_is_suppressed(self):
-        rules = rules_with("BTC_USD")
+        rules = rules_with("BTC_GBP")
         analysis = analysis_for(
-            rules, {"BTC_USD": ready_decision("BTC_USD", rules["BTC_USD"])}
+            rules, {"BTC_GBP": ready_decision("BTC_GBP", rules["BTC_GBP"])}
         )
-        state = {"BTC_USD": {"LAST_BUY_DATE": "2026-08-05"}}
+        state = {"BTC_GBP": {"LAST_BUY_DATE": "2026-08-05"}}
         with (
             patch.object(crypto_dca, "DCA_TARGET_MAP_JSON", json.dumps(rules)),
             patch.object(
@@ -1148,11 +1138,11 @@ class MainSchedulingTests(unittest.TestCase):
         execute.assert_not_called()
 
     def test_multiple_assets_can_share_a_window_and_use_own_tiers(self):
-        rules = rules_with("BTC_USD", "HYPE_USD", low=10, up=20)
+        rules = rules_with("BTC_GBP", "HYPE_USD", low=10, up=20)
         analysis = analysis_for(
             rules,
             {
-                "BTC_USD": ready_decision("BTC_USD", rules["BTC_USD"]),
+                "BTC_GBP": ready_decision("BTC_GBP", rules["BTC_GBP"]),
                 "HYPE_USD": ready_decision(
                     "HYPE_USD", rules["HYPE_USD"], regime="SIDEWAYS"
                 ),
@@ -1172,14 +1162,14 @@ class MainSchedulingTests(unittest.TestCase):
 
         self.assertEqual(execute.call_count, 2)
         calls = {call.args[0]: call.args[1] for call in execute.call_args_list}
-        self.assertEqual(calls, {"BTC_USD": 10.0, "HYPE_USD": 15.0})
+        self.assertEqual(calls, {"BTC_GBP": 10.0, "HYPE_USD": 15.0})
 
     def test_error_or_missed_decision_alerts_and_never_trades(self):
-        rules = rules_with("BTC_USD")
+        rules = rules_with("BTC_GBP")
         decision = ready_decision(
-            "BTC_USD", rules["BTC_USD"], now=NOW - timedelta(hours=2)
+            "BTC_GBP", rules["BTC_GBP"], now=NOW - timedelta(hours=2)
         )
-        analysis = analysis_for(rules, {"BTC_USD": decision})
+        analysis = analysis_for(rules, {"BTC_GBP": decision})
         with (
             patch.object(crypto_dca, "DCA_TARGET_MAP_JSON", json.dumps(rules)),
             patch.object(
@@ -1196,12 +1186,12 @@ class MainSchedulingTests(unittest.TestCase):
         self.assertTrue(alert.call_args.kwargs["is_error"])
 
     def test_stale_disabled_asset_hash_does_not_block_another_asset(self):
-        rules = rules_with("BTC_USD")
+        rules = rules_with("BTC_GBP")
         analysis = analysis_for(
-            rules, {"BTC_USD": ready_decision("BTC_USD", rules["BTC_USD"])}
+            rules, {"BTC_GBP": ready_decision("BTC_GBP", rules["BTC_GBP"])}
         )
         # Simulate an atomic budget edit on disabled ADA after the last analysis.
-        rules["SOL_USD"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
+        rules["SOL_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
         with (
             patch.object(crypto_dca, "DCA_TARGET_MAP_JSON", json.dumps(rules)),
             patch.object(
@@ -1215,12 +1205,12 @@ class MainSchedulingTests(unittest.TestCase):
             self.assertTrue(crypto_dca.main())
 
         execute.assert_called_once()
-        self.assertEqual(execute.call_args.args[:2], ("BTC_USD", 10.0))
+        self.assertEqual(execute.call_args.args[:2], ("BTC_GBP", 10.0))
 
     def test_explicit_empty_filter_is_a_successful_noop(self):
-        rules = rules_with("BTC_USD")
+        rules = rules_with("BTC_GBP")
         analysis = analysis_for(
-            rules, {"BTC_USD": ready_decision("BTC_USD", rules["BTC_USD"])}
+            rules, {"BTC_GBP": ready_decision("BTC_GBP", rules["BTC_GBP"])}
         )
         with (
             patch.object(crypto_dca, "DCA_TARGET_MAP_JSON", json.dumps(rules)),

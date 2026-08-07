@@ -180,7 +180,7 @@ def main(argv=None):
         variables = {row["name"]: row["value"] for row in _load_json(args.github_variables)}
         execution = json.loads(variables.get("DCA_EXECUTION_STATE", "{}"))
         evidence["protected_execution_state"] = {
-            "BTC_USD_LAST_BUY_DATE": execution.get("BTC_USD", {}).get("LAST_BUY_DATE", "")
+            "BTC_GBP_LAST_BUY_DATE": execution.get("BTC_GBP", {}).get("LAST_BUY_DATE", "")
         }
     if args.kraken_audit:
         text = Path(args.kraken_audit).read_text(encoding="utf-8-sig")

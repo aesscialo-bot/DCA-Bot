@@ -1,4 +1,4 @@
-"""Reporting-only PortfolioEventV2 importer for local Ghostfolio."""
+"""Reporting-only PortfolioEventV3 importer for local Ghostfolio."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from urllib.request import Request, urlopen
 EVENT_FILE = "kraken_usd_dca_ghostfolio_events.jsonl"
 RECEIPT_FILE = "ghostfolio_sync_receipts.jsonl"
 STATE_PATH = Path("/receipts/state.json")
-SYMBOLS = {"BTC_USD": "bitcoin", "HYPE_USD": "hyperliquid", "SOL_USD": "solana"}
+SYMBOLS = {"BTC_GBP": "bitcoin", "HYPE_USD": "hyperliquid", "SOL_GBP": "solana"}
 
 
 def canonical(value):
@@ -120,16 +120,18 @@ def import_payload(event):
             "accountId": account_id,
             "comment": (
                 f"Kraken orders funding={event['funding_order_id']} crypto={event['crypto_order_id']}; "
-                f"funding fee USD {event['funding_fee_usd']}; crypto fee USD {event['crypto_fee_usd']}"
+                f"route={event['route']}; funding fee {event['quote_currency']} "
+                f"{event['funding_fee_quote']}; crypto fee {event['quote_currency']} "
+                f"{event['crypto_fee_quote']}"
             ),
-            "currency": "USD",
+            "currency": event["quote_currency"],
             "dataSource": "COINGECKO",
             "date": event["occurred_at"],
-            "fee": float(event["crypto_fee_usd"]),
+            "fee": float(event["crypto_fee_quote"]),
             "quantity": float(event["crypto_quantity"]),
             "symbol": SYMBOLS[event["target"]],
             "type": "BUY",
-            "unitPrice": float(event["unit_price_usd"]),
+            "unitPrice": float(event["unit_price_quote"]),
         }]
     }
 

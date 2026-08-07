@@ -78,6 +78,6 @@ jobs:
           DCA_START_DATE: ${{ vars.DCA_START_DATE }}
           DCA_SYMBOLS_JSON: ${{ inputs.symbols_json || '' }}
           DCA_TRADING_MODE: ${{ vars.DCA_TRADING_MODE || 'shadow' }}
-          DCA_CANARY_SYMBOL: ${{ vars.DCA_CANARY_SYMBOL || 'SOL_USD' }}
+          DCA_CANARY_SYMBOL: ${{ vars.DCA_CANARY_SYMBOL || 'SOL_GBP' }}
           GHOSTFOLIO_DIRECT_SYNC_ENABLED: "false"
         run: python -u crypto_dca.py

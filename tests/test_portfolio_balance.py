@@ -9,20 +9,20 @@ import portfolio_balance
 class PortfolioConfigurationTests(unittest.TestCase):
     def test_extracts_unique_usd_markets(self):
         target_map = {
-            "BTC_USD": {"BUY_ENABLED": False},
+            "BTC_GBP": {"BUY_ENABLED": False},
             "HYPE_USD": {"BUY_ENABLED": True},
-            "SOL_USD": {"BUY_ENABLED": True},
+            "SOL_GBP": {"BUY_ENABLED": True},
         }
 
         self.assertEqual(
             portfolio_balance.extract_usd_symbols(target_map),
-            ["BTC/USD", "HYPE/USD", "SOL/USD"],
+            ["BTC/GBP", "HYPE/USD", "SOL/GBP"],
         )
 
-    def test_rejects_non_usd_or_noncanonical_market(self):
-        with self.assertRaisesRegex(ValueError, "expected a BASE_USD"):
-            portfolio_balance.extract_usd_symbols({"BTC_GBP": {}})
-        with self.assertRaisesRegex(ValueError, "expected a BASE_USD"):
+    def test_rejects_non_gbp_usd_or_noncanonical_market(self):
+        with self.assertRaisesRegex(ValueError, "expected a BASE_GBP or BASE_USD"):
+            portfolio_balance.extract_usd_symbols({"BTC_EUR": {}})
+        with self.assertRaisesRegex(ValueError, "expected a BASE_GBP or BASE_USD"):
             portfolio_balance.extract_usd_symbols({"btc_usd": {}})
 
     def test_monthly_window_uses_latest_completed_fifth(self):
@@ -48,15 +48,15 @@ class KrakenPortfolioDataTests(unittest.TestCase):
         }
         exchange.fetch_ticker.return_value = {"last": 60_000}
 
-        balances = portfolio_balance.get_portfolio_balances(exchange, ["BTC/USD"])
-        prices = portfolio_balance.get_usd_prices(exchange, ["BTC/USD"])
+        balances = portfolio_balance.get_portfolio_balances(exchange, ["BTC/GBP"])
+        prices = portfolio_balance.get_usd_prices(exchange, ["BTC/GBP"])
 
         self.assertEqual(
             balances,
             {"BTC": 0.1, "GBP": 125.5, "USD": 7.25},
         )
-        self.assertEqual(prices, {"BTC/USD": 60_000})
-        exchange.fetch_ticker.assert_called_once_with("BTC/USD")
+        self.assertEqual(prices, {"BTC/GBP": 60_000})
+        exchange.fetch_ticker.assert_called_once_with("BTC/GBP")
 
     def test_live_gbp_usd_rate_comes_from_kraken(self):
         exchange = MagicMock()
@@ -82,7 +82,7 @@ class KrakenPortfolioDataTests(unittest.TestCase):
                 {
                     "id": "buy-1",
                     "order": "order-1",
-                    "symbol": "BTC/USD",
+                    "symbol": "BTC/GBP",
                     "timestamp": 110_000,
                     "side": "buy",
                     "amount": 0.01,
@@ -92,7 +92,7 @@ class KrakenPortfolioDataTests(unittest.TestCase):
                 },
                 {
                     "id": "sell-1",
-                    "symbol": "BTC/USD",
+                    "symbol": "BTC/GBP",
                     "timestamp": 120_000,
                     "side": "sell",
                     "amount": 0.01,
@@ -104,7 +104,7 @@ class KrakenPortfolioDataTests(unittest.TestCase):
                 {
                     "id": "buy-2",
                     "order": "order-2",
-                    "symbol": "BTC/USD",
+                    "symbol": "BTC/GBP",
                     "timestamp": 150_000,
                     "side": "buy",
                     "amount": 0.02,
@@ -117,7 +117,7 @@ class KrakenPortfolioDataTests(unittest.TestCase):
         with patch.object(portfolio_balance, "TRADE_PAGE_SIZE", 2):
             history = portfolio_balance.aggregate_buy_trades(
                 exchange,
-                ["BTC/USD"],
+                ["BTC/GBP"],
                 start_ts=100,
                 end_ts=200,
             )
@@ -159,7 +159,7 @@ class KrakenPortfolioDataTests(unittest.TestCase):
                 {
                     "id": "btc-1",
                     "order": "order-btc-1",
-                    "symbol": "BTC/USD",
+                    "symbol": "BTC/GBP",
                     "timestamp": 150_000,
                     "side": "buy",
                     "amount": 0.001,
@@ -171,7 +171,7 @@ class KrakenPortfolioDataTests(unittest.TestCase):
 
         with patch.object(portfolio_balance, "TRADE_PAGE_SIZE", 2):
             history = portfolio_balance.aggregate_buy_trades(
-                exchange, ["BTC/USD"], start_ts=100, end_ts=200
+                exchange, ["BTC/GBP"], start_ts=100, end_ts=200
             )
 
         self.assertEqual([trade["trade_id"] for trade in history["BTC"]], ["btc-1"])
@@ -187,14 +187,14 @@ class PortfolioReportTests(unittest.TestCase):
         }
 
         def ticker(symbol):
-            return {"last": {"BTC/USD": 60_000, "GBP/USD": 1.25}[symbol]}
+            return {"last": {"BTC/GBP": 60_000, "GBP/USD": 1.25}[symbol]}
 
         self.exchange.fetch_ticker.side_effect = ticker
 
     def test_short_report_values_usd_assets_and_both_cash_balances_in_gbp(self):
         report = portfolio_balance.build_portfolio_report(
             self.exchange,
-            ["BTC/USD"],
+            ["BTC/GBP"],
             short_report=True,
         )
 
@@ -242,7 +242,7 @@ class PortfolioReportTests(unittest.TestCase):
         ):
             report = portfolio_balance.build_portfolio_report(
                 self.exchange,
-                ["BTC/USD"],
+                ["BTC/GBP"],
                 short_report=False,
             )
 
@@ -253,7 +253,7 @@ class PortfolioReportTests(unittest.TestCase):
         self.assertIn("order `order-1`", report)
         aggregate.assert_called_once_with(
             self.exchange,
-            ["BTC/USD"],
+            ["BTC/GBP"],
             int(window[0].timestamp()),
             int(window[1].timestamp()),
         )

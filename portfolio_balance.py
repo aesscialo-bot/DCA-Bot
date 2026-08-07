@@ -53,17 +53,17 @@ def _positive_number(value: Any, name: str) -> float:
 
 
 def extract_usd_symbols(target_map: dict[str, Any]) -> list[str]:
-    """Return unique Kraken ``BASE/USD`` symbols from canonical target keys."""
+    """Return unique Kraken pair symbols from canonical target keys."""
     symbols: list[str] = []
     for raw_key in target_map:
         if not isinstance(raw_key, str) or not re.fullmatch(
-            r"[A-Z0-9]+_USD", raw_key
+            r"[A-Z0-9]+_(?:GBP|USD)", raw_key
         ):
             raise ValueError(
-                f"Invalid DCA market {raw_key!r}; expected a BASE_USD key"
+                f"Invalid DCA market {raw_key!r}; expected a BASE_GBP or BASE_USD key"
             )
-        base = raw_key[:-4]
-        symbol = f"{base}/USD"
+        base, quote = raw_key.rsplit("_", 1)
+        symbol = f"{base}/{quote}"
         if symbol not in symbols:
             symbols.append(symbol)
     return symbols
@@ -174,7 +174,7 @@ def aggregate_buy_trades(
     start_ts: int,
     end_ts: int,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Fetch all configured Kraken USD-market buy fills in ``[start, end)``."""
+    """Fetch all configured Kraken-market buy fills in ``[start, end)``."""
     start_ms = int(start_ts * 1000)
     end_ms = int(end_ts * 1000)
     result: dict[str, list[dict[str, Any]]] = {}
@@ -261,7 +261,7 @@ def build_portfolio_report(
     short_report: bool = True,
     now: datetime | None = None,
 ) -> str:
-    """Build a GBP-valued Kraken report for the configured USD markets."""
+    """Build a GBP-valued Kraken report for the configured mixed markets."""
     balances = get_portfolio_balances(exchange, symbols)
     prices = get_usd_prices(exchange, symbols)
     gbp_usd_rate = get_live_gbp_usd_rate(exchange)
@@ -287,7 +287,7 @@ def build_portfolio_report(
         lines.extend([holding_text, ""])
 
     if not holding_count:
-        lines.extend(["_No balances found for the configured USD markets._", ""])
+        lines.extend(["_No balances found for the configured markets._", ""])
 
     cash_gbp = balances.get("GBP", 0)
     cash_usd = balances.get("USD", 0)
@@ -324,7 +324,7 @@ def build_portfolio_report(
     lines.extend(["", "═" * 40, f"**📈 KRAKEN USD BUY HISTORY ({report_label})**", ""])
 
     if not history:
-        lines.append("_No configured Kraken USD-market buys in this period._")
+        lines.append("_No configured Kraken-market buys in this period._")
         return "\n".join(lines)
 
     for base in sorted(history):

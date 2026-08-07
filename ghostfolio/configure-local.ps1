@@ -16,9 +16,9 @@ if (-not $byName['Kraken DCA'] -or -not $byName['Bitkub Legacy']) {
   throw 'Required custody accounts were not returned by Ghostfolio'
 }
 $accountMap = @{
-  BTC_USD = $byName['Kraken DCA']
+  BTC_GBP = $byName['Kraken DCA']
   HYPE_USD = $byName['Kraken DCA']
-  SOL_USD = $byName['Kraken DCA']
+  SOL_GBP = $byName['Kraken DCA']
   BITKUB_LEGACY = $byName['Bitkub Legacy']
 } | ConvertTo-Json -Compress
 
