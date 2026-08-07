@@ -32,6 +32,19 @@ class MemoryStore:
 
 
 class KrakenHistoryTests(unittest.TestCase):
+    def test_normalized_cursor_boundary_cannot_reaggregate_earlier_trade(self):
+        cursor = kraken_history._parse_iso(
+            "2026-08-07T00:00:00.123456789Z", "cursor"
+        )
+        earlier = kraken_history._parse_iso(
+            "2026-08-07T00:00:00.123455999Z", "trade"
+        )
+        same_boundary = kraken_history._parse_iso(
+            "2026-08-07T00:00:00.123456999Z", "trade"
+        )
+        self.assertLess(earlier, cursor)
+        self.assertEqual(same_boundary, cursor)
+
     def test_trade_aggregation_is_canonical_ohlcvt(self):
         candles = {}
         kraken_history._add_trade(

@@ -132,6 +132,12 @@ hashes, and verifies the overlapping recent 7.5 days against Kraken OHLC. No new
 order is permitted unless BTC/GBP, HYPE/USD, and SOL/GBP all have current,
 verified history and decisions.
 
+PostTrade pagination uses Kraken's exclusive `from_ts` cursor without subtracting
+time. Boundary trade IDs are deduplicated after nanosecond timestamps are
+normalized to Python microseconds; trades older than the active cursor are
+discarded. This prevents page-boundary executions being counted twice and is
+required for the OHLC overlap check to pass.
+
 If analysis finishes after its selected time, the explicit legacy catch-up time
 is 05:00 Bangkok and is usable only through 06:00. Normal selections retain the
 one-hour recovery window. Expired decisions are never replayed.
@@ -309,6 +315,10 @@ or externally-created holdings are reconciled only by the explicit, idempotent
 `reconcile-holdings` command, which records opening-balance BUY/SELL adjustments
 at the Kraken snapshot price and publishes a receipt; normal DCA fills always
 retain their exact order-level cost and fee records.
+
+Ghostfolio 3.43.0 imports BTC and SOL through CoinGecko. Its local CoinGecko
+importer rejects Hyperliquid despite returning it in lookup results, so HYPE is
+bound explicitly to Ghostfolio's supported Yahoo profile `HYPE32196USD`.
 
 `ghostfolio/reconcile_legacy.py` is dry-run only. It maps recovered trades to
 fresh logical accounts and blocks migration if the hosted export is missing or

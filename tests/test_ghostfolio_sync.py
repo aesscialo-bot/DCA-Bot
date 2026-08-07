@@ -114,6 +114,23 @@ class GhostfolioSyncTests(unittest.TestCase):
         self.assertIn("funding fee GBP 0", activity["comment"])
         self.assertIn("crypto fee GBP 0.03", activity["comment"])
 
+    def test_hype_uses_supported_ghostfolio_yahoo_profile(self):
+        hype = event()
+        hype["target"] = "HYPE_USD"
+        prior = ghostfolio_sync.os.environ.get("GHOSTFOLIO_ACCOUNT_MAP")
+        ghostfolio_sync.os.environ["GHOSTFOLIO_ACCOUNT_MAP"] = json.dumps(
+            {"HYPE_USD": "local-hype"}
+        )
+        try:
+            activity = ghostfolio_sync.import_payload(hype)["activities"][0]
+        finally:
+            if prior is None:
+                ghostfolio_sync.os.environ.pop("GHOSTFOLIO_ACCOUNT_MAP", None)
+            else:
+                ghostfolio_sync.os.environ["GHOSTFOLIO_ACCOUNT_MAP"] = prior
+        self.assertEqual(activity["dataSource"], "YAHOO")
+        self.assertEqual(activity["symbol"], "HYPE32196USD")
+
 
 if __name__ == "__main__":
     unittest.main()

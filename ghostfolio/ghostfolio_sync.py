@@ -18,7 +18,15 @@ RECEIPT_FILE = "ghostfolio_sync_receipts.jsonl"
 HOLDINGS_SNAPSHOT_FILE = "kraken_holdings_snapshot_v1.json"
 HOLDINGS_RECEIPT_FILE = "ghostfolio_holdings_receipts.jsonl"
 STATE_PATH = Path("/receipts/state.json")
-SYMBOLS = {"BTC_GBP": "bitcoin", "HYPE_USD": "hyperliquid", "SOL_GBP": "solana"}
+ASSET_PROFILES = {
+    "BTC_GBP": {"symbol": "bitcoin", "data_source": "COINGECKO"},
+    # Ghostfolio 3.43.0 returns Hyperliquid in lookup results for both
+    # providers, but its CoinGecko importer rejects that asset. The supported
+    # Yahoo crypto profile is therefore the audited local identifier.
+    "HYPE_USD": {"symbol": "HYPE32196USD", "data_source": "YAHOO"},
+    "SOL_GBP": {"symbol": "solana", "data_source": "COINGECKO"},
+}
+SYMBOLS = {target: profile["symbol"] for target, profile in ASSET_PROFILES.items()}
 QUANTITY_TOLERANCE = {"BTC_GBP": 1e-10, "HYPE_USD": 1e-8, "SOL_GBP": 1e-8}
 
 
@@ -138,6 +146,7 @@ def import_payload(event):
     account_id = accounts.get(event["target"])
     if not account_id:
         raise RuntimeError(f"no local custody account configured for {event['target']}")
+    profile = ASSET_PROFILES[event["target"]]
     return {
         "activities": [{
             "accountId": account_id,
@@ -148,11 +157,11 @@ def import_payload(event):
                 f"{event['crypto_fee_quote']}"
             ),
             "currency": event["quote_currency"],
-            "dataSource": "COINGECKO",
+            "dataSource": profile["data_source"],
             "date": event["occurred_at"],
             "fee": float(event["crypto_fee_quote"]),
             "quantity": float(event["crypto_quantity"]),
-            "symbol": SYMBOLS[event["target"]],
+            "symbol": profile["symbol"],
             "type": "BUY",
             "unitPrice": float(event["unit_price_quote"]),
         }]
@@ -192,6 +201,7 @@ def holdings_import_payload(snapshot, target, difference):
     if not account_id:
         raise RuntimeError(f"no local custody account configured for {target}")
     item = snapshot["holdings"][target]
+    profile = ASSET_PROFILES[target]
     return {
         "activities": [{
             "accountId": account_id,
@@ -200,11 +210,11 @@ def holdings_import_payload(snapshot, target, difference):
                 f"snapshot={snapshot['canonical_hash']}; target={target}"
             ),
             "currency": item["quote_currency"],
-            "dataSource": "COINGECKO",
+            "dataSource": profile["data_source"],
             "date": snapshot["as_of"],
             "fee": 0,
             "quantity": abs(difference),
-            "symbol": SYMBOLS[target],
+            "symbol": profile["symbol"],
             "type": "BUY" if difference > 0 else "SELL",
             "unitPrice": float(item["unit_price_quote"]),
         }]

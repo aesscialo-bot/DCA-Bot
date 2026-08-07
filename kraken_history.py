@@ -539,7 +539,12 @@ def refresh_target(
     stalled = 0
     try:
         while last_ts < cutoff:
-            page_from = max(query_from, last_ts - timedelta(microseconds=1))
+            # PostTrade defines ``from_ts`` as exclusive. Python normalizes
+            # Kraken's nanosecond cursor to microseconds, so subtracting another
+            # microsecond reintroduced already-aggregated trades at page
+            # boundaries. Reuse the normalized boundary and deduplicate every
+            # trade that maps to it by ID.
+            page_from = max(query_from, last_ts)
             page = client.post_trade_page(pair, from_ts=page_from, to_ts=cutoff)
             trades = page["trades"]
             if not trades:
@@ -554,6 +559,8 @@ def refresh_target(
                     raise HistoryError("Kraken PostTrade trade must be an object")
                 trade_id = str(trade.get("trade_id", ""))
                 trade_time = _parse_iso(trade.get("trade_ts"), "Kraken trade_ts")
+                if trade_time < last_ts:
+                    continue
                 if trade_id in page_seen or (trade_time == last_ts and trade_id in boundary_ids):
                     continue
                 page_seen.add(trade_id)
