@@ -367,6 +367,31 @@ class TimingPolicyTests(unittest.TestCase):
 
 
 class DecisionAndNarrationTests(unittest.TestCase):
+    def test_analysis_noop_is_invalidated_when_enable_state_changes(self):
+        rules = dca_config.default_rules_map()
+        target = "BTC_GBP"
+        rules[target]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
+        state = dca_config.empty_analysis_state(rules, now=NOW)
+        state["ANALYSIS_DATE"] = NOW.astimezone(
+            ZoneInfo("Asia/Bangkok")
+        ).date().isoformat()
+        state["POLICY_VERSION"] = dca_config.TIMING_POLICY_VERSION
+        decision = state["TARGETS"][target]
+        decision["ANALYSIS_STATUS"] = "READY"
+        decision["RULES_HASH"] = dca_config.rules_hash(target, rules[target])
+        decision["ENABLED"] = False
+        self.assertTrue(
+            crypto_analysis._analysis_is_complete_for_live_rules(
+                state, rules, [target], state["ANALYSIS_DATE"]
+            )
+        )
+        rules[target]["BUY_ENABLED"] = True
+        self.assertFalse(
+            crypto_analysis._analysis_is_complete_for_live_rules(
+                state, rules, [target], state["ANALYSIS_DATE"]
+            )
+        )
+
     def test_v1_state_is_replaced_with_fail_closed_v2_before_fresh_analysis(self):
         rules = dca_config.default_rules_map()
         old_state = dca_config.empty_analysis_state(rules, now=NOW)

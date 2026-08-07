@@ -881,6 +881,28 @@ def _existing_or_empty_state(rules: Mapping[str, Any], now: datetime) -> dict[st
     return empty_analysis_state(rules, now=now)
 
 
+def _analysis_is_complete_for_live_rules(
+    state: Mapping[str, Any],
+    rules: Mapping[str, Any],
+    selected_targets: Iterable[str],
+    analysis_date: str,
+) -> bool:
+    """Return true only when an idempotent no-op preserves live enable state."""
+
+    return (
+        state.get("ANALYSIS_DATE") == analysis_date
+        and state.get("POLICY_VERSION") == TIMING_POLICY_VERSION
+        and all(
+            state["TARGETS"][target].get("ANALYSIS_STATUS") == READY_STATUS
+            and state["TARGETS"][target].get("RULES_HASH")
+            == rules_hash(target, rules[target])
+            and state["TARGETS"][target].get("ENABLED")
+            is bool(rules[target]["BUY_ENABLED"])
+            for target in selected_targets
+        )
+    )
+
+
 def main() -> int:
     """Analyze selected targets, persist three decisions, and alert per asset."""
 
@@ -896,14 +918,8 @@ def main() -> int:
     selected_targets = [symbol.replace("/", "_") for symbol in symbols]
     state = _existing_or_empty_state(rules, generated)
     analysis_date = generated.astimezone(ZoneInfo(LOCAL_TZ)).date().isoformat()
-    already_complete = (
-        state.get("ANALYSIS_DATE") == analysis_date
-        and state.get("POLICY_VERSION") == TIMING_POLICY_VERSION
-        and all(
-            state["TARGETS"][target].get("ANALYSIS_STATUS") == READY_STATUS
-            and state["TARGETS"][target].get("RULES_HASH") == rules_hash(target, rules[target])
-            for target in selected_targets
-        )
+    already_complete = _analysis_is_complete_for_live_rules(
+        state, rules, selected_targets, analysis_date
     )
     if already_complete:
         print(
