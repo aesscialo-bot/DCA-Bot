@@ -19,7 +19,9 @@ concurrency:
 jobs:
   bootstrap:
     name: Bootstrap 65-day first-party history
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.ref == 'refs/heads/main' ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/recovery/dca-core')
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
