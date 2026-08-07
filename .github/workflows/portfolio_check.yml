@@ -54,7 +54,22 @@ jobs:
         KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
         KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Bangkok' }}
-      run: python -u kraken_order_audit.py
+      run: |
+        python - <<'PY'
+        from kraken_order_audit import audit_orders
+        result = audit_orders()
+        if (
+            not result["flow_integrity_ok"]
+            or result["unresolved_bot_orders"]
+            or result["unknown_timestamp_closed_bot_orders"]
+        ):
+            raise SystemExit("Kraken order integrity audit failed")
+        print(
+            "Kraken order integrity is clear: "
+            f"{result['same_day_completed_dca_flows']} complete DCA flow(s), "
+            "zero unresolved or unknown-timestamp bot orders."
+        )
+        PY
 
     - name: Publish signed Kraken holdings snapshot (non-production validation)
       if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
