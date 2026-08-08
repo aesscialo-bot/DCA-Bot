@@ -787,6 +787,25 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn(f"Regime: `{decision['REGIME']}`", summary)
         self.assertNotIn("Regime: `ERROR`", summary)
 
+    def test_expired_enabled_pair_is_quietly_omitted_from_scheduler(self):
+        live_rules = rules(enabled={"HYPE_USD"})
+        analysis = analysis_state(live_rules)
+        execution = {}
+
+        self.assertTrue(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules),
+                json.dumps(analysis),
+                json.dumps(execution),
+                "2026-08-05",
+                now=NOW + timedelta(hours=3),
+            )
+        )
+
+        self.assertNotIn("HYPE_USD", discord_bot._dca_schedule)
+        self.assertIsNone(discord_bot._schedule_error)
+        self.assertIsNone(discord_bot._schedule_warning)
+
     def test_chain_never_reports_operational_for_unhealthy_workflow_evidence(self):
         with patch.object(discord_bot, "DCA_CRON_ENABLED", True):
             for workflow_status in ("UNKNOWN", "FAILING", "BLOCKED", "STALE"):
