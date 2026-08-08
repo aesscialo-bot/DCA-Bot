@@ -1,4 +1,9 @@
-"""Best-effort audit logging for Kraken mixed-market purchases."""
+"""Best-effort private-repository outbox logging for Kraken purchases.
+
+The module name and ``build_gist_delivery``/``update_gist_log`` entry points are
+retained while the protected execution-state outbox is migrated.  They no
+longer access Gist.
+"""
 
 import hashlib
 import json
@@ -6,19 +11,18 @@ import math
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
-from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-import requests
+from github_contents import (
+    GitHubContentsClient,
+    GitHubContentsError,
+    MAX_CONTENT_BYTES,
+    configured_outbox_paths,
+)
 
 
-GIST_ID = os.environ.get("GIST_ID")
-GIST_TOKEN = os.environ.get("GIST_TOKEN")
-GIST_FILENAME = "kraken_usd_dca_trade_log.md"
-GHOSTFOLIO_EVENTS_FILENAME = "kraken_usd_dca_ghostfolio_events.jsonl"
-GIST_REQUEST_TIMEOUT_SECONDS = 10
 GIST_DELIVERY_VERSION = 3
-MAX_GIST_FILE_BYTES = 8_000_000
+MAX_GIST_FILE_BYTES = MAX_CONTENT_BYTES
 
 _DELIVERY_KEYS = (
     "version",
@@ -93,7 +97,7 @@ def _validated_trade_values(trade_data):
     """Extract and validate authoritative direct-GBP or GBP-funded fill fields."""
     quote_currency = str(trade_data.get("quote_currency", "")).upper()
     if quote_currency not in {"GBP", "USD"}:
-        raise ValueError("Gist logger requires a Kraken GBP or USD market trade")
+        raise ValueError("outbox logger requires a Kraken GBP or USD market trade")
 
     route = str(
         trade_data.get("route")
@@ -240,7 +244,7 @@ def _delivery_event_status(content, delivery):
         try:
             event = json.loads(line)
         except json.JSONDecodeError as error:
-            raise ValueError("Ghostfolio event Gist contains malformed JSONL") from error
+            raise ValueError("Portfolio event outbox contains malformed JSONL") from error
         if event.get("event_id") == delivery["delivery_id"]:
             matches.append(line)
     if not matches:
@@ -250,60 +254,8 @@ def _delivery_event_status(content, delivery):
     return "conflict"
 
 
-def _safe_raw_gist_url(value):
-    """Accept only GitHub's authenticated raw-Gist host."""
-    if not isinstance(value, str):
-        raise ValueError("truncated Gist file is missing its raw URL")
-    parsed = urlparse(value)
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname != "gist.githubusercontent.com"
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.port not in {None, 443}
-    ):
-        raise ValueError("truncated Gist file returned an unsafe raw URL")
-    return value
-
-
-def _response_text(response):
-    value = response.text
-    if not isinstance(value, str):
-        raise ValueError("Gist file content must be text")
-    if len(value.encode("utf-8")) > MAX_GIST_FILE_BYTES:
-        raise ValueError("Gist file exceeds the supported audit-ledger size")
-    return value
-
-
-def _gist_file_content(gist, headers, filename=GIST_FILENAME):
-    """Return the complete file, fetching raw content when REST truncates it."""
-    files = gist.get("files", {})
-    if not isinstance(files, dict):
-        raise ValueError("Gist files payload must be an object")
-    file_info = files.get(filename)
-    if file_info is None:
-        return ""
-    if not isinstance(file_info, dict):
-        raise ValueError("Gist file payload must be an object")
-    if file_info.get("truncated") is True:
-        raw_url = _safe_raw_gist_url(file_info.get("raw_url"))
-        raw_response = requests.get(
-            raw_url,
-            headers=headers,
-            timeout=GIST_REQUEST_TIMEOUT_SECONDS,
-        )
-        raw_response.raise_for_status()
-        return _response_text(raw_response)
-    content = file_info.get("content", "")
-    if not isinstance(content, str):
-        raise ValueError("Gist file content must be text")
-    if len(content.encode("utf-8")) > MAX_GIST_FILE_BYTES:
-        raise ValueError("Gist file exceeds the supported audit-ledger size")
-    return content
-
-
 def build_gist_delivery(trade_data, symbol, saved_to_ghostfolio=False):
-    """Build an immutable, retry-safe Gist delivery from a confirmed purchase."""
+    """Build immutable, retry-safe repository delivery evidence."""
     if not isinstance(trade_data, dict):
         raise ValueError("trade data must be a dictionary")
 
@@ -381,9 +333,9 @@ def build_gist_delivery(trade_data, symbol, saved_to_ghostfolio=False):
 
 def _validated_delivery(delivery):
     if not isinstance(delivery, dict) or set(delivery) != set(_DELIVERY_KEYS):
-        raise ValueError("Gist delivery must use the exact version 3 schema")
+        raise ValueError("outbox delivery must use the exact version 3 schema")
     if type(delivery["version"]) is not int or delivery["version"] != 3:
-        raise ValueError("unsupported Gist delivery version")
+        raise ValueError("unsupported outbox delivery version")
 
     delivery_id = _canonical_external_identifier(
         delivery["delivery_id"], "delivery ID"
@@ -451,107 +403,89 @@ def _coerce_delivery(value, symbol, saved_to_ghostfolio):
 
 
 def update_gist_log(trade_data, symbol="BTC", saved_to_ghostfolio=False):
-    """Deliver a confirmed Kraken two-leg purchase to the optional audit Gist.
+    """Deliver a confirmed purchase to the private repository outbox.
 
-    Logging is deliberately best-effort: a Gist outage never changes a Kraken
-    order's success. ``True`` means the exact immutable row is present (whether
-    newly appended or already delivered); skipped, conflicting, and failed
-    attempts return ``False``. ``trade_data`` may also be a delivery returned
-    by :func:`build_gist_delivery`.
+    The legacy function name is retained because the protected execution state
+    still calls its durable evidence queue ``PENDING_GIST_DELIVERIES``.  No Gist
+    request or fallback is performed.  ``True`` means both the exact immutable
+    audit row and PortfolioEventV3 are present in the configured repository.
     """
     try:
         delivery = _coerce_delivery(
             trade_data, symbol, saved_to_ghostfolio
         )
     except (KeyError, TypeError, ValueError) as error:
-        print(f"Failed to update optional Gist audit ({type(error).__name__}).")
-        return False
-
-    if not GIST_ID or not GIST_TOKEN:
-        print("GIST_ID or GIST_TOKEN not set. Skipping optional Gist audit log.")
+        print(f"Failed to update private repository outbox ({type(error).__name__}).")
         return False
 
     try:
-        headers = {
-            "Authorization": f"Bearer {GIST_TOKEN}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        url = f"https://api.github.com/gists/{GIST_ID}"
+        paths = configured_outbox_paths()
+        client = GitHubContentsClient.from_env()
 
-        response = requests.get(
-            url, headers=headers, timeout=GIST_REQUEST_TIMEOUT_SECONDS
-        )
-        response.raise_for_status()
-        gist = response.json()
-        current_content = _gist_file_content(gist, headers, GIST_FILENAME)
-        current_events = _gist_file_content(
-            gist, headers, GHOSTFOLIO_EVENTS_FILENAME
-        )
+        def append_audit(current_content):
+            row_status = _delivery_row_status(current_content, delivery)
+            if row_status == "conflict":
+                raise ValueError("audit delivery conflicts with the existing order ID")
+            if row_status == "duplicate":
+                return current_content
+            if not current_content.strip():
+                current_content = TABLE_HEADER
+            elif not current_content.endswith("\n"):
+                current_content += "\n"
+            updated_content = current_content + delivery["row"]
+            if len(updated_content.encode("utf-8")) > MAX_GIST_FILE_BYTES:
+                raise ValueError("audit file would exceed the supported size")
+            return updated_content
 
-        row_status = _delivery_row_status(current_content, delivery)
-        event_status = _delivery_event_status(current_events, delivery)
-        if row_status == "duplicate" and event_status == "duplicate":
-            print(
-                f"Optional Gist audit already contains "
-                f"{delivery['symbol']} delivery."
-            )
-            return True
-        if "conflict" in {row_status, event_status}:
-            print("Failed to update optional Gist audit (delivery conflict).")
-            return False
-
-        if not current_content.strip():
-            current_content = TABLE_HEADER
-        elif not current_content.endswith("\n"):
-            current_content += "\n"
-        updated_content = (
-            current_content + delivery["row"]
-            if row_status == "missing"
-            else current_content
-        )
-        if len(updated_content.encode("utf-8")) > MAX_GIST_FILE_BYTES:
-            raise ValueError("Gist file would exceed the supported audit-ledger size")
         event_line = json.dumps(
             delivery["event"],
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
         ) + "\n"
-        if current_events and not current_events.endswith("\n"):
-            current_events += "\n"
-        updated_events = (
-            current_events + event_line
-            if event_status == "missing"
-            else current_events
-        )
-        if len(updated_events.encode("utf-8")) > MAX_GIST_FILE_BYTES:
-            raise ValueError("Ghostfolio event file would exceed the supported size")
 
-        response = requests.patch(
-            url,
-            headers=headers,
-            json={
-                "files": {
-                    GIST_FILENAME: {"content": updated_content},
-                    GHOSTFOLIO_EVENTS_FILENAME: {"content": updated_events},
-                }
-            },
-            timeout=GIST_REQUEST_TIMEOUT_SECONDS,
+        def append_event(current_events):
+            event_status = _delivery_event_status(current_events, delivery)
+            if event_status == "conflict":
+                raise ValueError("Portfolio event conflicts with the existing order ID")
+            if event_status == "duplicate":
+                return current_events
+            if current_events and not current_events.endswith("\n"):
+                current_events += "\n"
+            updated_events = current_events + event_line
+            if len(updated_events.encode("utf-8")) > MAX_GIST_FILE_BYTES:
+                raise ValueError("Portfolio event file would exceed the supported size")
+            return updated_events
+
+        client.update_text(
+            paths.audit,
+            append_audit,
+            message="Append confirmed Kraken DCA audit row",
         )
-        response.raise_for_status()
-        print(
-            f"Optional Gist audit log updated for {delivery['symbol']}."
+        client.update_text(
+            paths.event,
+            append_event,
+            message="Append confirmed PortfolioEventV3",
         )
+        verified_audit = client.read_text(paths.audit).content
+        verified_events = client.read_text(paths.event).content
+        if _delivery_row_status(verified_audit, delivery) != "duplicate":
+            raise GitHubContentsError("private repository did not confirm the audit row")
+        if _delivery_event_status(verified_events, delivery) != "duplicate":
+            raise GitHubContentsError("private repository did not confirm the Portfolio event")
+        print(f"Private repository outbox confirmed for {delivery['symbol']}.")
         return True
-    except (KeyError, TypeError, ValueError, requests.RequestException) as error:
-        print(f"Failed to update optional Gist audit ({type(error).__name__}).")
+    except (KeyError, TypeError, ValueError, GitHubContentsError) as error:
+        print(f"Failed to update private repository outbox ({type(error).__name__}).")
     except Exception as error:
-        # Optional logging must remain nonblocking for unexpected response data.
-        print(f"Failed to update optional Gist audit ({type(error).__name__}).")
+        # Post-fill publishing remains nonblocking; durable local evidence stays queued.
+        print(f"Failed to update private repository outbox ({type(error).__name__}).")
 
     return False
 
 
+publish_repository_delivery = update_gist_log
+
+
 if __name__ == "__main__":
-    print("This optional logger is called after a completed Kraken order.")
+    print("This private repository outbox publisher runs after a completed Kraken order.")

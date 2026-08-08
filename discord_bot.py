@@ -42,6 +42,13 @@ from dca_config import (
     validate_execution_state,
     validate_rules_map,
 )
+from github_contents import (
+    TOKEN_ENV,
+    GitHubContentsClient,
+    GitHubContentsConfigError,
+    GitHubContentsError,
+    configured_repository_path,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -51,8 +58,6 @@ from dca_config import (
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GH_PAT = os.environ.get("GH_PAT", "")
-GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
-GIST_ID = os.environ.get("GIST_ID", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_WORKFLOW_REF = os.environ.get("GITHUB_WORKFLOW_REF", "").strip()
 CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID")
@@ -82,8 +87,11 @@ GH_HEADERS = {
     "Authorization": f"token {GH_PAT}",
     "Accept": "application/vnd.github+json",
 }
-PORTFOLIO_EVENT_FILE = "kraken_usd_dca_ghostfolio_events.jsonl"
-GHOSTFOLIO_RECEIPT_FILE = "ghostfolio_sync_receipts.jsonl"
+DCA_OUTBOX_REPOSITORY_OWNER = "aesscialo-bot"
+DCA_OUTBOX_REPOSITORY_NAME = "portfolio-canonical-ledger"
+DCA_OUTBOX_REPOSITORY_BRANCH = "main"
+DCA_OUTBOX_EVENT_PATH = "portfolio/kraken_usd_dca_ghostfolio_events.jsonl"
+DCA_OUTBOX_GHOSTFOLIO_EVENT_RECEIPT_PATH = "portfolio/ghostfolio_sync_receipts.jsonl"
 
 # A restart intentionally cancels pending confirmations.
 _pending_enable_confirmations: dict[str, dict[str, Any]] = {}
@@ -1075,26 +1083,32 @@ def _pending_gist_delivery_count(execution: Mapping[str, Any]) -> int:
 
 def get_ghostfolio_delivery_health() -> dict[str, Any]:
     """Compare durable portfolio events with local sync receipts."""
-    if not GIST_ID or not GIST_TOKEN:
-        return {"status": "UNAVAILABLE", "pending": None, "completed": None}
-    response = requests.get(
-        f"https://api.github.com/gists/{GIST_ID}",
-        headers={
-            "Authorization": f"token {GIST_TOKEN}",
-            "Accept": "application/vnd.github+json",
-        },
-        timeout=15,
-    )
-    if response.status_code != 200:
-        return {
-            "status": f"HTTP_{response.status_code}",
-            "pending": None,
-            "completed": None,
-        }
     try:
-        files = response.json().get("files", {})
-        event_text = (files.get(PORTFOLIO_EVENT_FILE) or {}).get("content", "")
-        receipt_text = (files.get(GHOSTFOLIO_RECEIPT_FILE) or {}).get("content", "")
+        repository_token = os.environ.get(TOKEN_ENV, "").strip() or GH_PAT.strip()
+        if not repository_token:
+            raise GitHubContentsConfigError("private repository credential is unavailable")
+        client = GitHubContentsClient(
+            owner=DCA_OUTBOX_REPOSITORY_OWNER,
+            repository=DCA_OUTBOX_REPOSITORY_NAME,
+            branch=DCA_OUTBOX_REPOSITORY_BRANCH,
+            token=repository_token,
+        )
+        event_path = configured_repository_path(DCA_OUTBOX_EVENT_PATH)
+        receipt_path = configured_repository_path(DCA_OUTBOX_GHOSTFOLIO_EVENT_RECEIPT_PATH)
+        if event_path == receipt_path:
+            raise GitHubContentsConfigError("event and receipt paths must be distinct")
+        commit_sha = client.resolve_commit_sha()
+        event_file = client.read_text_at_commit(event_path, commit_sha)
+        receipt_file = client.read_text_at_commit(receipt_path, commit_sha)
+    except GitHubContentsConfigError:
+        return {"status": "UNAVAILABLE", "pending": None, "completed": None}
+    except GitHubContentsError:
+        return {"status": "ERROR", "pending": None, "completed": None}
+    try:
+        if not event_file.exists:
+            raise ValueError("event ledger is missing")
+        event_text = event_file.content
+        receipt_text = receipt_file.content if receipt_file.exists else ""
         events = {}
         for line in event_text.splitlines():
             if not line.strip():

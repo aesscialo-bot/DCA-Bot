@@ -339,11 +339,34 @@ command. Do not edit around the validation.
 ### Discord reports pending Portfolio ledger deliveries
 
 Kraken remains the authoritative portfolio. A confirmed purchase remains in
-`PENDING_GIST_DELIVERIES` until its exact private-Gist ledger row is present and
-acknowledged. The Railway controller retries it on the guarded schedule without
-calling Kraken or blocking recovery of an existing order. Do not delete the
-queue manually; Portfolio Compass will import the row idempotently. Ghostfolio
-remains an optional mirror.
+`PENDING_GIST_DELIVERIES` until its exact private-repository audit row and
+PortfolioEventV3 are present and acknowledged. The field name is deliberately
+retained as local recovery evidence during the transport cutover. The Railway
+controller retries it on the guarded schedule without calling Kraken or
+blocking recovery of an existing order. Do not delete the queue manually;
+Portfolio Compass will import the event idempotently. Ghostfolio remains an
+optional mirror.
+
+Before enabling any producer workflow, create a dedicated **private** GitHub
+repository and an existing branch whose rules permit the outbox service
+identity's compare-and-swap commits. Configure repository variables
+`DCA_OUTBOX_REPOSITORY_OWNER`, `DCA_OUTBOX_REPOSITORY_NAME`,
+`DCA_OUTBOX_REPOSITORY_BRANCH`, `DCA_OUTBOX_AUDIT_PATH`,
+`DCA_OUTBOX_EVENT_PATH`, and `DCA_OUTBOX_HOLDINGS_PATH`, plus the Actions secret
+`DCA_OUTBOX_REPOSITORY_TOKEN`. This launch uses the existing classic controller
+credential as a time-bounded compatibility value; rotate it after launch to a
+fine-grained token limited to Contents read/write for that one private
+repository and remove the classic value. Paths are repository-relative POSIX
+paths and have no code defaults. The producer refuses missing
+settings, public repositories, failed authorization, malformed files, and
+unresolved SHA conflicts. `GIST_ID` and `GIST_TOKEN` do not enable a fallback.
+
+The Railway Discord controller reads the exact event ledger and Ghostfolio
+event-receipt path from one resolved immutable commit. A dedicated
+`DCA_OUTBOX_REPOSITORY_TOKEN` with Contents read access takes precedence; until
+that narrower credential is configured, the already-present Railway `GH_PAT`
+is used only for this count-and-hash health check. It no longer reads the
+portfolio ledger or receipts from a Gist.
 
 ### Ghostfolio is empty or remains on loading placeholders
 

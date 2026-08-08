@@ -17,7 +17,6 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import re
 import secrets
 import sys
@@ -27,8 +26,11 @@ from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
 import gist_logger
-import requests
 from gist_logger import build_gist_delivery
+from github_contents import (
+    GitHubContentsClient,
+    configured_outbox_paths,
+)
 from kraken_client import build_client_order_id, place_gbp_funded_market_buy
 
 
@@ -258,16 +260,6 @@ def _validate_delivery(delivery: dict, request: RecoveryRequest) -> tuple[str, s
     return event_hash, row_sha256
 
 
-def _gist_credentials() -> tuple[str, str]:
-    gist_id = os.environ.get("GIST_ID", "").strip()
-    gist_token = os.environ.get("GIST_TOKEN", "").strip()
-    if not gist_id or not gist_token:
-        raise RecoveryRefused(
-            "Gist credentials are required to prove the exact Markdown row exists"
-        )
-    return gist_id, gist_token
-
-
 def _event_line(delivery: dict) -> str:
     return json.dumps(
         delivery["event"],
@@ -277,17 +269,7 @@ def _event_line(delivery: dict) -> str:
     ) + "\n"
 
 
-def _gist_contents(gist: dict, headers: dict) -> tuple[str, str]:
-    markdown = gist_logger._gist_file_content(  # noqa: SLF001 - shared contract
-        gist, headers, gist_logger.GIST_FILENAME
-    )
-    events = gist_logger._gist_file_content(  # noqa: SLF001 - shared contract
-        gist, headers, gist_logger.GHOSTFOLIO_EVENTS_FILENAME
-    )
-    return markdown, events
-
-
-def _exact_gist_status(markdown: str, events: str, delivery: dict) -> tuple[str, str]:
+def _exact_outbox_status(markdown: str, events: str, delivery: dict) -> tuple[str, str]:
     row_status = gist_logger._delivery_row_status(  # noqa: SLF001
         markdown, delivery
     )
@@ -307,34 +289,23 @@ def _exact_gist_status(markdown: str, events: str, delivery: dict) -> tuple[str,
             "Portfolio event conflicts with the existing order-ID record"
         )
     if row_status != "duplicate" or event_status not in {"missing", "duplicate"}:
-        raise RecoveryRefused("Gist delivery state is not safely recoverable")
+        raise RecoveryRefused("private repository delivery state is not safely recoverable")
     return row_status, event_status
 
 
 def _inspect_and_maybe_publish_event(delivery: dict, *, publish: bool) -> str:
     """Require the exact row and optionally append only the missing event.
 
-    The PATCH payload contains only the JSONL filename.  The response is then
-    checked for both the unchanged exact row and the exact event before success
-    is reported.  An exact existing event is an idempotent success.
+    Only the configured JSONL path is changed.  Optimistic blob-SHA retries are
+    handled by the shared Contents API transport, then both files are checked.
+    An exact existing event is an idempotent success.
     """
-    gist_id, gist_token = _gist_credentials()
-    headers = {
-        "Authorization": f"Bearer {gist_token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    url = f"https://api.github.com/gists/{gist_id}"
-
     try:
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=gist_logger.GIST_REQUEST_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        markdown, events = _gist_contents(response.json(), headers)
-        _row_status, event_status = _exact_gist_status(
+        paths = configured_outbox_paths()
+        client = GitHubContentsClient.from_env()
+        markdown = client.read_text(paths.audit).content
+        events = client.read_text(paths.event).content
+        _row_status, event_status = _exact_outbox_status(
             markdown, events, delivery
         )
 
@@ -343,43 +314,45 @@ def _inspect_and_maybe_publish_event(delivery: dict, *, publish: bool) -> str:
         if not publish:
             return "event_missing"
 
-        if events and not events.endswith("\n"):
-            events += "\n"
-        updated_events = events + _event_line(delivery)
-        if len(updated_events.encode("utf-8")) > gist_logger.MAX_GIST_FILE_BYTES:
-            raise RecoveryRefused(
-                "Ghostfolio event file would exceed the supported size"
+        def append_missing_event(current_events):
+            current_status = gist_logger._delivery_event_status(  # noqa: SLF001
+                current_events, delivery
             )
+            if current_status == "conflict":
+                raise RecoveryRefused(
+                    "Portfolio event conflicts with the existing order-ID record"
+                )
+            if current_status == "duplicate":
+                return current_events
+            if current_events and not current_events.endswith("\n"):
+                current_events += "\n"
+            updated_events = current_events + _event_line(delivery)
+            if len(updated_events.encode("utf-8")) > gist_logger.MAX_GIST_FILE_BYTES:
+                raise RecoveryRefused(
+                    "Portfolio event file would exceed the supported size"
+                )
+            return updated_events
 
-        response = requests.patch(
-            url,
-            headers=headers,
-            json={
-                "files": {
-                    gist_logger.GHOSTFOLIO_EVENTS_FILENAME: {
-                        "content": updated_events
-                    }
-                }
-            },
-            timeout=gist_logger.GIST_REQUEST_TIMEOUT_SECONDS,
+        client.update_text(
+            paths.event,
+            append_missing_event,
+            message="Recover reviewed PortfolioEventV3",
         )
-        response.raise_for_status()
-        verified_markdown, verified_events = _gist_contents(
-            response.json(), headers
-        )
-        _verified_row, verified_event = _exact_gist_status(
+        verified_markdown = client.read_text(paths.audit).content
+        verified_events = client.read_text(paths.event).content
+        _verified_row, verified_event = _exact_outbox_status(
             verified_markdown, verified_events, delivery
         )
         if verified_event != "duplicate":
             raise RecoveryRefused(
-                "Gist did not confirm the exact appended Portfolio event"
+                "private repository did not confirm the exact appended Portfolio event"
             )
         return "event_appended"
     except RecoveryRefused:
         raise
     except Exception as error:
         raise RecoveryRefused(
-            f"Gist recovery failed safely ({type(error).__name__})"
+            f"private repository recovery failed safely ({type(error).__name__})"
         ) from error
 
 
@@ -457,7 +430,7 @@ def recover_portfolio_event(
             "reviewed Markdown-row hash does not match current Kraken evidence"
         )
 
-    gist_status = _inspect_and_maybe_publish_event(delivery, publish=publish)
+    outbox_status = _inspect_and_maybe_publish_event(delivery, publish=publish)
 
     return {
         "mode": "publish" if publish else "preview",
@@ -470,7 +443,7 @@ def recover_portfolio_event(
         "funding_client_order_id": funding_client_order_id,
         "event_hash": event_hash,
         "row_sha256": row_sha256,
-        "gist_status": gist_status,
+        "outbox_status": outbox_status,
     }
 
 
@@ -484,7 +457,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--publish",
         action="store_true",
-        help="append the exact delivery to the Gist after all checks pass",
+        help="append the exact delivery to the private repository after all checks pass",
     )
     parser.add_argument(
         "--expected-event-hash",

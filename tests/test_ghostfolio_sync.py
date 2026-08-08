@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import importlib.util
 import json
@@ -19,6 +20,30 @@ SYNTHETIC_OPENING_HASH = "b" * 64
 SYNTHETIC_OPENING_QUANTITY = 1.25
 SYNTHETIC_EVENT_QUANTITY = 0.25
 SYNTHETIC_RESIDUAL_QUANTITY = 1.0
+
+
+def repository_environment():
+    return {
+        ghostfolio_sync.REPOSITORY_OWNER_ENV: "owner",
+        ghostfolio_sync.REPOSITORY_NAME_ENV: "canonical-ledger",
+        ghostfolio_sync.REPOSITORY_BRANCH_ENV: "main",
+        ghostfolio_sync.REPOSITORY_TOKEN_ENV: "private-token",
+        ghostfolio_sync.REPOSITORY_EVENT_PATH_ENV: (
+            "portfolio/kraken_usd_dca_ghostfolio_events.jsonl"
+        ),
+        ghostfolio_sync.REPOSITORY_HOLDINGS_PATH_ENV: (
+            "portfolio/kraken_holdings_snapshot_v1.json"
+        ),
+        ghostfolio_sync.REPOSITORY_EVENT_RECEIPT_PATH_ENV: (
+            "portfolio/ghostfolio_sync_receipts.jsonl"
+        ),
+        ghostfolio_sync.REPOSITORY_HOLDINGS_RECEIPT_PATH_ENV: (
+            "portfolio/ghostfolio_holdings_receipts.jsonl"
+        ),
+        ghostfolio_sync.REPOSITORY_PROVENANCE_RECEIPT_PATH_ENV: (
+            "portfolio/ghostfolio_provenance_reclassification_receipts.jsonl"
+        ),
+    }
 
 
 def event(identifier="ORDER-1"):
@@ -283,6 +308,139 @@ class GhostfolioSyncTests(unittest.TestCase):
         self._intent_patch.stop()
         self._intent_directory.cleanup()
 
+    def test_repository_snapshot_reads_every_artifact_at_one_commit(self):
+        environment = repository_environment()
+        commit_sha = "a" * 40
+        contents = {
+            environment[setting]: f"content for {filename}\n"
+            for filename, setting in (
+                ghostfolio_sync.REPOSITORY_PATH_ENV_BY_FILE.items()
+            )
+        }
+        calls = []
+
+        def github_response(url, **kwargs):
+            calls.append((url, kwargs))
+            self.assertEqual(kwargs["token"], "private-token")
+            self.assertEqual(
+                kwargs["request_headers"]["X-GitHub-Api-Version"],
+                ghostfolio_sync.GITHUB_API_VERSION,
+            )
+            if url.endswith("/repos/owner/canonical-ledger"):
+                return 200, {
+                    "private": True,
+                    "full_name": "owner/canonical-ledger",
+                }
+            if url.endswith("/commits/main"):
+                return 200, {"sha": commit_sha}
+            for path, content in contents.items():
+                if f"/contents/{path}?" in url:
+                    raw = content.encode("utf-8")
+                    return 200, {
+                        "type": "file",
+                        "path": path,
+                        "sha": "b" * 40,
+                        "size": len(raw),
+                        "encoding": "base64",
+                        "content": base64.b64encode(raw).decode("ascii"),
+                    }
+            self.fail(f"unexpected private repository request: {url}")
+
+        with (
+            patch.dict(ghostfolio_sync.os.environ, environment),
+            patch.object(
+                ghostfolio_sync, "request_json", side_effect=github_response
+            ),
+        ):
+            snapshot = ghostfolio_sync.repository_snapshot()
+
+        self.assertEqual(snapshot["repository_commit_sha"], commit_sha)
+        self.assertEqual(
+            set(snapshot["files"]),
+            set(ghostfolio_sync.REPOSITORY_PATH_ENV_BY_FILE),
+        )
+        for filename, setting in (
+            ghostfolio_sync.REPOSITORY_PATH_ENV_BY_FILE.items()
+        ):
+            self.assertEqual(
+                ghostfolio_sync.file_content(snapshot, filename),
+                contents[environment[setting]],
+            )
+        content_urls = [url for url, _kwargs in calls if "/contents/" in url]
+        self.assertEqual(len(content_urls), 5)
+        self.assertTrue(
+            all(url.endswith(f"ref={commit_sha}") for url in content_urls)
+        )
+
+    def test_repository_snapshot_rejects_a_non_private_destination(self):
+        with (
+            patch.dict(ghostfolio_sync.os.environ, repository_environment()),
+            patch.object(
+                ghostfolio_sync,
+                "request_json",
+                return_value=(
+                    200,
+                    {"private": False, "full_name": "owner/canonical-ledger"},
+                ),
+            ),
+            self.assertRaisesRegex(RuntimeError, "not verified private"),
+        ):
+            ghostfolio_sync.repository_snapshot()
+
+    def test_repository_configuration_rejects_duplicate_artifact_paths(self):
+        environment = repository_environment()
+        environment[ghostfolio_sync.REPOSITORY_HOLDINGS_PATH_ENV] = environment[
+            ghostfolio_sync.REPOSITORY_EVENT_PATH_ENV
+        ]
+        with (
+            patch.dict(ghostfolio_sync.os.environ, environment),
+            self.assertRaisesRegex(RuntimeError, "paths must be distinct"),
+        ):
+            ghostfolio_sync.repository_configuration()
+
+    def test_receipt_append_retries_sha_conflict_and_verifies_durability(self):
+        environment = repository_environment()
+        other = {"order_id": "OTHER", "event_hash": "c" * 64}
+        wanted = {"order_id": "ORDER-1", "event_hash": "d" * 64}
+        other_content = ghostfolio_sync.canonical(other) + "\n"
+        wanted_content = other_content + ghostfolio_sync.canonical(wanted) + "\n"
+        repository_files = [
+            {"content": "", "sha": "1" * 40, "exists": True},
+            {"content": other_content, "sha": "2" * 40, "exists": True},
+            {"content": wanted_content, "sha": "3" * 40, "exists": True},
+        ]
+        with (
+            patch.dict(ghostfolio_sync.os.environ, environment),
+            patch.object(ghostfolio_sync, "_verify_private_repository"),
+            patch.object(
+                ghostfolio_sync,
+                "_repository_file",
+                side_effect=repository_files,
+            ),
+            patch.object(
+                ghostfolio_sync,
+                "_repository_json",
+                side_effect=[(409, {}), (200, {})],
+            ) as write,
+        ):
+            self.assertTrue(
+                ghostfolio_sync._append_repository_receipt(
+                    ghostfolio_sync.RECEIPT_FILE, "order_id", wanted
+                )
+            )
+
+        self.assertEqual(write.call_count, 2)
+        retry_payload = write.call_args_list[1].kwargs["payload"]
+        self.assertEqual(retry_payload["sha"], "2" * 40)
+        self.assertEqual(retry_payload["branch"], "main")
+        self.assertEqual(
+            base64.b64decode(retry_payload["content"]).decode("utf-8"),
+            wanted_content,
+        )
+        self.assertNotIn(
+            "private-token", write.call_args_list[1].args[1]
+        )
+
     def test_compose_scopes_secrets_and_configuration_runs_one_shot(self):
         root = PATH.parents[1]
         compose = (root / "ghostfolio" / "compose.yml").read_text(
@@ -304,6 +462,20 @@ class GhostfolioSyncTests(unittest.TestCase):
         scoped_env = (root / "ghostfolio" / "write-service-env.ps1").read_text(
             encoding="utf-8"
         )
+        for key in (
+            "DCA_OUTBOX_REPOSITORY_OWNER",
+            "DCA_OUTBOX_REPOSITORY_NAME",
+            "DCA_OUTBOX_REPOSITORY_BRANCH",
+            "DCA_OUTBOX_REPOSITORY_TOKEN",
+            "DCA_OUTBOX_EVENT_PATH",
+            "DCA_OUTBOX_HOLDINGS_PATH",
+            "DCA_OUTBOX_GHOSTFOLIO_EVENT_RECEIPT_PATH",
+            "DCA_OUTBOX_GHOSTFOLIO_HOLDINGS_RECEIPT_PATH",
+            "DCA_OUTBOX_GHOSTFOLIO_PROVENANCE_RECEIPT_PATH",
+        ):
+            self.assertIn(key, scoped_env)
+        self.assertNotIn("'GIST_ID'", scoped_env)
+        self.assertNotIn("'GIST_TOKEN'", scoped_env)
         for key in (
             "GHOSTFOLIO_RECOVERY_CRYPTO_ORDER_ID",
             "GHOSTFOLIO_RECOVERY_FUNDING_ORDER_ID",
@@ -697,7 +869,7 @@ class GhostfolioSyncTests(unittest.TestCase):
     def test_fx_bridge_runs_before_portfolio_calculation_audit(self):
         order = []
         with (
-            patch.object(ghostfolio_sync, "gist", return_value={"files": {}}),
+            patch.object(ghostfolio_sync, "repository_snapshot", return_value={"files": {}}),
             patch.object(
                 ghostfolio_sync,
                 "prepare_ghostfolio_fx_bridge",
@@ -745,7 +917,7 @@ class GhostfolioSyncTests(unittest.TestCase):
             state_path = Path(directory) / "state.json"
             with (
                 patch.object(ghostfolio_sync, "STATE_PATH", state_path),
-                patch.object(ghostfolio_sync, "gist", return_value={"files": {}}),
+                patch.object(ghostfolio_sync, "repository_snapshot", return_value={"files": {}}),
                 patch.object(ghostfolio_sync, "ghostfolio_token", return_value="token"),
                 patch.object(
                     ghostfolio_sync,
@@ -780,10 +952,10 @@ class GhostfolioSyncTests(unittest.TestCase):
             self.assertEqual(state["portfolio_calculation_status"], "ERROR")
             self.assertTrue(state["portfolio_calculation_has_error"])
             reconcile.assert_called_once_with(
-                commit=True, token="token", gist_payload={"files": {}}
+                commit=True, token="token", repository_payload={"files": {}}
             )
 
-    def test_sync_once_passes_one_immutable_gist_view_to_reconciliation(self):
+    def test_sync_once_passes_one_immutable_repository_view_to_reconciliation(self):
         payload = {"files": {}}
         holdings = {
             "status": "IN_SYNC",
@@ -799,8 +971,8 @@ class GhostfolioSyncTests(unittest.TestCase):
                     ghostfolio_sync, "STATE_PATH", Path(directory) / "state.json"
                 ),
                 patch.object(
-                    ghostfolio_sync, "gist", return_value=payload
-                ) as gist_read,
+                    ghostfolio_sync, "repository_snapshot", return_value=payload
+                ) as repository_read,
                 patch.object(
                     ghostfolio_sync, "ghostfolio_token", return_value="token"
                 ),
@@ -822,12 +994,12 @@ class GhostfolioSyncTests(unittest.TestCase):
             ):
                 ghostfolio_sync.sync_once()
 
-        gist_read.assert_called_once_with()
+        repository_read.assert_called_once_with()
         accounts.assert_called_once_with("token", require_bitkub=False)
         account_map.assert_called_once_with(
             {"Kraken DCA": "kraken"}, require_bitkub=False
         )
-        self.assertIs(reconcile.call_args.kwargs["gist_payload"], payload)
+        self.assertIs(reconcile.call_args.kwargs["repository_payload"], payload)
 
     def test_confirmed_hype_reclassification_is_durable_and_quantity_neutral(self):
         payload = hype_recovery_payload()
@@ -844,7 +1016,7 @@ class GhostfolioSyncTests(unittest.TestCase):
             "BTC_GBP": 0.01,
             "SOL_GBP": 2,
         }
-        gist_updates = []
+        repository_updates = []
 
         def update_opening(_identity, amount, _event, snapshot_hash, _token):
             self.assertTrue(
@@ -857,19 +1029,27 @@ class GhostfolioSyncTests(unittest.TestCase):
             self.assertEqual(amount, ghostfolio_sync.Decimal("1"))
             self.assertEqual(snapshot_hash, SYNTHETIC_OPENING_HASH)
 
-        def publish_gist(_url, **kwargs):
-            self.assertEqual(kwargs["method"], "PATCH")
-            files = kwargs["payload"]["files"]
-            self.assertEqual(
-                set(files),
+        def publish_repository(_payload, filename, identity_field, receipt):
+            self.assertIn(
+                filename,
                 {
                     ghostfolio_sync.RECEIPT_FILE,
                     ghostfolio_sync.PROVENANCE_RECLASSIFICATION_RECEIPT_FILE,
                 },
             )
-            gist_updates.append(files)
-            remote["files"].update(json.loads(ghostfolio_sync.canonical(files)))
-            return 200, {}
+            self.assertEqual(
+                identity_field,
+                "order_id"
+                if filename == ghostfolio_sync.RECEIPT_FILE
+                else "event_id",
+            )
+            content = ghostfolio_sync.file_content(remote, filename)
+            separator = "" if not content or content.endswith("\n") else "\n"
+            remote["files"][filename] = {
+                "content": content + separator + ghostfolio_sync.canonical(receipt) + "\n"
+            }
+            repository_updates.append(filename)
+            return True
 
         with (
             patch.dict(
@@ -878,8 +1058,6 @@ class GhostfolioSyncTests(unittest.TestCase):
                     "GHOSTFOLIO_ACCOUNT_MAP": json.dumps(
                         {"HYPE_USD": "kraken"}
                     ),
-                    "GIST_ID": "gist",
-                    "GIST_TOKEN": "token",
                 },
             ),
             patch.object(
@@ -923,11 +1101,13 @@ class GhostfolioSyncTests(unittest.TestCase):
             ),
             patch.object(
                 ghostfolio_sync,
-                "gist",
+                "repository_snapshot",
                 side_effect=lambda: json.loads(ghostfolio_sync.canonical(remote)),
             ),
             patch.object(
-                ghostfolio_sync, "request_json", side_effect=publish_gist
+                ghostfolio_sync,
+                "append_named_receipt",
+                side_effect=publish_repository,
             ),
         ):
             result = ghostfolio_sync.process_hype_provenance_reclassification(
@@ -942,7 +1122,13 @@ class GhostfolioSyncTests(unittest.TestCase):
         self.assertEqual(result["status"], "COMPLETE")
         self.assertTrue(result["clear_intent_after_state"])
         self.assertEqual(receipts, {SYNTHETIC_RECOVERY_EVENT_ID})
-        self.assertEqual(len(gist_updates), 1)
+        self.assertEqual(
+            repository_updates,
+            [
+                ghostfolio_sync.RECEIPT_FILE,
+                ghostfolio_sync.PROVENANCE_RECLASSIFICATION_RECEIPT_FILE,
+            ],
+        )
         update.assert_called_once()
         imported.assert_called_once_with(item, "token")
         intent = ghostfolio_sync.load_provenance_reclassification_intent()
@@ -1072,7 +1258,7 @@ class GhostfolioSyncTests(unittest.TestCase):
             state_path = Path(directory) / "state.json"
             with (
                 patch.object(ghostfolio_sync, "STATE_PATH", state_path),
-                patch.object(ghostfolio_sync, "gist", return_value=payload),
+                patch.object(ghostfolio_sync, "repository_snapshot", return_value=payload),
                 patch.object(ghostfolio_sync, "ghostfolio_token", return_value="token"),
                 patch.object(
                     ghostfolio_sync,
@@ -1105,7 +1291,7 @@ class GhostfolioSyncTests(unittest.TestCase):
         reconcile.assert_called_once_with(
             commit=False,
             token="token",
-            gist_payload=payload,
+            repository_payload=payload,
             allow_provenance_intent=True,
         )
         clear_intent.assert_not_called()
@@ -1408,7 +1594,7 @@ class GhostfolioSyncTests(unittest.TestCase):
                 ghostfolio_sync.os.environ,
                 {"GHOSTFOLIO_ACCOUNT_MAP": json.dumps({"SOL_GBP": "kraken"})},
             ),
-            patch.object(ghostfolio_sync, "gist", return_value=payload),
+            patch.object(ghostfolio_sync, "repository_snapshot", return_value=payload),
             patch.object(ghostfolio_sync, "ghostfolio_token", return_value="token"),
             patch.object(
                 ghostfolio_sync,
@@ -1504,7 +1690,7 @@ class GhostfolioSyncTests(unittest.TestCase):
                 patch.object(
                     ghostfolio_sync, "STATE_PATH", Path(directory) / "state.json"
                 ),
-                patch.object(ghostfolio_sync, "gist", return_value=payload),
+                patch.object(ghostfolio_sync, "repository_snapshot", return_value=payload),
                 patch.object(ghostfolio_sync, "ghostfolio_token", return_value="token"),
                 patch.object(
                     ghostfolio_sync,
@@ -1564,7 +1750,7 @@ class GhostfolioSyncTests(unittest.TestCase):
     def test_signed_snapshot_drift_is_reconciled_exactly_once(self):
         snapshot = signed_snapshot()
         post_import_order = []
-        gist_payload = {
+        repository_payload = {
             "files": {
                 ghostfolio_sync.HOLDINGS_SNAPSHOT_FILE: {
                     "content": ghostfolio_sync.canonical(snapshot)
@@ -1589,7 +1775,7 @@ class GhostfolioSyncTests(unittest.TestCase):
                 ghostfolio_sync.os.environ,
                 {"GHOSTFOLIO_ACCOUNT_MAP": json.dumps({"BTC_GBP": "kraken"})},
             ),
-            patch.object(ghostfolio_sync, "gist", return_value=gist_payload),
+            patch.object(ghostfolio_sync, "repository_snapshot", return_value=repository_payload),
             patch.object(
                 ghostfolio_sync,
                 "prepare_ghostfolio_fx_bridge",
@@ -1634,7 +1820,7 @@ class GhostfolioSyncTests(unittest.TestCase):
 
     def test_snapshot_receipt_is_blocked_until_quantities_converge(self):
         snapshot = signed_snapshot()
-        gist_payload = {
+        repository_payload = {
             "files": {
                 ghostfolio_sync.HOLDINGS_SNAPSHOT_FILE: {
                     "content": ghostfolio_sync.canonical(snapshot)
@@ -1647,7 +1833,7 @@ class GhostfolioSyncTests(unittest.TestCase):
                 ghostfolio_sync.os.environ,
                 {"GHOSTFOLIO_ACCOUNT_MAP": json.dumps({"BTC_GBP": "kraken"})},
             ),
-            patch.object(ghostfolio_sync, "gist", return_value=gist_payload),
+            patch.object(ghostfolio_sync, "repository_snapshot", return_value=repository_payload),
             patch.object(
                 ghostfolio_sync,
                 "prepare_ghostfolio_fx_bridge",
@@ -1689,7 +1875,7 @@ class GhostfolioSyncTests(unittest.TestCase):
             "snapshot": snapshot,
             "receipt": receipt_value,
         })
-        gist_payload = {
+        repository_payload = {
             "files": {
                 ghostfolio_sync.HOLDINGS_SNAPSHOT_FILE: {
                     "content": ghostfolio_sync.canonical(snapshot)
@@ -1697,7 +1883,7 @@ class GhostfolioSyncTests(unittest.TestCase):
             }
         }
         with (
-            patch.object(ghostfolio_sync, "gist", return_value=gist_payload),
+            patch.object(ghostfolio_sync, "repository_snapshot", return_value=repository_payload),
             patch.object(
                 ghostfolio_sync,
                 "prepare_ghostfolio_fx_bridge",
@@ -1764,7 +1950,7 @@ class GhostfolioSyncTests(unittest.TestCase):
                 "STATE_PATH",
                 Path(self._intent_directory.name) / "state.json",
             ),
-            patch.object(ghostfolio_sync, "gist", return_value=payload),
+            patch.object(ghostfolio_sync, "repository_snapshot", return_value=payload),
             patch.object(
                 ghostfolio_sync,
                 "prepare_ghostfolio_fx_bridge",
@@ -1788,7 +1974,7 @@ class GhostfolioSyncTests(unittest.TestCase):
                 commit=True,
                 token="token",
                 now=datetime(2026, 8, 7, 5, 30, tzinfo=timezone.utc),
-                gist_payload=payload,
+                repository_payload=payload,
             )
 
         self.assertEqual(result["status"], "RECONCILED")
@@ -1826,7 +2012,7 @@ class GhostfolioSyncTests(unittest.TestCase):
                 "STATE_PATH",
                 Path(self._intent_directory.name) / "state.json",
             ),
-            patch.object(ghostfolio_sync, "gist", return_value=payload),
+            patch.object(ghostfolio_sync, "repository_snapshot", return_value=payload),
             patch.object(
                 ghostfolio_sync,
                 "prepare_ghostfolio_fx_bridge",
@@ -1865,7 +2051,7 @@ class GhostfolioSyncTests(unittest.TestCase):
                 commit=True,
                 token="token",
                 now=datetime(2026, 8, 7, 7, tzinfo=timezone.utc),
-                gist_payload=payload,
+                repository_payload=payload,
             )
 
         self.assertEqual(result["status"], "RECONCILED")
@@ -1875,7 +2061,7 @@ class GhostfolioSyncTests(unittest.TestCase):
 
     def test_calculation_error_retains_intent_and_blocks_receipt(self):
         snapshot = signed_snapshot()
-        gist_payload = {
+        repository_payload = {
             "files": {
                 ghostfolio_sync.HOLDINGS_SNAPSHOT_FILE: {
                     "content": ghostfolio_sync.canonical(snapshot)
@@ -1891,7 +2077,7 @@ class GhostfolioSyncTests(unittest.TestCase):
                 ghostfolio_sync.os.environ,
                 {"GHOSTFOLIO_ACCOUNT_MAP": json.dumps({"BTC_GBP": "kraken"})},
             ),
-            patch.object(ghostfolio_sync, "gist", return_value=gist_payload),
+            patch.object(ghostfolio_sync, "repository_snapshot", return_value=repository_payload),
             patch.object(
                 ghostfolio_sync,
                 "prepare_ghostfolio_fx_bridge",
@@ -1929,7 +2115,7 @@ class GhostfolioSyncTests(unittest.TestCase):
 
     def test_signed_snapshot_reconciliation_conflict_fails_closed(self):
         snapshot = signed_snapshot()
-        gist_payload = {
+        repository_payload = {
             "files": {
                 ghostfolio_sync.HOLDINGS_SNAPSHOT_FILE: {
                     "content": ghostfolio_sync.canonical(snapshot)
@@ -1941,7 +2127,7 @@ class GhostfolioSyncTests(unittest.TestCase):
                 ghostfolio_sync.os.environ,
                 {"GHOSTFOLIO_ACCOUNT_MAP": json.dumps({"BTC_GBP": "kraken"})},
             ),
-            patch.object(ghostfolio_sync, "gist", return_value=gist_payload),
+            patch.object(ghostfolio_sync, "repository_snapshot", return_value=repository_payload),
             patch.object(
                 ghostfolio_sync,
                 "prepare_ghostfolio_fx_bridge",
@@ -1983,7 +2169,7 @@ class GhostfolioSyncTests(unittest.TestCase):
         newer_event["canonical_hash"] = hashlib.sha256(
             ghostfolio_sync.canonical(newer_event).encode()
         ).hexdigest()
-        gist_payload = {
+        repository_payload = {
             "files": {
                 ghostfolio_sync.HOLDINGS_SNAPSHOT_FILE: {
                     "content": ghostfolio_sync.canonical(snapshot)
@@ -1994,7 +2180,7 @@ class GhostfolioSyncTests(unittest.TestCase):
             }
         }
         with (
-            patch.object(ghostfolio_sync, "gist", return_value=gist_payload),
+            patch.object(ghostfolio_sync, "repository_snapshot", return_value=repository_payload),
             patch.object(ghostfolio_sync, "prepare_ghostfolio_fx_bridge") as bridge,
             patch.object(ghostfolio_sync, "request_json") as request,
             patch.object(ghostfolio_sync, "append_named_receipt") as receipt,

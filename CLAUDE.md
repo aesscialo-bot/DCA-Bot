@@ -24,15 +24,19 @@ workflows, or release configuration.
 - Stale, missing, insufficient, or inconsistent state always skips trading.
 - A pending funding or crypto order must be reconciled before any new order.
 - Kraken is the portfolio and execution source of truth.
-- Gist and Ghostfolio are optional post-fill mirrors and never influence spend,
-  success, scheduling, trend classification, or recovery.
+- The private repository outbox and Ghostfolio are post-fill mirrors and never
+  influence spend, success, scheduling, trend classification, or recovery.
 
 ## Ownership and security
 
 - Railway continuously runs the Discord controller and scheduler.
 - GitHub Actions holds Kraken credentials and performs trading and reporting.
 - Kraken keys require query/order permissions and must not permit withdrawals.
-- `GIST_TOKEN` is only for Gist; `GH_PAT_FOR_VARS` is only for repository state.
+- `DCA_OUTBOX_REPOSITORY_TOKEN` must be rotated after launch to Contents
+  read/write on the dedicated private outbox repository only. The cutover's
+  classic compatibility value is time-bounded. `GH_PAT_FOR_VARS` is only for
+  repository state. The three outbox producers have no Gist fallback. `GIST_TOKEN` remains
+  restricted to the separate market-history Gist during its transition.
 - Never log tokens, API responses containing credentials, complete production
   rules, complete analysis state, or complete execution state.
 - Workflows load production JSON inside a step, mask every nonempty line, and

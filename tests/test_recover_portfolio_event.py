@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import gist_logger
+from github_contents import RepositoryFile, WriteResult
 import kraken_client
 import recover_portfolio_event as recovery
 
@@ -165,27 +166,36 @@ def event_content(delivery):
     ) + "\n"
 
 
-class MockResponse:
-    def __init__(self, body=None, status_code=200):
-        self._body = body or {}
-        self.status_code = status_code
-        self.text = "sanitized-response"
-
-    def json(self):
-        return self._body
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
-
-
-def gist_body(markdown, events):
+def outbox_environment():
     return {
-        "files": {
-            gist_logger.GIST_FILENAME: {"content": markdown},
-            gist_logger.GHOSTFOLIO_EVENTS_FILENAME: {"content": events},
-        }
+        "DCA_OUTBOX_REPOSITORY_OWNER": "example",
+        "DCA_OUTBOX_REPOSITORY_NAME": "private-outbox",
+        "DCA_OUTBOX_REPOSITORY_BRANCH": "main",
+        "DCA_OUTBOX_REPOSITORY_TOKEN": "sanitized-token",
+        "DCA_OUTBOX_AUDIT_PATH": "portfolio/audit.md",
+        "DCA_OUTBOX_EVENT_PATH": "portfolio/events.jsonl",
+        "DCA_OUTBOX_HOLDINGS_PATH": "portfolio/holdings.json",
     }
+
+
+class FakeRepository:
+    def __init__(self, markdown="", events=""):
+        self.contents = {
+            "portfolio/audit.md": markdown,
+            "portfolio/events.jsonl": events,
+        }
+        self.update_calls = []
+
+    def read_text(self, path):
+        content = self.contents.get(path, "")
+        return RepositoryFile(content=content, sha="a" * 40, exists=path in self.contents)
+
+    def update_text(self, path, transform, *, message):
+        self.update_calls.append((path, message))
+        current = self.contents.get(path, "")
+        updated = transform(current)
+        self.contents[path] = updated
+        return WriteResult(changed=updated != current, sha="b" * 40, content=updated)
 
 
 class PortfolioEventRecoveryTests(unittest.TestCase):
@@ -259,7 +269,7 @@ class PortfolioEventRecoveryTests(unittest.TestCase):
         inspect.assert_called_once()
         self.assertFalse(inspect.call_args.kwargs["publish"])
         self.assertEqual(summary["mode"], "preview")
-        self.assertEqual(summary["gist_status"], "event_missing")
+        self.assertEqual(summary["outbox_status"], "event_missing")
         self.assertEqual(summary["timestamp"], "2026-08-07T05:34:00Z")
         self.assertRegex(summary["event_hash"], r"^[0-9a-f]{64}$")
         self.assertRegex(summary["row_sha256"], r"^[0-9a-f]{64}$")
@@ -276,7 +286,7 @@ class PortfolioEventRecoveryTests(unittest.TestCase):
                 "funding_client_order_id",
                 "event_hash",
                 "row_sha256",
-                "gist_status",
+                "outbox_status",
             },
         )
 
@@ -403,7 +413,7 @@ class PortfolioEventRecoveryTests(unittest.TestCase):
             delivered["event"]["canonical_hash"], preview["event_hash"]
         )
         self.assertTrue(inspect.call_args.kwargs["publish"])
-        self.assertEqual(published["gist_status"], "event_appended")
+        self.assertEqual(published["outbox_status"], "event_appended")
 
     def test_repeated_publish_reuses_identical_delivery_and_client_ids(self):
         with (
@@ -498,17 +508,14 @@ class PortfolioEventRecoveryTests(unittest.TestCase):
 
     def test_missing_markdown_row_is_refused_without_patch(self):
         delivery = synthetic_delivery()
+        repository = FakeRepository()
         with (
-            patch.dict(
-                os.environ,
-                {"GIST_ID": "sanitized-gist", "GIST_TOKEN": "sanitized-token"},
-            ),
+            patch.dict(os.environ, outbox_environment(), clear=True),
             patch.object(
-                recovery.requests,
-                "get",
-                return_value=MockResponse(gist_body("", "")),
+                recovery.GitHubContentsClient,
+                "from_env",
+                return_value=repository,
             ),
-            patch.object(recovery.requests, "patch") as patch_request,
         ):
             with self.assertRaisesRegex(
                 recovery.RecoveryRefused, "exact Markdown row is missing"
@@ -517,22 +524,19 @@ class PortfolioEventRecoveryTests(unittest.TestCase):
                     delivery, publish=True
                 )
 
-        patch_request.assert_not_called()
+        self.assertEqual(repository.update_calls, [])
 
     def test_conflicting_markdown_row_is_refused_without_patch(self):
         delivery = synthetic_delivery()
         conflicting_row = delivery["row"].replace("GBP 12.50", "GBP 12.51")
+        repository = FakeRepository(conflicting_row, "")
         with (
-            patch.dict(
-                os.environ,
-                {"GIST_ID": "sanitized-gist", "GIST_TOKEN": "sanitized-token"},
-            ),
+            patch.dict(os.environ, outbox_environment(), clear=True),
             patch.object(
-                recovery.requests,
-                "get",
-                return_value=MockResponse(gist_body(conflicting_row, "")),
+                recovery.GitHubContentsClient,
+                "from_env",
+                return_value=repository,
             ),
-            patch.object(recovery.requests, "patch") as patch_request,
         ):
             with self.assertRaisesRegex(
                 recovery.RecoveryRefused, "Markdown row conflicts"
@@ -541,7 +545,7 @@ class PortfolioEventRecoveryTests(unittest.TestCase):
                     delivery, publish=True
                 )
 
-        patch_request.assert_not_called()
+        self.assertEqual(repository.update_calls, [])
 
     def test_conflicting_event_is_refused_without_patch(self):
         delivery = synthetic_delivery()
@@ -551,19 +555,14 @@ class PortfolioEventRecoveryTests(unittest.TestCase):
             sort_keys=True,
             separators=(",", ":"),
         ) + "\n"
+        repository = FakeRepository(delivery["row"], conflicting_content)
         with (
-            patch.dict(
-                os.environ,
-                {"GIST_ID": "sanitized-gist", "GIST_TOKEN": "sanitized-token"},
-            ),
+            patch.dict(os.environ, outbox_environment(), clear=True),
             patch.object(
-                recovery.requests,
-                "get",
-                return_value=MockResponse(
-                    gist_body(delivery["row"], conflicting_content)
-                ),
+                recovery.GitHubContentsClient,
+                "from_env",
+                return_value=repository,
             ),
-            patch.object(recovery.requests, "patch") as patch_request,
         ):
             with self.assertRaisesRegex(
                 recovery.RecoveryRefused, "Portfolio event conflicts"
@@ -572,89 +571,66 @@ class PortfolioEventRecoveryTests(unittest.TestCase):
                     delivery, publish=True
                 )
 
-        patch_request.assert_not_called()
+        self.assertEqual(repository.update_calls, [])
 
     def test_exact_duplicate_is_idempotent_without_patch(self):
         delivery = synthetic_delivery()
+        repository = FakeRepository(delivery["row"], event_content(delivery))
         with (
-            patch.dict(
-                os.environ,
-                {"GIST_ID": "sanitized-gist", "GIST_TOKEN": "sanitized-token"},
-            ),
+            patch.dict(os.environ, outbox_environment(), clear=True),
             patch.object(
-                recovery.requests,
-                "get",
-                return_value=MockResponse(
-                    gist_body(delivery["row"], event_content(delivery))
-                ),
+                recovery.GitHubContentsClient,
+                "from_env",
+                return_value=repository,
             ),
-            patch.object(recovery.requests, "patch") as patch_request,
         ):
             status = recovery._inspect_and_maybe_publish_event(
                 delivery, publish=True
             )
 
         self.assertEqual(status, "exact_event_present")
-        patch_request.assert_not_called()
+        self.assertEqual(repository.update_calls, [])
 
-    def test_exact_append_patches_only_event_file_and_verifies_response(self):
+    def test_exact_append_updates_only_event_file_and_verifies_content(self):
         delivery = synthetic_delivery()
         appended_events = event_content(delivery)
+        repository = FakeRepository(delivery["row"], "")
         with (
-            patch.dict(
-                os.environ,
-                {"GIST_ID": "sanitized-gist", "GIST_TOKEN": "sanitized-token"},
-            ),
+            patch.dict(os.environ, outbox_environment(), clear=True),
             patch.object(
-                recovery.requests,
-                "get",
-                return_value=MockResponse(gist_body(delivery["row"], "")),
+                recovery.GitHubContentsClient,
+                "from_env",
+                return_value=repository,
             ),
-            patch.object(
-                recovery.requests,
-                "patch",
-                return_value=MockResponse(
-                    gist_body(delivery["row"], appended_events)
-                ),
-            ) as patch_request,
         ):
             status = recovery._inspect_and_maybe_publish_event(
                 delivery, publish=True
             )
 
         self.assertEqual(status, "event_appended")
-        patch_request.assert_called_once()
-        files = patch_request.call_args.kwargs["json"]["files"]
-        self.assertEqual(
-            files,
-            {
-                gist_logger.GHOSTFOLIO_EVENTS_FILENAME: {
-                    "content": appended_events
-                }
-            },
-        )
-        self.assertNotIn(gist_logger.GIST_FILENAME, files)
+        self.assertEqual(repository.update_calls, [
+            ("portfolio/events.jsonl", "Recover reviewed PortfolioEventV3")
+        ])
+        self.assertEqual(repository.contents["portfolio/events.jsonl"], appended_events)
+        self.assertEqual(repository.contents["portfolio/audit.md"], delivery["row"])
 
     def test_preview_requires_exact_row_but_never_patches_missing_event(self):
         delivery = synthetic_delivery()
+        repository = FakeRepository(delivery["row"], "")
         with (
-            patch.dict(
-                os.environ,
-                {"GIST_ID": "sanitized-gist", "GIST_TOKEN": "sanitized-token"},
-            ),
+            patch.dict(os.environ, outbox_environment(), clear=True),
             patch.object(
-                recovery.requests,
-                "get",
-                return_value=MockResponse(gist_body(delivery["row"], "")),
+                recovery.GitHubContentsClient,
+                "from_env",
+                return_value=repository,
             ),
-            patch.object(recovery.requests, "patch") as patch_request,
         ):
             status = recovery._inspect_and_maybe_publish_event(
                 delivery, publish=False
             )
 
         self.assertEqual(status, "event_missing")
-        patch_request.assert_not_called()
+        self.assertEqual(repository.update_calls, [])
 
     def test_workflow_uses_secret_ids_and_both_reviewed_hashes(self):
         workflow = (

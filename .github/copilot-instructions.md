@@ -104,10 +104,14 @@ schemas, workflows, or deployment configuration.
   default branch. Do not mutate production state during a branch-only code
   change unless the migration is explicitly authorized.
 - Kraken keys require query/order permissions and must never allow withdrawals.
-- `GIST_TOKEN` is only for Gist; Actions `GH_PAT_FOR_VARS` is only for repository
-  state; Railway `GH_PAT` is the Discord controller's workflow/variable token.
+- `DCA_OUTBOX_REPOSITORY_TOKEN` must be rotated after launch to Contents
+  read/write on the dedicated private outbox repository only. The cutover's
+  classic compatibility value is time-bounded; Actions `GH_PAT_FOR_VARS` is only for
+  repository state; Railway `GH_PAT` is the Discord controller's workflow/variable
+  token. The event, holdings, and audit producers have no Gist fallback;
+  `GIST_TOKEN` remains restricted to the separate market-history Gist.
 - Never log tokens, full production JSON, or unredacted authenticated payloads.
-- Optional Gist, Ghostfolio, and Gemini failures must not change authoritative
+- Optional outbox, Ghostfolio, and Gemini failures must not change authoritative
   Kraken execution, spend, state transition, or deterministic analysis.
 
 ## Testing

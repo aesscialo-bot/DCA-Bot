@@ -1,4 +1,4 @@
-"""Publish a signed, read-only Kraken crypto holdings snapshot to the outbox Gist."""
+"""Publish a signed Kraken holdings snapshot to the private repository outbox."""
 
 from __future__ import annotations
 
@@ -8,13 +8,15 @@ import math
 import os
 from datetime import datetime, timezone
 
-import requests
-
 from dca_config import validate_execution_state
+from github_contents import (
+    GitHubContentsClient,
+    GitHubContentsError,
+    configured_outbox_paths,
+)
 from kraken_client import get_kraken_exchange
 
 
-FILENAME = "kraken_holdings_snapshot_v1.json"
 TARGETS = {
     "BTC_GBP": ("BTC", "BTC/GBP", "GBP"),
     "HYPE_USD": ("HYPE", "HYPE/USD", "USD"),
@@ -110,20 +112,20 @@ def build_snapshot(exchange, *, now=None):
     return snapshot
 
 
-def publish(snapshot):
-    gist_id = os.environ["GIST_ID"]
-    token = os.environ["GIST_TOKEN"]
-    response = requests.patch(
-        f"https://api.github.com/gists/{gist_id}",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-        json={"files": {FILENAME: {"content": json.dumps(snapshot, sort_keys=True, indent=2) + "\n"}}},
-        timeout=20,
+def publish(snapshot, *, client=None):
+    """Replace the snapshot with optimistic-SHA protection and verify content."""
+    paths = configured_outbox_paths()
+    repository = client or GitHubContentsClient.from_env()
+    content = json.dumps(snapshot, sort_keys=True, indent=2) + "\n"
+    result = repository.replace_text(
+        paths.holdings,
+        content,
+        message="Update signed Kraken holdings snapshot",
     )
-    response.raise_for_status()
+    if result.content != content:
+        raise GitHubContentsError(
+            "private repository did not confirm the holdings snapshot"
+        )
 
 
 def main():

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -25,6 +27,38 @@ HOLDINGS_RECEIPT_FILE = "ghostfolio_holdings_receipts.jsonl"
 PROVENANCE_RECLASSIFICATION_RECEIPT_FILE = (
     "ghostfolio_provenance_reclassification_receipts.jsonl"
 )
+REPOSITORY_OWNER_ENV = "DCA_OUTBOX_REPOSITORY_OWNER"
+REPOSITORY_NAME_ENV = "DCA_OUTBOX_REPOSITORY_NAME"
+REPOSITORY_BRANCH_ENV = "DCA_OUTBOX_REPOSITORY_BRANCH"
+REPOSITORY_TOKEN_ENV = "DCA_OUTBOX_REPOSITORY_TOKEN"
+REPOSITORY_EVENT_PATH_ENV = "DCA_OUTBOX_EVENT_PATH"
+REPOSITORY_HOLDINGS_PATH_ENV = "DCA_OUTBOX_HOLDINGS_PATH"
+REPOSITORY_EVENT_RECEIPT_PATH_ENV = (
+    "DCA_OUTBOX_GHOSTFOLIO_EVENT_RECEIPT_PATH"
+)
+REPOSITORY_HOLDINGS_RECEIPT_PATH_ENV = (
+    "DCA_OUTBOX_GHOSTFOLIO_HOLDINGS_RECEIPT_PATH"
+)
+REPOSITORY_PROVENANCE_RECEIPT_PATH_ENV = (
+    "DCA_OUTBOX_GHOSTFOLIO_PROVENANCE_RECEIPT_PATH"
+)
+REPOSITORY_PATH_ENV_BY_FILE = {
+    EVENT_FILE: REPOSITORY_EVENT_PATH_ENV,
+    HOLDINGS_SNAPSHOT_FILE: REPOSITORY_HOLDINGS_PATH_ENV,
+    RECEIPT_FILE: REPOSITORY_EVENT_RECEIPT_PATH_ENV,
+    HOLDINGS_RECEIPT_FILE: REPOSITORY_HOLDINGS_RECEIPT_PATH_ENV,
+    PROVENANCE_RECLASSIFICATION_RECEIPT_FILE: (
+        REPOSITORY_PROVENANCE_RECEIPT_PATH_ENV
+    ),
+}
+REQUIRED_REPOSITORY_FILES = {EVENT_FILE, HOLDINGS_SNAPSHOT_FILE}
+GITHUB_API_ROOT = "https://api.github.com"
+GITHUB_API_VERSION = "2022-11-28"
+MAX_REPOSITORY_FILE_BYTES = 8_000_000
+MAX_REPOSITORY_WRITE_ATTEMPTS = 3
+REPOSITORY_COMPONENT_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,100}")
+REPOSITORY_BRANCH_PATTERN = re.compile(r"[A-Za-z0-9._/-]{1,255}")
+GIT_OBJECT_SHA_PATTERN = re.compile(r"[0-9a-f]{40,64}")
 STATE_PATH = Path("/receipts/state.json")
 HOLDINGS_INTENT_PATH = Path("/receipts/holdings-intent.json")
 PROVENANCE_RECLASSIFICATION_INTENT_PATH = Path(
@@ -160,8 +194,12 @@ def _recovery_residual_comment(snapshot_hash, event_id):
     )
 
 
-def request_json(url, *, method="GET", token=None, payload=None):
+def request_json(
+    url, *, method="GET", token=None, payload=None, request_headers=None
+):
     headers = {"Accept": "application/json"}
+    if request_headers:
+        headers.update(request_headers)
     body = None
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -180,36 +218,215 @@ def request_json(url, *, method="GET", token=None, payload=None):
         except json.JSONDecodeError:
             detail = {"error": "non-JSON response"}
         return error.code, detail
+    except (URLError, TimeoutError, OSError):
+        raise RuntimeError("HTTP request failed") from None
 
 
-def request_text(url, *, token=None):
-    headers = {"Accept": "text/plain"}
+def request_bytes(url, *, token=None, request_headers=None):
+    headers = {"Accept": "application/octet-stream"}
+    if request_headers:
+        headers.update(request_headers)
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    with urlopen(Request(url, headers=headers), timeout=20) as response:
-        return response.status, response.read().decode("utf-8")
+    try:
+        with urlopen(Request(url, headers=headers), timeout=20) as response:
+            return response.status, response.read()
+    except HTTPError as error:
+        return error.code, error.read()
+    except (URLError, TimeoutError, OSError):
+        raise RuntimeError("HTTP request failed") from None
 
 
-def gist():
-    gist_id = os.environ["GIST_ID"]
-    token = os.environ["GIST_TOKEN"]
-    status, payload = request_json(
-        f"https://api.github.com/gists/{gist_id}", token=token
+def _required_repository_environment(name):
+    value = os.environ.get(name)
+    if value is None or not value.strip() or value != value.strip():
+        raise RuntimeError(f"required private repository setting {name} is invalid")
+    return value
+
+
+def _validated_repository_path(value, setting):
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 1024
+        or value.startswith("/")
+        or value.endswith("/")
+        or "\\" in value
+        or any(ord(character) < 32 for character in value)
+        or any(component in {"", ".", ".."} for component in value.split("/"))
+    ):
+        raise RuntimeError(f"required private repository setting {setting} is invalid")
+    return value
+
+
+def repository_configuration():
+    owner = _required_repository_environment(REPOSITORY_OWNER_ENV)
+    name = _required_repository_environment(REPOSITORY_NAME_ENV)
+    branch = _required_repository_environment(REPOSITORY_BRANCH_ENV)
+    token = _required_repository_environment(REPOSITORY_TOKEN_ENV)
+    if REPOSITORY_COMPONENT_PATTERN.fullmatch(owner) is None:
+        raise RuntimeError("private repository owner is invalid")
+    if REPOSITORY_COMPONENT_PATTERN.fullmatch(name) is None:
+        raise RuntimeError("private repository name is invalid")
+    if (
+        REPOSITORY_BRANCH_PATTERN.fullmatch(branch) is None
+        or branch.startswith("/")
+        or branch.endswith("/")
+        or "//" in branch
+        or any(component in {".", ".."} for component in branch.split("/"))
+    ):
+        raise RuntimeError("private repository branch is invalid")
+    paths = {
+        filename: _validated_repository_path(
+            _required_repository_environment(environment), environment
+        )
+        for filename, environment in REPOSITORY_PATH_ENV_BY_FILE.items()
+    }
+    if len(set(paths.values())) != len(paths):
+        raise RuntimeError("private repository artifact paths must be distinct")
+    return {
+        "owner": owner,
+        "name": name,
+        "branch": branch,
+        "token": token,
+        "paths": paths,
+    }
+
+
+def _repository_url(configuration):
+    return (
+        f"{GITHUB_API_ROOT}/repos/"
+        f"{quote(configuration['owner'], safe='')}/"
+        f"{quote(configuration['name'], safe='')}"
+    )
+
+
+def _github_headers(*, raw=False):
+    return {
+        "Accept": (
+            "application/vnd.github.raw+json"
+            if raw
+            else "application/vnd.github+json"
+        ),
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    }
+
+
+def _repository_json(configuration, url, *, method="GET", payload=None):
+    status, value = request_json(
+        url,
+        method=method,
+        token=configuration["token"],
+        payload=payload,
+        request_headers=_github_headers(),
+    )
+    if status in {401, 403}:
+        raise RuntimeError("private repository authentication or authorization failed")
+    return status, value
+
+
+def _verify_private_repository(configuration):
+    status, metadata = _repository_json(
+        configuration, _repository_url(configuration)
     )
     if status != 200:
-        raise RuntimeError(f"Gist read failed with HTTP {status}")
-    return payload
+        raise RuntimeError("private repository identity request failed")
+    expected = f"{configuration['owner']}/{configuration['name']}".casefold()
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("private") is not True
+        or str(metadata.get("full_name", "")).casefold() != expected
+    ):
+        raise RuntimeError("configured canonical repository is not verified private")
+
+
+def _repository_commit(configuration):
+    branch = quote(configuration["branch"], safe="")
+    status, metadata = _repository_json(
+        configuration, f"{_repository_url(configuration)}/commits/{branch}"
+    )
+    commit_sha = metadata.get("sha") if isinstance(metadata, dict) else None
+    if status != 200 or not isinstance(commit_sha, str) or not re.fullmatch(
+        r"[0-9a-f]{40}", commit_sha
+    ):
+        raise RuntimeError("private repository branch could not be pinned")
+    return commit_sha
+
+
+def _repository_file(configuration, path, reference, *, required):
+    encoded_path = quote(path, safe="/")
+    url = (
+        f"{_repository_url(configuration)}/contents/{encoded_path}?"
+        + urlencode({"ref": reference})
+    )
+    status, metadata = _repository_json(configuration, url)
+    if status == 404 and not required:
+        return {"content": "", "path": path, "sha": None, "exists": False}
+    if status != 200 or not isinstance(metadata, dict):
+        raise RuntimeError(f"private repository file read failed for {path}")
+    sha = metadata.get("sha")
+    size = metadata.get("size")
+    if (
+        metadata.get("type") != "file"
+        or metadata.get("path") != path
+        or not isinstance(sha, str)
+        or GIT_OBJECT_SHA_PATTERN.fullmatch(sha) is None
+        or type(size) is not int
+        or size < 0
+        or size > MAX_REPOSITORY_FILE_BYTES
+    ):
+        raise RuntimeError(f"private repository file metadata is invalid for {path}")
+    if metadata.get("encoding") == "base64":
+        encoded = metadata.get("content")
+        if not isinstance(encoded, str):
+            raise RuntimeError(f"private repository file content is invalid for {path}")
+        try:
+            raw = base64.b64decode("".join(encoded.split()), validate=True)
+        except (ValueError, binascii.Error):
+            raise RuntimeError(
+                f"private repository file content is invalid for {path}"
+            ) from None
+    elif metadata.get("encoding") == "none" and size > 1_000_000:
+        raw_status, raw = request_bytes(
+            url,
+            token=configuration["token"],
+            request_headers=_github_headers(raw=True),
+        )
+        if raw_status != 200:
+            raise RuntimeError(f"private repository raw read failed for {path}")
+    else:
+        raise RuntimeError(f"private repository file encoding is invalid for {path}")
+    if not isinstance(raw, bytes) or len(raw) != size:
+        raise RuntimeError(f"private repository file size is invalid for {path}")
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise RuntimeError(f"private repository file is not UTF-8 for {path}") from None
+    return {"content": content, "path": path, "sha": sha, "exists": True}
+
+
+def repository_snapshot():
+    """Read one immutable, commit-pinned canonical source and receipt view."""
+    configuration = repository_configuration()
+    _verify_private_repository(configuration)
+    commit_sha = _repository_commit(configuration)
+    files = {
+        filename: _repository_file(
+            configuration,
+            path,
+            commit_sha,
+            required=filename in REQUIRED_REPOSITORY_FILES,
+        )
+        for filename, path in configuration["paths"].items()
+    }
+    return {"repository_commit_sha": commit_sha, "files": files}
 
 
 def file_content(payload, name):
     info = payload.get("files", {}).get(name)
     if not info:
         return ""
-    if info.get("truncated"):
-        status, raw = request_text(info["raw_url"], token=os.environ["GIST_TOKEN"])
-        if status != 200:
-            raise RuntimeError(f"Gist raw read failed with HTTP {status}")
-        return raw
     content = info.get("content", "")
     if not isinstance(content, str):
         raise RuntimeError(f"{name} is not text")
@@ -1203,45 +1420,116 @@ def is_exact_duplicate(payload):
     return bool(messages) and all("duplicate activity" in message.lower() for message in messages)
 
 
-def append_receipt(gist_payload, receipt):
-    existing = file_content(gist_payload, RECEIPT_FILE)
-    for line in existing.splitlines():
-        row = json.loads(line)
-        if row.get("order_id") == receipt["order_id"]:
-            return row == receipt
-    updated = existing + ("" if not existing or existing.endswith("\n") else "\n") + canonical(receipt) + "\n"
-    status, _ = request_json(
-        f"https://api.github.com/gists/{os.environ['GIST_ID']}",
-        method="PATCH",
-        token=os.environ["GIST_TOKEN"],
-        payload={"files": {RECEIPT_FILE: {"content": updated}}},
-    )
-    if status != 200:
-        raise RuntimeError(f"receipt publish failed with HTTP {status}")
-    return True
-
-
-def append_named_receipt(gist_payload, filename, identity_field, receipt):
-    existing = file_content(gist_payload, filename)
-    for line in existing.splitlines():
-        row = json.loads(line)
-        if row.get(identity_field) == receipt[identity_field]:
-            return row == receipt
-    updated = existing + ("" if not existing or existing.endswith("\n") else "\n") + canonical(receipt) + "\n"
-    status, _ = request_json(
-        f"https://api.github.com/gists/{os.environ['GIST_ID']}",
-        method="PATCH",
-        token=os.environ["GIST_TOKEN"],
-        payload={"files": {filename: {"content": updated}}},
-    )
-    if status != 200:
-        raise RuntimeError(f"{filename} publish failed with HTTP {status}")
-    return True
-
-
-def holdings_receipt_for_snapshot(gist_payload, snapshot_hash):
+def _receipt_identity(content, identity_field, identity_value):
     match = None
-    for line in file_content(gist_payload, HOLDINGS_RECEIPT_FILE).splitlines():
+    for line in content.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("private repository receipt ledger is malformed") from error
+        if not isinstance(row, dict):
+            raise RuntimeError("private repository receipt ledger is malformed")
+        if row.get(identity_field) == identity_value:
+            if match is not None:
+                raise RuntimeError("private repository receipt identity is duplicated")
+            match = row
+    return match
+
+
+def _append_repository_receipt(filename, identity_field, receipt):
+    configuration = repository_configuration()
+    _verify_private_repository(configuration)
+    if filename not in {
+        RECEIPT_FILE,
+        HOLDINGS_RECEIPT_FILE,
+        PROVENANCE_RECLASSIFICATION_RECEIPT_FILE,
+    }:
+        raise RuntimeError("private repository receipt filename is invalid")
+    if not isinstance(receipt, dict) or identity_field not in receipt:
+        raise RuntimeError("private repository receipt identity is invalid")
+    path = configuration["paths"][filename]
+    identity_value = receipt[identity_field]
+    wanted_line = canonical(receipt)
+    for _attempt in range(MAX_REPOSITORY_WRITE_ATTEMPTS):
+        current = _repository_file(
+            configuration, path, configuration["branch"], required=False
+        )
+        existing = _receipt_identity(
+            current["content"], identity_field, identity_value
+        )
+        if existing is not None:
+            return existing == receipt
+        separator = (
+            ""
+            if not current["content"] or current["content"].endswith("\n")
+            else "\n"
+        )
+        updated = current["content"] + separator + wanted_line + "\n"
+        if len(updated.encode("utf-8")) > MAX_REPOSITORY_FILE_BYTES:
+            raise RuntimeError("private repository receipt ledger is too large")
+        payload = {
+            "message": f"Append Ghostfolio receipt to {filename}",
+            "content": base64.b64encode(updated.encode("utf-8")).decode("ascii"),
+            "branch": configuration["branch"],
+        }
+        if current["sha"] is not None:
+            payload["sha"] = current["sha"]
+        url = (
+            f"{_repository_url(configuration)}/contents/"
+            f"{quote(path, safe='/')}"
+        )
+        try:
+            status, _metadata = _repository_json(
+                configuration, url, method="PUT", payload=payload
+            )
+        except RuntimeError as error:
+            if str(error) != "HTTP request failed":
+                raise
+            continue
+        if status in {409, 422}:
+            continue
+        if status not in {200, 201}:
+            raise RuntimeError(f"private repository receipt write failed for {filename}")
+        verified = _repository_file(
+            configuration, path, configuration["branch"], required=True
+        )
+        durable = _receipt_identity(
+            verified["content"], identity_field, identity_value
+        )
+        if durable == receipt:
+            return True
+        if durable is not None:
+            return False
+    raise RuntimeError("private repository receipt write conflicted after bounded retries")
+
+
+def append_receipt(repository_payload, receipt):
+    existing = _receipt_identity(
+        file_content(repository_payload, RECEIPT_FILE),
+        "order_id",
+        receipt["order_id"],
+    )
+    if existing is not None:
+        return existing == receipt
+    return _append_repository_receipt(RECEIPT_FILE, "order_id", receipt)
+
+
+def append_named_receipt(repository_payload, filename, identity_field, receipt):
+    existing = _receipt_identity(
+        file_content(repository_payload, filename),
+        identity_field,
+        receipt[identity_field],
+    )
+    if existing is not None:
+        return existing == receipt
+    return _append_repository_receipt(filename, identity_field, receipt)
+
+
+def holdings_receipt_for_snapshot(repository_payload, snapshot_hash):
+    match = None
+    for line in file_content(repository_payload, HOLDINGS_RECEIPT_FILE).splitlines():
         if not line.strip():
             continue
         try:
@@ -1501,29 +1789,22 @@ def _receipt_pair(payload, events, event_id):
 def _publish_recovery_receipts(intent):
     event, event_id = intent["event"], intent["event"]["event_id"]
     wanted = _migration_receipts(event, intent)
-    fresh = gist()
+    fresh = repository_snapshot()
     fresh_events = parse_events(file_content(fresh, EVENT_FILE))
     if sorted(row["event_id"] for row in fresh_events) != intent["baseline_event_ids"]:
         raise RuntimeError("newer PortfolioEvents appeared during HYPE recovery")
     existing = _receipt_pair(fresh, fresh_events, event_id)
     if any(old is not None and old != new for old, new in zip(existing, wanted)):
         raise RuntimeError("HYPE recovery receipt conflict")
-    files = {}
     for filename, old, receipt in zip(
         (RECEIPT_FILE, PROVENANCE_RECLASSIFICATION_RECEIPT_FILE), existing, wanted
     ):
-        if old is None:
-            content = file_content(fresh, filename)
-            separator = "" if not content or content.endswith("\n") else "\n"
-            files[filename] = {"content": content + separator + canonical(receipt) + "\n"}
-    if files:
-        status, _ = request_json(
-            f"https://api.github.com/gists/{os.environ['GIST_ID']}",
-            method="PATCH", token=os.environ["GIST_TOKEN"], payload={"files": files},
-        )
-        if status != 200:
-            raise RuntimeError(f"HYPE recovery receipt publish failed with HTTP {status}")
-    verified = gist()
+        identity_field = "order_id" if filename == RECEIPT_FILE else "event_id"
+        if old is None and not append_named_receipt(
+            fresh, filename, identity_field, receipt
+        ):
+            raise RuntimeError("HYPE recovery receipt conflict")
+    verified = repository_snapshot()
     verified_events = parse_events(file_content(verified, EVENT_FILE))
     if (
         sorted(row["event_id"] for row in verified_events) != intent["baseline_event_ids"]
@@ -1775,7 +2056,7 @@ def _finalize_holdings_intent(intent, token, reporting, *, now=None):
     )
     if calculation["portfolio_calculation_has_error"]:
         raise RuntimeError("Ghostfolio portfolio calculation is incomplete")
-    fresh_payload = gist()
+    fresh_payload = repository_snapshot()
     receipt = intent["receipt"]
     existing = holdings_receipt_for_snapshot(
         fresh_payload, receipt["snapshot_hash"]
@@ -1799,7 +2080,7 @@ def reconcile_holdings_snapshot(
     commit=False,
     token=None,
     now=None,
-    gist_payload=None,
+    repository_payload=None,
     allow_provenance_intent=False,
 ):
     if (
@@ -1812,7 +2093,11 @@ def reconcile_holdings_snapshot(
     # One sync cycle must use one immutable outbox view. Receipt publication
     # deliberately rereads only at the append boundary to preserve concurrent
     # append-only records.
-    payload = gist_payload if gist_payload is not None else gist()
+    payload = (
+        repository_payload
+        if repository_payload is not None
+        else repository_snapshot()
+    )
     snapshot = parse_holdings_snapshot(file_content(payload, HOLDINGS_SNAPSHOT_FILE))
     events = parse_events(file_content(payload, EVENT_FILE))
     intent = load_holdings_intent()
@@ -1857,7 +2142,7 @@ def reconcile_holdings_snapshot(
                 and intent_hash == snapshot["canonical_hash"]
             )
             # An exact match to the durable transaction watermark proves that
-            # every old adjustment landed, even when the current Gist now has
+            # every old adjustment landed, even when the repository now has
             # a newer signed snapshot. Finalize the old receipt first.
             can_finalize = not intent_drift
             if commit and can_finalize:
@@ -1975,7 +2260,7 @@ def reconcile_holdings_snapshot(
         raise RuntimeError("Ghostfolio portfolio calculation is incomplete")
     receipt = intent["receipt"]
     if not append_named_receipt(
-        gist(), HOLDINGS_RECEIPT_FILE, "snapshot_hash", receipt
+        repository_snapshot(), HOLDINGS_RECEIPT_FILE, "snapshot_hash", receipt
     ):
         raise RuntimeError("holdings receipt conflict")
     clear_holdings_intent()
@@ -1989,7 +2274,7 @@ def reconcile_holdings_snapshot(
 
 
 def recover_holdings_intent_before_events(
-    gist_payload, events, event_receipts, token, *, now=None
+    repository_payload, events, event_receipts, token, *, now=None
 ):
     """Complete an older local holdings transaction before newer event imports."""
     intent = load_holdings_intent()
@@ -1997,7 +2282,7 @@ def recover_holdings_intent_before_events(
         return None
     intent_snapshot = intent["snapshot"]
     intent_hash = intent_snapshot["canonical_hash"]
-    existing = holdings_receipt_for_snapshot(gist_payload, intent_hash)
+    existing = holdings_receipt_for_snapshot(repository_payload, intent_hash)
     if existing is not None:
         if existing != intent["receipt"]:
             raise RuntimeError("holdings receipt conflict")
@@ -2026,8 +2311,8 @@ def recover_holdings_intent_before_events(
                 "holdings intent could be recovered"
             )
 
-    recovery_payload = dict(gist_payload)
-    recovery_files = dict(gist_payload.get("files", {}))
+    recovery_payload = dict(repository_payload)
+    recovery_files = dict(repository_payload.get("files", {}))
     recovery_files[HOLDINGS_SNAPSHOT_FILE] = {
         "content": canonical(intent_snapshot)
     }
@@ -2039,7 +2324,7 @@ def recover_holdings_intent_before_events(
         commit=True,
         token=token,
         now=now,
-        gist_payload=recovery_payload,
+        repository_payload=recovery_payload,
     )
     if HOLDINGS_INTENT_PATH.is_file():
         raise RuntimeError("pending holdings intent did not recover")
@@ -2047,7 +2332,7 @@ def recover_holdings_intent_before_events(
 
 
 def sync_once():
-    payload = gist()
+    payload = repository_snapshot()
     events = parse_events(file_content(payload, EVENT_FILE))
     receipts = parse_event_receipts(
         file_content(payload, RECEIPT_FILE), events
@@ -2115,7 +2400,7 @@ def sync_once():
             "ghostfolio_activity_id": activity_id,
             "imported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
-        if not append_receipt(gist(), receipt):
+        if not append_receipt(repository_snapshot(), receipt):
             raise RuntimeError(f"receipt conflict for {event['event_id']}")
         receipts.add(event["event_id"])
     holdings_kwargs = {
@@ -2126,7 +2411,7 @@ def sync_once():
         # provenance state is durable and its intent has been cleared.
         "commit": not provenance["clear_intent_after_state"],
         "token": token,
-        "gist_payload": payload,
+        "repository_payload": payload,
     }
     if provenance["clear_intent_after_state"]:
         holdings_kwargs["allow_provenance_intent"] = True

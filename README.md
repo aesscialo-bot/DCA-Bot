@@ -19,10 +19,10 @@ There is no THB or Bitkub trading path.
 
 Kraken is the authoritative record of cash, holdings, fees, and orders. Every
 confirmed purchase is also placed in a durable, retry-safe outbox for Portfolio
-Compass's read-only private-Gist adapter. A Gist outage cannot repeat a Kraken
-order; the exact ledger row remains queued until it is delivered. Ghostfolio is
-a reporting-only local mirror and can never affect analysis, budgets, scheduling,
-or Kraken execution.
+Compass's read-only private-repository adapter. A repository outage cannot
+repeat a Kraken order; the exact delivery evidence remains queued until both
+audit and event artifacts are confirmed. Ghostfolio is a reporting-only local
+mirror and can never affect analysis, budgets, scheduling, or Kraken execution.
 
 > [!WARNING]
 > Recovery defaults to `DCA_TRADING_MODE=shadow`. Production scheduling remains
@@ -87,7 +87,7 @@ flowchart TD
     L --> T["Require confirmed crypto fill"]
     N --> T
     T --> O["Atomically save buy date and Portfolio Compass outbox row"]
-    O --> P["Deliver exact row to private Gist with idempotent retry"]
+    O --> P["Deliver audit + event to private repository with SHA retries"]
     P --> U["Portfolio Compass imports the Markdown record"]
     P --> S["Local sidecar imports the JSONL event into Ghostfolio"]
     O --> Q["Discord: Saved on Kraken"]
@@ -163,7 +163,7 @@ flowchart LR
     K --> T
     T --> V
     T --> D["Discord receipt"]
-    T --> L["Durable private-Gist ledger outbox"]
+    T --> L["Durable private-repository ledger outbox"]
     L --> P["Portfolio Compass read-only importer"]
     T -. "optional" .-> G["Ghostfolio"]
 ```
@@ -190,7 +190,9 @@ timing metrics.
 FIFO `PENDING_GIST_DELIVERIES`. Completion atomically moves confirmed fill
 evidence into that delivery queue before the pending Kraken intent is cleared.
 The state is size-bounded and new orders reserve delivery capacity before
-submission.
+submission. `PENDING_GIST_DELIVERIES` is a retained legacy field name: it is now
+the local recovery evidence for the private-repository outbox and must not be
+renamed or cleared during the transport cutover.
 
 Required repository variables:
 
@@ -202,6 +204,13 @@ Required repository variables:
 - `DCA_TRADING_MODE` (`shadow`, `canary`, or `live`; default `shadow`)
 - `DCA_CANARY_SYMBOL` (`SOL_GBP`)
 - `DCA_HISTORY_GIST_ID` (dedicated private history Gist)
+- `DCA_OUTBOX_REPOSITORY_OWNER` (owner of the dedicated private outbox repository)
+- `DCA_OUTBOX_REPOSITORY_NAME`
+- `DCA_OUTBOX_REPOSITORY_BRANCH` (an existing branch whose rules permit the
+  outbox service identity to make compare-and-swap commits)
+- `DCA_OUTBOX_AUDIT_PATH` (repository-relative legacy Markdown audit path)
+- `DCA_OUTBOX_EVENT_PATH` (repository-relative PortfolioEventV3 JSONL path)
+- `DCA_OUTBOX_HOLDINGS_PATH` (repository-relative signed snapshot JSON path)
 
 `DCA_CRON_ENABLED` is a Railway runtime variable, not a GitHub repository
 variable. It must be `true` for normal scheduling and should be set to `false`
@@ -220,7 +229,14 @@ Required Railway runtime variables:
 - `TIMEZONE` (`Asia/Bangkok`, matching the GitHub repository variable)
 - `DCA_TRADING_MODE` (must match the repository variable)
 - `DCA_CANARY_SYMBOL` (`SOL_GBP`)
-- `GIST_ID` and `GIST_TOKEN` for receipt-aware status
+
+The Railway controller's receipt-aware health check is compiled to the exact
+private repository, branch, event path, and event-receipt path used by this
+release. `DCA_OUTBOX_REPOSITORY_TOKEN` is an optional dedicated Contents-read
+credential and takes precedence when present. During the cutover, the existing
+Railway `GH_PAT` is the fail-closed compatibility credential; this adds no new
+permission to the process, but it should be replaced with the narrower token
+after Railway access is available.
 
 Railway may also contain `GEMINI_API_KEY` for optional read-only conversational
 intent classification. Exact DCA control commands never depend on AI.
@@ -231,17 +247,31 @@ Required GitHub Actions secrets:
 - `KRAKEN_API_SECRET`
 - `DISCORD_WEBHOOK_URL`
 - `GH_PAT_FOR_VARS`
-- `GIST_ID`
-- `GIST_TOKEN`
+- `DCA_OUTBOX_REPOSITORY_TOKEN` (temporary classic compatibility credential for
+  this cutover; rotate it to a fine-grained token with Contents read/write only
+  for the dedicated private outbox repository, then remove the classic value)
+- `GIST_TOKEN` (legacy read/write token for the separate market-history Gist
+  only; the event, holdings, and audit producers never use it)
 
 Optional secrets:
 
 - `GEMINI_API_KEY`
 
 GitHub Actions does not receive a Ghostfolio URL, token, or account map.
-Ghostfolio is reporting-only: the localhost sidecar consumes the durable Gist
-outbox and signed Kraken holdings snapshot, so hosted runners never connect
-directly to the PC or to a hosted Ghostfolio instance.
+Ghostfolio is reporting-only: hosted runners publish the three source artifacts
+to a dedicated private GitHub repository and never connect directly to the PC
+or to a hosted Ghostfolio instance.
+
+The three producers do not read `GIST_ID` or `GIST_TOKEN` and have no Gist
+fallback. Repository identity, branch, every destination path, and the token
+must be present in the environment; missing configuration, an unverified-public
+repository, or failed authorization stops publication. Contents API writes use
+the current blob SHA and retry a conflict at most three times. The audit row and
+event are separate Git commits, so the protected execution-state delivery stays
+queued until both exact artifacts are confirmed. Never point an outbox path at
+this source repository or a public repository. Branch rules must allow the
+outbox service identity to make direct Contents API commits; verify that narrow
+exception without weakening review rules for other writers.
 
 Kraken API credentials must allow query and order operations but must never have
 withdrawal permission. Production JSON state is loaded inside workflow steps,
@@ -306,8 +336,11 @@ On this PC, the operator-facing installation is stored under
 
 The isolated `dca-ghostfolio` Compose project pins Ghostfolio 3.43.0 and keeps
 PostgreSQL 15 and Redis off host ports. Only `127.0.0.1:3333` is exposed. The
-no-port sync sidecar has no Kraken credentials and polls the durable Gist every
-five minutes. Secrets live under `%LOCALAPPDATA%\dca-ghostfolio`, outside Git,
+no-port sync sidecar has no Kraken credentials. During this producer-only
+transition it polls the access-controlled private repository every five minutes,
+pinning canonical events, holdings, and all receipt ledgers to one immutable
+commit before it reconciles Ghostfolio. Secrets live under
+`%LOCALAPPDATA%\dca-ghostfolio`, outside Git,
 with user-only ACLs. The setup derives separate `app.env`, `postgres.env`,
 `redis.env`, and `sync.env` files there, so each container receives only the
 credentials it needs; the reporting sidecar receives no database, Redis, JWT,
@@ -389,8 +422,9 @@ timestamp rollback, a changed hash at the same timestamp, or an unfinished
 reconciliation receipt. This makes a dropped GitHub schedule visible instead
 of repeatedly reporting an old Kraken balance as current.
 
-Each five-minute poll pins one immutable Gist view for event and snapshot
-processing. A local reconciliation intent embeds the exact signed Kraken
+The consumer resolves the private repository branch once per poll and pins
+events, holdings, and all receipt ledgers to that immutable commit.
+A local reconciliation intent embeds the exact signed Kraken
 snapshot and is recovered before any newer PortfolioEvent can be imported. If
 the old watermark is still provable, its receipt is completed even after a
 newer snapshot is published; changed or ambiguous quantities fail closed for
