@@ -170,6 +170,17 @@ class ApiInfoExchange:
 
 
 class KrakenOpeningBasisTests(unittest.TestCase):
+    def test_utc_timestamp_rejects_noncanonical_but_parseable_text(self):
+        for value in (
+            "2026-08-08 14:24:00Z",
+            "2026-08-08T14:24:00.1234567Z",
+            "2026-08-08T14:24:00+00:00",
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                basis.OpeningBasisError, "canonical UTC timestamp"
+            ):
+                basis.utc_timestamp(value, "generated_at")
+
     def test_timestamp_rounding_is_decimal_half_up_at_microseconds(self):
         self.assertEqual(
             basis.timestamp_text("1770000000.1234565"),

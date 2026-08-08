@@ -125,7 +125,14 @@ def signed_decimal_text(value) -> str:
 
 
 def utc_timestamp(value: str, label: str) -> datetime:
-    if not isinstance(value, str) or not value.endswith("Z"):
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z",
+            value,
+        )
+        is None
+    ):
         raise OpeningBasisError(f"{label} must be a canonical UTC timestamp")
     try:
         parsed = datetime.fromisoformat(value[:-1] + "+00:00")
