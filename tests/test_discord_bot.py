@@ -173,11 +173,12 @@ class DiscordBotControlTests(unittest.TestCase):
         discord_bot._pending_recovery_symbols.clear()
         discord_bot._pending_gist_delivery_symbols.clear()
         discord_bot._awaiting_start_day_symbols.clear()
+        discord_bot._awaiting_daily_analysis = False
         discord_bot._schedule_error = None
         discord_bot._schedule_warning = None
         discord_bot._schedule_start_date = None
-        discord_bot._workflow_contract_error = None
         discord_bot._analysis_watchdog_last_dispatch = None
+        discord_bot._workflow_contract_error = None
         self.workflow_health = {
             "status": "HEALTHY",
             "configured_ref": "main",
@@ -901,6 +902,51 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertNotIn("ATTENTION REQUIRED", message.replies[-1])
         self.assertNotIn("Analysis ERROR", message.replies[-1])
 
+    def test_status_and_health_report_armed_during_daily_rollover_wait(self):
+        live_rules = rules(enabled=set(ALLOWED_TARGETS))
+        decisions = analysis_state(
+            live_rules,
+            generated_at=datetime(2026, 8, 5, 12, 20, tzinfo=timezone.utc),
+        )
+        rollover = datetime(2026, 8, 5, 17, 2, tzinfo=timezone.utc)
+        self.assertTrue(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules),
+                json.dumps(decisions),
+                "{}",
+                "2026-08-01",
+                now=rollover,
+            )
+        )
+        status_message = MessageStub()
+        health_message = MessageStub()
+        with (
+            patch.object(
+                discord_bot,
+                "get_repo_variable",
+                side_effect=variable_reader(live_rules, decisions),
+            ),
+            patch.object(discord_bot, "datetime", FrozenDateTime),
+            patch.object(discord_bot, "DCA_CRON_ENABLED", True),
+        ):
+            FrozenDateTime.current = rollover
+            try:
+                asyncio.run(discord_bot.handle_status({}, status_message))
+                asyncio.run(discord_bot.handle_health({}, health_message))
+            finally:
+                FrozenDateTime.current = NOW
+
+        status = status_message.replies[-1]
+        health = health_message.replies[-1]
+        self.assertIn("awaiting 04:07 daily analysis", status)
+        self.assertIn("TODAY'S ANALYSIS NOT DUE YET", status)
+        self.assertNotIn("NEXT ANALYSIS TOMORROW", status)
+        self.assertIn("Analysis watchdog: **WAITING**", status)
+        self.assertIn("Analysis/scheduling chain: **OPERATIONAL**", status)
+        self.assertIn("DCA health: ARMED", health)
+        self.assertIn("Analysis: awaiting 04:07 daily analysis", health)
+        self.assertNotIn("Stale decisions", health)
+
     def test_health_reports_armed_for_ready_decisions_that_predate_start(self):
         live_rules = rules(enabled=set(ALLOWED_TARGETS))
         decisions = analysis_state(live_rules)
@@ -949,10 +995,13 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         discord_bot._pending_recovery_symbols.clear()
         discord_bot._pending_gist_delivery_symbols.clear()
         discord_bot._awaiting_start_day_symbols.clear()
+        discord_bot._awaiting_daily_analysis = False
         discord_bot._dca_dispatch_guard.clear()
         discord_bot._schedule_error = None
         discord_bot._schedule_warning = None
         discord_bot._schedule_start_date = None
+        discord_bot._analysis_watchdog_last_dispatch = None
+        discord_bot._workflow_contract_error = None
 
     def test_v1_analysis_state_clears_schedule_and_fails_closed(self):
         live_rules = rules(enabled={"BTC_GBP", "HYPE_USD", "SOL_GBP"})
@@ -1045,6 +1094,147 @@ class DiscordBotSchedulerTests(unittest.TestCase):
             )
         )
         self.assertIn("BTC_GBP: analysis ERROR", discord_bot._schedule_warning)
+
+    def test_prior_day_ready_state_waits_quietly_until_daily_analysis_deadline(self):
+        live_rules = rules(enabled={"BTC_GBP", "HYPE_USD", "SOL_GBP"})
+        decisions = analysis_state(
+            live_rules,
+            generated_at=datetime(2026, 8, 5, 12, 20, tzinfo=timezone.utc),
+        )
+
+        for current in (
+            datetime(2026, 8, 5, 17, 2, tzinfo=timezone.utc),
+            datetime(2026, 8, 5, 21, 19, 59, tzinfo=timezone.utc),
+        ):
+            with self.subTest(current=current):
+                self.assertTrue(
+                    discord_bot.refresh_dca_schedule(
+                        json.dumps(live_rules),
+                        json.dumps(decisions),
+                        "{}",
+                        "2026-08-01",
+                        now=current,
+                    )
+                )
+                self.assertEqual(discord_bot._dca_schedule, {})
+                self.assertIsNone(discord_bot._schedule_warning)
+                self.assertTrue(discord_bot._awaiting_daily_analysis)
+                with patch.object(discord_bot, "DCA_CRON_ENABLED", True):
+                    self.assertIn(
+                        "awaiting 04:07 daily analysis",
+                        discord_bot._format_cron_status(),
+                    )
+
+    def test_prior_day_ready_state_alerts_at_daily_analysis_deadline(self):
+        live_rules = rules(enabled={"BTC_GBP"})
+        decisions = analysis_state(
+            live_rules,
+            generated_at=datetime(2026, 8, 5, 12, 20, tzinfo=timezone.utc),
+        )
+        deadline = datetime(2026, 8, 5, 21, 20, tzinfo=timezone.utc)
+
+        self.assertTrue(
+            discord_bot.refresh_dca_schedule(
+                json.dumps(live_rules),
+                json.dumps(decisions),
+                "{}",
+                "2026-08-01",
+                now=deadline,
+            )
+        )
+        self.assertFalse(discord_bot._awaiting_daily_analysis)
+        self.assertIn("stale analysis date", discord_bot._schedule_warning)
+
+    def test_unhealthy_or_older_prior_state_is_not_quiet_during_rollover(self):
+        live_rules = rules(enabled={"BTC_GBP"})
+        rollover = datetime(2026, 8, 5, 17, 2, tzinfo=timezone.utc)
+        unhealthy = analysis_state(
+            live_rules,
+            generated_at=datetime(2026, 8, 5, 12, 20, tzinfo=timezone.utc),
+            status_overrides={"BTC_GBP": "ERROR"},
+        )
+        older = analysis_state(
+            live_rules,
+            generated_at=datetime(2026, 8, 4, 12, 20, tzinfo=timezone.utc),
+        )
+
+        for decisions in (unhealthy, older):
+            with self.subTest(state_date=decisions["ANALYSIS_DATE"]):
+                self.assertTrue(
+                    discord_bot.refresh_dca_schedule(
+                        json.dumps(live_rules),
+                        json.dumps(decisions),
+                        "{}",
+                        "2026-08-01",
+                        now=rollover,
+                    )
+                )
+                self.assertFalse(discord_bot._awaiting_daily_analysis)
+                self.assertIsNotNone(discord_bot._schedule_warning)
+
+    def test_analysis_watchdog_waits_until_boundary_then_dispatches(self):
+        live_rules = rules(enabled=set(ALLOWED_TARGETS))
+        decisions = analysis_state(
+            live_rules,
+            generated_at=datetime(2026, 8, 5, 12, 20, tzinfo=timezone.utc),
+        )
+        before_deadline = datetime(2026, 8, 5, 21, 19, 59, tzinfo=timezone.utc)
+        deadline = datetime(2026, 8, 5, 21, 20, tzinfo=timezone.utc)
+
+        with (
+            patch.object(discord_bot, "analysis_workflow_active") as active,
+            patch.object(discord_bot, "trigger_workflow") as dispatch,
+        ):
+            asyncio.run(
+                discord_bot._analysis_watchdog(
+                    json.dumps(decisions), before_deadline
+                )
+            )
+        active.assert_not_called()
+        dispatch.assert_not_called()
+
+        with (
+            patch.object(
+                discord_bot, "analysis_workflow_active", return_value=False
+            ),
+            patch.object(discord_bot, "trigger_workflow", return_value=True) as dispatch,
+            patch.object(discord_bot, "monotonic", return_value=100.0),
+        ):
+            asyncio.run(
+                discord_bot._analysis_watchdog(json.dumps(decisions), deadline)
+            )
+        dispatch.assert_called_once_with("crypto_analysis.yml", {"symbol": "all"})
+        self.assertEqual(discord_bot._analysis_watchdog_last_dispatch, 100.0)
+
+    def test_analysis_watchdog_suppresses_active_and_recent_recovery(self):
+        live_rules = rules(enabled=set(ALLOWED_TARGETS))
+        decisions = analysis_state(
+            live_rules,
+            generated_at=datetime(2026, 8, 5, 12, 20, tzinfo=timezone.utc),
+        )
+        deadline = datetime(2026, 8, 5, 21, 20, tzinfo=timezone.utc)
+
+        with (
+            patch.object(discord_bot, "analysis_workflow_active", return_value=True),
+            patch.object(discord_bot, "trigger_workflow") as dispatch,
+        ):
+            asyncio.run(
+                discord_bot._analysis_watchdog(json.dumps(decisions), deadline)
+            )
+        dispatch.assert_not_called()
+
+        discord_bot._analysis_watchdog_last_dispatch = 100.0
+        with (
+            patch.object(
+                discord_bot, "analysis_workflow_active", return_value=False
+            ),
+            patch.object(discord_bot, "trigger_workflow") as dispatch,
+            patch.object(discord_bot, "monotonic", return_value=101.0),
+        ):
+            asyncio.run(
+                discord_bot._analysis_watchdog(json.dumps(decisions), deadline)
+            )
+        dispatch.assert_not_called()
 
     def test_fresh_start_day_analysis_schedules_during_grace(self):
         live_rules = rules(enabled={"BTC_GBP"})

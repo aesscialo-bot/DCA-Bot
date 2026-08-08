@@ -108,6 +108,9 @@ funding leg merely because an API response was interrupted.
 Analysis runs at 04:07 Bangkok with an idempotent 04:37 recovery and uses
 completed Kraken candles only. Railway independently checks after 04:20 and
 dispatches a missing analysis when GitHub has no queued or active run.
+Between local midnight and 04:20, one complete prior-day state is reported as
+awaiting the scheduled analysis: old decisions stay blocked, pending orders
+still reconcile, and the normal rollover does not raise an incident alert.
 
 - `UPTREND`: two consecutive daily closes above SMA150, EMA20 above EMA50,
   completed weekly close above weekly EMA20, and a positive 20-day SMA150 slope.
