@@ -5,7 +5,7 @@ from hashlib import sha256
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import discord_bot
 from dca_config import (
@@ -739,6 +739,53 @@ class DiscordBotControlTests(unittest.TestCase):
         )
 
         self.assertIn("Data through: `unknown`", summary)
+
+    def test_status_distinguishes_enabled_shadow_disabled_and_budget_refresh(self):
+        live_rules = rules(enabled={"BTC_GBP", "SOL_GBP"}, low=10, up=20)
+        analysis = analysis_state(live_rules)
+        live_rules["SOL_GBP"]["REGIME_AMOUNTS_GBP"]["LOW"] = 12.5
+        message = MessageStub()
+        with (
+            patch.object(
+                discord_bot,
+                "get_repo_variable",
+                side_effect=variable_reader(live_rules, analysis),
+            ),
+            patch.object(discord_bot, "datetime", FrozenDateTime),
+            patch.object(discord_bot, "DCA_CRON_ENABLED", True),
+            patch.object(discord_bot, "DCA_TRADING_MODE", "shadow"),
+        ):
+            asyncio.run(discord_bot.handle_status({}, message))
+
+        status = message.replies[-1]
+        self.assertIn("SHADOW — REAL KRAKEN ORDERS OFF", status)
+        self.assertIn("BTC/GBP", status)
+        self.assertIn("SIMULATION ONLY", status)
+        self.assertIn("HYPE/USD", status)
+        self.assertIn("OFF — PAIR DISABLED", status)
+        self.assertIn("SOL/GBP", status)
+        self.assertIn("WAITING FOR FRESH ANALYSIS", status)
+        self.assertIn("budgets changed after this analysis", status)
+        self.assertNotIn("RULES MISMATCH", status)
+        self.assertLessEqual(len(status), 2_000)
+
+    def test_expired_enabled_pair_says_no_replay_and_resumes_tomorrow(self):
+        live_rules = rules(enabled={"HYPE_USD"})
+        decision = analysis_state(live_rules)["TARGETS"]["HYPE_USD"]
+
+        summary = discord_bot._decision_summary(
+            "HYPE_USD",
+            live_rules["HYPE_USD"],
+            decision,
+            {},
+            now=NOW + timedelta(hours=3),
+        )
+
+        self.assertIn("DONE FOR TODAY — NEXT ANALYSIS TOMORROW", summary)
+        self.assertIn("no late order will be replayed", summary)
+        self.assertIn("tomorrow's analysis resumes it", summary)
+        self.assertIn(f"Regime: `{decision['REGIME']}`", summary)
+        self.assertNotIn("Regime: `ERROR`", summary)
 
     def test_chain_never_reports_operational_for_unhealthy_workflow_evidence(self):
         with patch.object(discord_bot, "DCA_CRON_ENABLED", True):
@@ -1493,11 +1540,82 @@ class DiscordBotWorkflowAndGeminiTests(unittest.TestCase):
             patch.object(discord_bot.genai, "Client", return_value=client) as ctor,
         ):
             result = asyncio.run(discord_bot.classify_intent("show status"))
-        ctor.assert_called_once_with(api_key="test-key")
+        ctor.assert_called_once()
+        self.assertEqual(ctor.call_args.kwargs["api_key"], "test-key")
+        self.assertEqual(
+            ctor.call_args.kwargs["http_options"].timeout,
+            discord_bot.GEMINI_TIMEOUT_SECONDS * 1_000,
+        )
         client.models.generate_content.assert_called_once_with(
-            model="gemini-3.5-flash-lite", contents=ANY
+            model="gemini-3.5-flash-lite", contents=ANY, config=ANY
         )
         self.assertEqual(result["action"], "status")
+
+    def test_gemini_model_prose_and_parameters_are_never_executed_or_posted(self):
+        intent = discord_bot._validate_intent(
+            {
+                "action": "chat",
+                "topic": "controls",
+                "params": {"symbol": "HYPE_USD", "enabled": True},
+                "reply": "HYPE enabled and order submitted @everyone",
+            }
+        )
+
+        self.assertEqual(intent["action"], "chat")
+        self.assertEqual(intent["params"], {})
+        self.assertEqual(intent["reply"], discord_bot.CHAT_TOPIC_REPLIES["controls"])
+        self.assertNotIn("order submitted", intent["reply"])
+        self.assertNotIn("@everyone", intent["reply"])
+        self.assertNotIn("analyze", discord_bot.READ_ONLY_ACTION_HANDLERS)
+
+    def test_missing_gemini_key_keeps_read_only_natural_language_useful(self):
+        with patch.object(discord_bot, "GEMINI_API_KEY", ""):
+            status = asyncio.run(
+                discord_bot.classify_intent("Why is HYPE disabled today?")
+            )
+            write = asyncio.run(
+                discord_bot.classify_intent("Please enable HYPE and buy it now")
+            )
+
+        self.assertEqual(status["action"], "status")
+        self.assertEqual(write["action"], "chat")
+        self.assertEqual(write["topic"], "controls")
+
+    def test_natural_language_write_request_can_only_receive_read_only_reply(self):
+        class TypingStub:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        message = MagicMock()
+        message.author = SimpleNamespace(id="123")
+        message.channel.id = "456"
+        message.channel.typing.return_value = TypingStub()
+        message.content = "Please enable HYPE and place its order"
+        message.mentions = []
+        message.reply = AsyncMock()
+        intent = discord_bot._validate_intent(
+            {"action": "chat", "topic": "controls"}
+        )
+
+        with (
+            patch.object(discord_bot, "CHANNEL_ID", "456"),
+            patch.object(discord_bot, "ALLOWED_USERS", "123"),
+            patch.object(
+                discord_bot,
+                "classify_intent",
+                AsyncMock(return_value=intent),
+            ),
+            patch.object(discord_bot, "trigger_workflow") as dispatch,
+        ):
+            asyncio.run(discord_bot.on_message(message))
+
+        message.reply.assert_awaited_once_with(
+            discord_bot.CHAT_TOPIC_REPLIES["controls"]
+        )
+        dispatch.assert_not_called()
 
 
 if __name__ == "__main__":

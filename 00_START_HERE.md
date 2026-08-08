@@ -43,14 +43,14 @@ The configured target set is exactly:
 
 | Pair | `UPTREND` lower | `SIDEWAYS` midpoint | `DOWNTREND` higher | Intended state |
 | --- | ---: | ---: | ---: | --- |
-| `BTC/GBP` | £10 | £15 | £20 | Enabled |
-| `HYPE/USD` | £10 | £12.50 | £15 | Enabled |
-| `SOL/GBP` | £5 | £10 | £15 | Enabled |
+| `BTC/GBP` | £12.50 | £18.75 | £25 | Enabled |
+| `HYPE/USD` | £12.50 | £15.63 | £18.75 | Enabled |
+| `SOL/GBP` | £12.50 | £15.63 | £18.75 | Enabled |
 
 - The bot deliberately buys more in a `DOWNTREND`, the midpoint in a
   `SIDEWAYS` market, and less in an `UPTREND`.
-- Aggregate daily exposure is £50 / £37.50 / £25 when every pair is downtrend /
-  sideways / uptrend respectively.
+- Aggregate daily exposure is £62.50 / £50.01 / £37.50 when every pair is
+  downtrend / sideways / uptrend respectively.
 - Each enabled pair can buy at most once per Asia/Bangkok calendar day.
 - The strict trading start gate is `DCA_START_DATE=2026-08-07` in
   `Asia/Bangkok`. Earlier orders are blocked.
@@ -104,8 +104,25 @@ exact lowercase `!dca ` prefix and spacing.
 
 ```text
 show status
+!dca status
 !dca health
+show portfolio
+!dca portfolio
+help
 ```
+
+### Chat naturally with the bot
+
+When `GEMINI_API_KEY` is configured on Railway, ordinary messages are routed by
+Gemini Flash-Lite to an approved read-only status, health, portfolio, help, or
+educational response. Replies use short reviewed explanations with relevant
+emoji. Gemini-supplied prose and parameters are never posted or executed.
+
+Natural language cannot change a budget, start analysis, enable or disable a
+pair, confirm a change, or place a Kraken order. Those operations still require
+the exact allowlisted `!dca` commands shown by `help`. If Gemini is unavailable,
+the scheduler and exact commands continue normally and common read-only requests
+use a deterministic fallback.
 
 Before the configured start day or before its first 04:07 analysis, a pair may
 show an `ERROR` placeholder while overall health correctly reports `ARMED`.
@@ -190,15 +207,15 @@ The user-owned repository variable is `DCA_TARGET_MAP`. Its approved shape is:
 ```json
 {
   "BTC_GBP": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 20},
+    "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 25},
     "BUY_ENABLED": true
   },
   "HYPE_USD": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 15},
+    "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 18.75},
     "BUY_ENABLED": true
   },
   "SOL_GBP": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 5, "UP": 15},
+    "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 18.75},
     "BUY_ENABLED": true
   }
 }

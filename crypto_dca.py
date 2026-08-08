@@ -103,15 +103,20 @@ def _place_routed_market_buy(
     )
 
 
-def send_discord_alert(message, is_error=False):
+def send_discord_alert(message, is_error=False, *, title=None, color=None):
     if not DISCORD_WEBHOOK_URL:
         return
     payload = {
         "embeds": [
             {
-                "title": "Kraken Automated DCA Execution",
+                "title": title
+                or (
+                    "🚨 DCA Bot Needs Attention"
+                    if is_error
+                    else "✅ DCA Bot Update"
+                ),
                 "description": message,
-                "color": 16711680 if is_error else 65280,
+                "color": color if color is not None else (16711680 if is_error else 65280),
                 "timestamp": datetime.now(SELECTED_TZ).isoformat(),
             }
         ]
@@ -605,7 +610,11 @@ def _decision_gate(symbol, rule, decision, now):
         return "ERROR", "analysis decision is not for the current Bangkok date", None
     expected_hash = rules_hash(symbol, rule)
     if decision["RULES_HASH"] != expected_hash:
-        return "ERROR", "analysis decision does not match the live budgets", None
+        return (
+            "REFRESH_REQUIRED",
+            "the GBP budget changed after this analysis was calculated",
+            None,
+        )
     try:
         execute_at = parse_utc_iso(decision["EXECUTE_AT"])
         valid_until = parse_utc_iso(decision["VALID_UNTIL"])
@@ -1178,6 +1187,35 @@ def main():
             continue
         if status == "SHADOW":
             print(f"{symbol}: {reason}; no Kraken order attempted.", flush=True)
+            continue
+        if status == "REFRESH_REQUIRED":
+            pair = symbol.replace("_", "/")
+            message = (
+                f"🔄 **{pair} is waiting for fresh analysis**\n"
+                "The GBP budget changed after today's decision was calculated.\n"
+                "🛡️ **Safety:** No Kraken order was attempted.\n"
+                "▶️ **Next:** A new deterministic analysis must complete before "
+                "this pair can trade."
+            )
+            print(f"{symbol}: {reason}; no Kraken order attempted.", flush=True)
+            send_discord_alert(
+                message,
+                is_error=False,
+                title="🔄 DCA Analysis Refresh Required",
+                color=16753920,
+            )
+            all_succeeded = False
+            continue
+        if status == "MISSED":
+            pair = symbol.replace("_", "/")
+            print(
+                f"{pair}: today's safe execution window has closed; no late "
+                "order will be replayed. Tomorrow's analysis will schedule the "
+                "next opportunity.",
+                flush=True,
+            )
+            # This is an expected terminal state, not an execution failure.
+            # Scheduled fallbacks remain quiet instead of repeating a red alert.
             continue
         if status != "READY":
             message = f"Skipping {symbol}: {reason}."

@@ -13,8 +13,9 @@ workflows, or release configuration.
   strict `YYYY-MM-DD` date in `Asia/Bangkok`; all earlier trading fails closed.
 - Counter-cyclical spend mapping is downtrend=`HIGH`, sideways=`MID`, and
   uptrend=`LOW`. `MID` is the half-up penny-rounded arithmetic midpoint.
-- The current lower/higher endpoints are BTC £10/£20, HYPE £10/£15, and SOL
-  £5/£15, producing sideways amounts £15/£12.50/£10. Budget changes must use
+- The current lower/higher endpoints are BTC £12.50/£25, HYPE £12.50/£18.75,
+  and SOL £12.50/£18.75, producing sideways amounts £18.75/£15.63/£15.63.
+  Budget changes must use
   the guarded configuration flow and must keep the lower endpoint at or below
   the higher endpoint.
 - BTC and SOL are direct GBP buys on `BTC/GBP` and `SOL/GBP`. HYPE alone uses
