@@ -178,6 +178,35 @@ class GitHubContentsTests(unittest.TestCase):
         self.assertNotIn("sha", puts[0][2]["json"])
         self.assertEqual(session.current, "{\"version\":1}\n")
 
+    def test_write_once_create_is_idempotent_but_never_replaces(self):
+        session = RepositorySession(exists=False)
+        repository = client(session)
+        first = repository.write_once_text(
+            "outbox/immutable.json", "{\"version\":1}\n", message="Create immutable"
+        )
+        second = repository.write_once_text(
+            "outbox/immutable.json", "{\"version\":1}\n", message="Create immutable"
+        )
+
+        self.assertTrue(first.changed)
+        self.assertFalse(second.changed)
+        self.assertEqual(len([call for call in session.calls if call[0] == "PUT"]), 1)
+        with self.assertRaises(github_contents.GitHubContentsConflictError):
+            repository.write_once_text(
+                "outbox/immutable.json", "{\"version\":2}\n", message="Create immutable"
+            )
+        self.assertEqual(session.current, "{\"version\":1}\n")
+
+    def test_write_once_lost_create_response_is_recovered_without_replacement(self):
+        session = LostResponseSession(exists=False)
+        result = client(session).write_once_text(
+            "outbox/immutable.json", "same\n", message="Create immutable"
+        )
+
+        self.assertFalse(result.changed)
+        self.assertEqual(result.content, "same\n")
+        self.assertEqual(len([call for call in session.calls if call[0] == "PUT"]), 1)
+
     def test_sha_conflict_refetches_and_merges_with_bounded_retry(self):
         for status in (409, 422):
             with self.subTest(status=status):

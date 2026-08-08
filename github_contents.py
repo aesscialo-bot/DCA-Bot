@@ -25,6 +25,8 @@ TOKEN_ENV = "DCA_OUTBOX_REPOSITORY_TOKEN"
 AUDIT_PATH_ENV = "DCA_OUTBOX_AUDIT_PATH"
 EVENT_PATH_ENV = "DCA_OUTBOX_EVENT_PATH"
 HOLDINGS_PATH_ENV = "DCA_OUTBOX_HOLDINGS_PATH"
+OPENING_BASIS_PATH_ENV = "DCA_OUTBOX_OPENING_BASIS_PATH"
+OPENING_BASIS_SOURCE_PATH_ENV = "DCA_OUTBOX_OPENING_BASIS_SOURCE_PATH"
 
 API_ROOT = "https://api.github.com"
 API_VERSION = "2022-11-28"
@@ -112,6 +114,29 @@ def configured_outbox_paths() -> OutboxPaths:
     if len({paths.audit, paths.event, paths.holdings}) != 3:
         raise GitHubContentsConfigError("outbox artifact paths must be distinct")
     return paths
+
+
+def configured_opening_basis_path() -> str:
+    """Return the distinct path for hash-bound pre-cutover basis evidence."""
+    path = configured_path(OPENING_BASIS_PATH_ENV)
+    current = configured_outbox_paths()
+    if path in {current.audit, current.event, current.holdings}:
+        raise GitHubContentsConfigError(
+            "opening-basis path must be distinct from existing outbox artifacts"
+        )
+    return path
+
+
+def configured_opening_basis_source_path() -> str:
+    """Return the distinct immutable source-evidence artifact path."""
+    path = configured_path(OPENING_BASIS_SOURCE_PATH_ENV)
+    existing = configured_outbox_paths()
+    basis = configured_opening_basis_path()
+    if path in {existing.audit, existing.event, existing.holdings, basis}:
+        raise GitHubContentsConfigError(
+            "opening-basis source path must be distinct from existing outbox artifacts"
+        )
+    return path
 
 
 class GitHubContentsClient:
@@ -353,6 +378,62 @@ class GitHubContentsClient:
 
     def replace_text(self, path: str, content: str, *, message: str) -> WriteResult:
         return self.update_text(path, lambda _current: content, message=message)
+
+    def write_once_text(self, path: str, content: str, *, message: str) -> WriteResult:
+        """Create one immutable file, allowing only byte-identical retries.
+
+        Unlike ``replace_text``, this method never sends an update for an
+        existing path.  A concurrent creator is handled by re-reading the
+        path; only the exact bytes requested by this call are idempotent.
+        """
+        if not isinstance(content, str):
+            raise GitHubContentsConfigError("outbox write-once content is invalid")
+        if len(content.encode("utf-8")) > MAX_CONTENT_BYTES:
+            raise GitHubContentsError("outbox file would exceed the supported size")
+        if not isinstance(message, str) or not message.strip() or len(message) > 120:
+            raise GitHubContentsConfigError("outbox commit message is invalid")
+
+        for _attempt in range(self._max_conflict_attempts):
+            current = self.read_text(path)
+            if current.exists:
+                if current.content == content:
+                    return WriteResult(
+                        changed=False,
+                        sha=current.sha,
+                        content=current.content,
+                    )
+                raise GitHubContentsConflictError(
+                    "immutable outbox artifact already exists with different content"
+                )
+
+            try:
+                response = self._put_text(path, content, None, message.strip())
+            except GitHubContentsRequestError:
+                # The create may have committed before the response was lost.
+                continue
+            if response.status_code in {409, 422}:
+                continue
+            self._raise_status(response, "write-once create")
+            metadata = self._json_object(response, "write-once create")
+            written = metadata.get("content")
+            written_sha = written.get("sha") if isinstance(written, dict) else None
+            if not isinstance(written_sha, str) or _BLOB_SHA.fullmatch(written_sha) is None:
+                raise GitHubContentsError(
+                    "private repository did not confirm a file SHA"
+                )
+            confirmed = self.read_text(path)
+            if not confirmed.exists or confirmed.sha != written_sha or confirmed.content != content:
+                raise GitHubContentsError(
+                    "private repository did not confirm write-once content"
+                )
+            return WriteResult(changed=True, sha=written_sha, content=content)
+
+        current = self.read_text(path)
+        if current.exists and current.content == content:
+            return WriteResult(changed=False, sha=current.sha, content=current.content)
+        raise GitHubContentsConflictError(
+            "private repository write-once create conflicted repeatedly"
+        )
 
 
 def configured_repository_path(value: str) -> str:
