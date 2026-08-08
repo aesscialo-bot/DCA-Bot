@@ -1,10 +1,12 @@
 import hashlib
 import json
+import os
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from github_contents import GitHubContentsConfigError, WriteResult
 from ghostfolio import kraken_holdings_snapshot
 
 
@@ -16,7 +18,27 @@ class Exchange:
         return {"last": {"BTC/GBP": 50000, "HYPE/USD": 40, "SOL/GBP": 50}[pair]}
 
 
+class FakeRepository:
+    def __init__(self):
+        self.calls = []
+
+    def replace_text(self, path, content, *, message):
+        self.calls.append((path, content, message))
+        return WriteResult(changed=True, sha="a" * 40, content=content)
+
+
 class KrakenHoldingsSnapshotTests(unittest.TestCase):
+    def _outbox_environment(self):
+        return {
+            "DCA_OUTBOX_REPOSITORY_OWNER": "example",
+            "DCA_OUTBOX_REPOSITORY_NAME": "private-outbox",
+            "DCA_OUTBOX_REPOSITORY_BRANCH": "main",
+            "DCA_OUTBOX_REPOSITORY_TOKEN": "token",
+            "DCA_OUTBOX_AUDIT_PATH": "portfolio/audit.md",
+            "DCA_OUTBOX_EVENT_PATH": "portfolio/events.jsonl",
+            "DCA_OUTBOX_HOLDINGS_PATH": "portfolio/holdings.json",
+        }
+
     def test_snapshot_uses_canonical_mixed_pairs_and_signed_quantities(self):
         snapshot = kraken_holdings_snapshot.build_snapshot(
             Exchange(), now=datetime(2026, 8, 7, tzinfo=timezone.utc)
@@ -75,6 +97,33 @@ class KrakenHoldingsSnapshotTests(unittest.TestCase):
         self.assertIn("group: dca-execution-state-writers", workflow)
         self.assertIn("gh variable get DCA_EXECUTION_STATE", workflow)
         self.assertIn("secrets.GH_PAT_FOR_VARS", workflow)
+        self.assertIn("DCA_OUTBOX_REPOSITORY_TOKEN", workflow)
+        self.assertNotIn("GIST_TOKEN:", workflow)
+
+    def test_publish_replaces_only_the_configured_holdings_path(self):
+        snapshot = kraken_holdings_snapshot.build_snapshot(
+            Exchange(), now=datetime(2026, 8, 7, tzinfo=timezone.utc)
+        )
+        repository = FakeRepository()
+        with patch.dict(os.environ, self._outbox_environment(), clear=True):
+            kraken_holdings_snapshot.publish(snapshot, client=repository)
+
+        self.assertEqual(len(repository.calls), 1)
+        path, content, message = repository.calls[0]
+        self.assertEqual(path, "portfolio/holdings.json")
+        self.assertEqual(json.loads(content), snapshot)
+        self.assertTrue(content.endswith("\n"))
+        self.assertEqual(message, "Update signed Kraken holdings snapshot")
+
+    def test_publish_fails_closed_when_any_outbox_path_is_missing(self):
+        snapshot = {"version": 1}
+        environment = self._outbox_environment()
+        del environment["DCA_OUTBOX_EVENT_PATH"]
+        repository = FakeRepository()
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(GitHubContentsConfigError):
+                kraken_holdings_snapshot.publish(snapshot, client=repository)
+        self.assertEqual(repository.calls, [])
 
     def test_snapshot_rejects_malformed_balances_and_naive_time(self):
         class MalformedExchange(Exchange):

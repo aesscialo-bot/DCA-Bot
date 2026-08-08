@@ -208,17 +208,21 @@ class DiscordBotControlTests(unittest.TestCase):
 
     def test_ghostfolio_health_distinguishes_pending_and_completed_receipts(self):
         event = gist_delivery()["event"]
-        response = MagicMock(status_code=200)
-        response.json.return_value = {"files": {
-            discord_bot.PORTFOLIO_EVENT_FILE: {
-                "content": json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
-            },
-            discord_bot.GHOSTFOLIO_RECEIPT_FILE: {"content": ""},
-        }}
+        files = {
+            "portfolio/events.jsonl": SimpleNamespace(
+                content=json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n",
+                exists=True,
+            ),
+            "portfolio/receipts.jsonl": SimpleNamespace(content="", exists=True),
+        }
+        client = MagicMock()
+        client.resolve_commit_sha.return_value = "a" * 40
+        client.read_text_at_commit.side_effect = lambda path, _sha: files[path]
         with (
-            patch.object(discord_bot, "GIST_ID", "gist-id"),
-            patch.object(discord_bot, "GIST_TOKEN", "token"),
-            patch.object(discord_bot.requests, "get", return_value=response),
+            patch.object(discord_bot, "GH_PAT", "controller-token"),
+            patch.object(discord_bot, "DCA_OUTBOX_EVENT_PATH", "portfolio/events.jsonl"),
+            patch.object(discord_bot, "DCA_OUTBOX_GHOSTFOLIO_EVENT_RECEIPT_PATH", "portfolio/receipts.jsonl"),
+            patch.object(discord_bot, "GitHubContentsClient", return_value=client),
         ):
             self.assertEqual(
                 discord_bot.get_ghostfolio_delivery_health(),
@@ -230,7 +234,7 @@ class DiscordBotControlTests(unittest.TestCase):
                 "ghostfolio_activity_id": "activity-id",
                 "imported_at": "2026-08-06T01:10:00Z",
             }
-            response.json.return_value["files"][discord_bot.GHOSTFOLIO_RECEIPT_FILE]["content"] = json.dumps(receipt) + "\n"
+            files["portfolio/receipts.jsonl"].content = json.dumps(receipt) + "\n"
             self.assertEqual(
                 discord_bot.get_ghostfolio_delivery_health(),
                 {"status": "CLEAR", "pending": 0, "completed": 1},
@@ -239,19 +243,76 @@ class DiscordBotControlTests(unittest.TestCase):
     def test_ghostfolio_health_rejects_malformed_event_hash(self):
         event = gist_delivery()["event"]
         event["canonical_hash"] = "0" * 64
-        response = MagicMock(status_code=200)
-        response.json.return_value = {"files": {
-            discord_bot.PORTFOLIO_EVENT_FILE: {"content": json.dumps(event) + "\n"},
-            discord_bot.GHOSTFOLIO_RECEIPT_FILE: {"content": ""},
-        }}
+        files = {
+            "portfolio/events.jsonl": SimpleNamespace(content=json.dumps(event) + "\n", exists=True),
+            "portfolio/receipts.jsonl": SimpleNamespace(content="", exists=True),
+        }
+        client = MagicMock()
+        client.resolve_commit_sha.return_value = "b" * 40
+        client.read_text_at_commit.side_effect = lambda path, _sha: files[path]
         with (
-            patch.object(discord_bot, "GIST_ID", "gist-id"),
-            patch.object(discord_bot, "GIST_TOKEN", "token"),
-            patch.object(discord_bot.requests, "get", return_value=response),
+            patch.object(discord_bot, "GH_PAT", "controller-token"),
+            patch.object(discord_bot, "DCA_OUTBOX_EVENT_PATH", "portfolio/events.jsonl"),
+            patch.object(discord_bot, "DCA_OUTBOX_GHOSTFOLIO_EVENT_RECEIPT_PATH", "portfolio/receipts.jsonl"),
+            patch.object(discord_bot, "GitHubContentsClient", return_value=client),
         ):
             self.assertEqual(
                 discord_bot.get_ghostfolio_delivery_health()["status"], "INVALID"
             )
+
+    def test_ghostfolio_health_uses_exact_private_target_and_safe_token_precedence(self):
+        for dedicated, controller, expected in (
+            ("dedicated-token", "controller-token", "dedicated-token"),
+            ("", "controller-token", "controller-token"),
+        ):
+            with self.subTest(dedicated=bool(dedicated)):
+                client = MagicMock()
+                client.resolve_commit_sha.return_value = "c" * 40
+                client.read_text_at_commit.side_effect = (
+                    lambda _path, _sha: SimpleNamespace(content="", exists=True)
+                )
+                with (
+                    patch.dict(
+                        discord_bot.os.environ,
+                        {discord_bot.TOKEN_ENV: dedicated},
+                        clear=False,
+                    ),
+                    patch.object(discord_bot, "GH_PAT", controller),
+                    patch.object(discord_bot, "GitHubContentsClient", return_value=client) as client_type,
+                ):
+                    self.assertEqual(
+                        discord_bot.get_ghostfolio_delivery_health(),
+                        {"status": "CLEAR", "pending": 0, "completed": 0},
+                    )
+                self.assertEqual(
+                    client_type.call_args.kwargs,
+                    {
+                        "owner": "aesscialo-bot",
+                        "repository": "portfolio-canonical-ledger",
+                        "branch": "main",
+                        "token": expected,
+                    },
+                )
+                self.assertEqual(
+                    client.read_text_at_commit.call_args_list[0].args,
+                    ("portfolio/kraken_usd_dca_ghostfolio_events.jsonl", "c" * 40),
+                )
+                self.assertEqual(
+                    client.read_text_at_commit.call_args_list[1].args,
+                    ("portfolio/ghostfolio_sync_receipts.jsonl", "c" * 40),
+                )
+
+    def test_ghostfolio_health_fails_closed_without_any_repository_token(self):
+        with (
+            patch.dict(discord_bot.os.environ, {discord_bot.TOKEN_ENV: ""}, clear=False),
+            patch.object(discord_bot, "GH_PAT", ""),
+            patch.object(discord_bot, "GitHubContentsClient") as client_type,
+        ):
+            self.assertEqual(
+                discord_bot.get_ghostfolio_delivery_health(),
+                {"status": "UNAVAILABLE", "pending": None, "completed": None},
+            )
+        client_type.assert_not_called()
 
     def test_symbols_are_derived_from_valid_three_target_map(self):
         with patch.object(

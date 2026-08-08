@@ -69,8 +69,13 @@ jobs:
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GH_PAT_FOR_VARS: ${{ secrets.GH_PAT_FOR_VARS }}
-          GIST_ID: ${{ secrets.GIST_ID }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          DCA_OUTBOX_REPOSITORY_OWNER: ${{ vars.DCA_OUTBOX_REPOSITORY_OWNER }}
+          DCA_OUTBOX_REPOSITORY_NAME: ${{ vars.DCA_OUTBOX_REPOSITORY_NAME }}
+          DCA_OUTBOX_REPOSITORY_BRANCH: ${{ vars.DCA_OUTBOX_REPOSITORY_BRANCH }}
+          DCA_OUTBOX_AUDIT_PATH: ${{ vars.DCA_OUTBOX_AUDIT_PATH }}
+          DCA_OUTBOX_EVENT_PATH: ${{ vars.DCA_OUTBOX_EVENT_PATH }}
+          DCA_OUTBOX_HOLDINGS_PATH: ${{ vars.DCA_OUTBOX_HOLDINGS_PATH }}
+          DCA_OUTBOX_REPOSITORY_TOKEN: ${{ secrets.DCA_OUTBOX_REPOSITORY_TOKEN }}
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Bangkok' }}
           DCA_START_DATE: ${{ vars.DCA_START_DATE }}
           DCA_SYMBOLS_JSON: ${{ inputs.symbols_json || '' }}

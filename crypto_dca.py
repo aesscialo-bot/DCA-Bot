@@ -466,11 +466,12 @@ def complete_order_intent(
     *,
     gist_delivery,
 ):
-    """Atomically complete an order and retain its immutable Gist delivery.
+    """Atomically complete an order and retain immutable outbox evidence.
 
     The confirmed fill is never marked complete without first retaining the
-    delivery evidence in the same protected execution-state write.  Gist
-    availability therefore cannot cause the Kraken order to be repeated.
+    delivery evidence in the same protected execution-state write.  Repository
+    availability therefore cannot cause the Kraken order to be repeated.  The
+    legacy field name is preserved so existing recovery evidence is not lost.
     """
     _parse_trade_date(completed_date, symbol_key)
     raw_state, exists = _fetch_repo_json_variable(
@@ -497,12 +498,12 @@ def complete_order_intent(
     )
     if existing is not None and existing != normalized_delivery:
         raise RuntimeError(
-            f"A different Gist delivery already uses the Kraken order ID for {symbol_key}"
+            f"Different outbox evidence already uses the Kraken order ID for {symbol_key}"
         )
     if existing is None:
         if len(deliveries) >= MAX_PENDING_GIST_DELIVERIES:
             raise RuntimeError(
-                f"The durable Gist delivery queue is full for {symbol_key}"
+                f"The durable outbox delivery queue is full for {symbol_key}"
             )
         deliveries.append(normalized_delivery)
     entry[PENDING_GIST_DELIVERIES_FIELD] = deliveries
@@ -538,7 +539,7 @@ def acknowledge_gist_delivery(symbol_key, delivery_id, row_sha256):
         return True
     if match["row_sha256"] != row_sha256:
         raise RuntimeError(
-            f"Refusing to acknowledge changed Gist delivery evidence for {symbol_key}"
+            f"Refusing to acknowledge changed outbox delivery evidence for {symbol_key}"
         )
     remaining = [
         queued
@@ -777,7 +778,7 @@ def _post_trade_logs(
                 saved_to_ghostfolio=ghostfolio_saved,
             )
         except Exception as error:
-            print(f"Optional Gist logging failed: {type(error).__name__}", flush=True)
+            print(f"Private repository outbox failed: {type(error).__name__}", flush=True)
     return ghostfolio_saved
 
 

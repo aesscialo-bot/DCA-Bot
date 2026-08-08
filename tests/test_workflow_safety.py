@@ -32,10 +32,30 @@ class WorkflowSafetyTests(unittest.TestCase):
                 self.assertIn("cancel-in-progress: false", text)
                 self.assertIn("github.ref == 'refs/heads/main'", text)
 
-    def test_gist_token_is_separate_from_repo_variable_token(self):
-        text = self._read("daily_dca.yml")
-        self.assertIn("GIST_TOKEN: ${{ secrets.GIST_TOKEN }}", text)
-        self.assertIn("GH_PAT_FOR_VARS: ${{ secrets.GH_PAT_FOR_VARS }}", text)
+    def test_private_outbox_token_is_separate_from_repo_variable_token(self):
+        for name in (
+            "daily_dca.yml",
+            "ghostfolio_holdings_snapshot.yml",
+            "recover_ghostfolio_event.yml",
+        ):
+            text = self._read(name)
+            with self.subTest(workflow=name):
+                self.assertIn(
+                    "DCA_OUTBOX_REPOSITORY_TOKEN: ${{ secrets.DCA_OUTBOX_REPOSITORY_TOKEN }}",
+                    text,
+                )
+                self.assertNotIn("GIST_ID:", text)
+                self.assertNotIn("GIST_TOKEN:", text)
+                self.assertIn("DCA_OUTBOX_REPOSITORY_OWNER:", text)
+                self.assertIn("DCA_OUTBOX_REPOSITORY_NAME:", text)
+                self.assertIn("DCA_OUTBOX_REPOSITORY_BRANCH:", text)
+                self.assertIn("DCA_OUTBOX_AUDIT_PATH:", text)
+                self.assertIn("DCA_OUTBOX_EVENT_PATH:", text)
+                self.assertIn("DCA_OUTBOX_HOLDINGS_PATH:", text)
+        self.assertIn(
+            "GH_PAT_FOR_VARS: ${{ secrets.GH_PAT_FOR_VARS }}",
+            self._read("daily_dca.yml"),
+        )
 
     def test_daily_dca_has_no_direct_ghostfolio_credentials(self):
         text = self._read("daily_dca.yml")

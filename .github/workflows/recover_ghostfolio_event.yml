@@ -104,10 +104,15 @@ jobs:
           TIMEZONE: Asia/Bangkok
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
-          # Preview requires read access to prove the exact Markdown row exists.
-          # Only the doubly hash-gated publish code path can issue a PATCH.
-          GIST_ID: ${{ secrets.GIST_ID }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          # Preview proves the exact row in the private repository. Only the
+          # doubly hash-gated publish path can issue a Contents API PUT.
+          DCA_OUTBOX_REPOSITORY_OWNER: ${{ vars.DCA_OUTBOX_REPOSITORY_OWNER }}
+          DCA_OUTBOX_REPOSITORY_NAME: ${{ vars.DCA_OUTBOX_REPOSITORY_NAME }}
+          DCA_OUTBOX_REPOSITORY_BRANCH: ${{ vars.DCA_OUTBOX_REPOSITORY_BRANCH }}
+          DCA_OUTBOX_AUDIT_PATH: ${{ vars.DCA_OUTBOX_AUDIT_PATH }}
+          DCA_OUTBOX_EVENT_PATH: ${{ vars.DCA_OUTBOX_EVENT_PATH }}
+          DCA_OUTBOX_HOLDINGS_PATH: ${{ vars.DCA_OUTBOX_HOLDINGS_PATH }}
+          DCA_OUTBOX_REPOSITORY_TOKEN: ${{ secrets.DCA_OUTBOX_REPOSITORY_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -121,7 +126,7 @@ jobs:
           printf '::add-mask::%s\n' "$EXPECTED_FUNDING_ORDER_ID"
 
           # The shared concurrency lock keeps this state stable for the run.
-          # Refuse recovery while any current purchase or Gist delivery is
+          # Refuse recovery while any current purchase or outbox delivery is
           # unresolved, even though the historical Kraken query is read-only.
           python - <<'PY'
           import os
