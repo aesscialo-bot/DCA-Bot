@@ -43,15 +43,15 @@ The requested enabled rules are:
 ```json
 {
   "BTC_GBP": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 20},
+    "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 25},
     "BUY_ENABLED": true
   },
   "HYPE_USD": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 15},
+    "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 18.75},
     "BUY_ENABLED": true
   },
   "SOL_GBP": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 5, "UP": 15},
+    "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 18.75},
     "BUY_ENABLED": true
   }
 }
@@ -61,9 +61,9 @@ The stored `LOW` and `UP` fields are the lower and upper budget endpoints; the
 `UP` field name is retained for configuration compatibility and no longer means
 "use this in an uptrend." The counter-cyclical policy is:
 
-- `DOWNTREND` → higher endpoint: BTC £20, HYPE £15, SOL £15; £50 aggregate.
-- `SIDEWAYS` → midpoint: BTC £15, HYPE £12.50, SOL £10; £37.50 aggregate.
-- `UPTREND` → lower endpoint: BTC £10, HYPE £10, SOL £5; £25 aggregate.
+- `DOWNTREND` → higher endpoint: BTC £25, HYPE £18.75, SOL £18.75; £62.50 aggregate.
+- `SIDEWAYS` → midpoint: BTC £18.75, HYPE £15.63, SOL £15.63; £50.01 aggregate.
+- `UPTREND` → lower endpoint: BTC £12.50, HYPE £12.50, SOL £12.50; £37.50 aggregate.
 
 Each enabled asset can buy at most once per Bangkok calendar day.
 
@@ -238,8 +238,11 @@ Railway `GH_PAT` is the fail-closed compatibility credential; this adds no new
 permission to the process, but it should be replaced with the narrower token
 after Railway access is available.
 
-Railway may also contain `GEMINI_API_KEY` for optional read-only conversational
-intent classification. Exact DCA control commands never depend on AI.
+Railway may also contain `GEMINI_API_KEY` for optional natural-language chat and
+read-only conversational routing. Gemini selects only an approved educational
+topic or read-only status, health, help, or portfolio handler; reviewed code
+supplies the reply and discards model-generated prose and parameters. Exact DCA
+controls, analysis, scheduling, and execution never depend on AI.
 
 Required GitHub Actions secrets:
 
@@ -283,20 +286,30 @@ must never print a complete rules, analysis, or execution-state document.
 Examples use the canonical mixed-market targets:
 
 ```text
-!dca set BTC amounts to 10 low and 20 high
+!dca set BTC amounts to 12.50 low and 25 high
 !dca disable BTC
 !dca enable BTC
 !dca confirm enable BTC_GBP
 !dca analyze BTC
 !dca analyze all
 show status
+!dca status
 !dca health
+show portfolio
+!dca portfolio
+help
 ```
 
 Budget changes require the target to be disabled. Enabling requires exact
 confirmation and displays the lower, midpoint, and higher amounts, the latest
 regime, effective amount, next execution time, decision age, and aggregate
 maximum daily exposure.
+
+Messages that are not exact commands can be phrased naturally. Gemini routes
+them only to read-only handlers or reviewed emoji-labelled explanations about
+DCA, regimes, timing, risk, markets, and controls. Natural language cannot
+change configuration, start analysis, enable/disable a pair, confirm a change,
+or submit an order; use `help` for the exact safety-critical command.
 
 ## Workflows
 

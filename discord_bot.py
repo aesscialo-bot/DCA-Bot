@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 import discord
 from discord.ext import tasks
 from google import genai
+from google.genai import types
 import requests
 
 from dca_config import (
@@ -529,45 +530,205 @@ def _symbols_from_dca_map() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Optional Gemini classifier for read-only conversational commands
+# Optional Gemini chat and read-only conversational routing
 # ---------------------------------------------------------------------------
 
 
 AI_MODEL_CANDIDATES = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
-VALID_ACTIONS = {"portfolio", "status", "help", "unknown"}
-CLASSIFY_PROMPT = """Classify a read-only Discord command for a DCA service.
-Allowed actions are portfolio, status, help, and unknown. Never classify a
-configuration change, analysis request, enable, disable, or purchase. Respond
-with JSON only: {"action":"...","params":{},"reply":"..."}."""
+GEMINI_TIMEOUT_SECONDS = 15
+VALID_ACTIONS = {"portfolio", "status", "health", "help", "chat", "unknown"}
+VALID_CHAT_TOPICS = {
+    "greeting",
+    "dca",
+    "regimes",
+    "timing",
+    "risk",
+    "markets",
+    "controls",
+    "capabilities",
+}
+CHAT_TOPIC_REPLIES = {
+    "greeting": (
+        "🐙 Hi! I’m your Kraken DCA guide. Ask me how the bot works, why a pair "
+        "is paused, or whether analysis and scheduling are healthy."
+    ),
+    "dca": (
+        "🪙 DCA invests a configured amount on a repeating schedule. This bot "
+        "uses deterministic Kraken candle analysis to choose the daily time and "
+        "budget tier; DCA reduces timing concentration but cannot remove crypto risk."
+    ),
+    "regimes": (
+        "🧭 Completed Kraken candles determine UPTREND, SIDEWAYS, or DOWNTREND. "
+        "Those labels select the configured lower, midpoint, or higher spend; "
+        "Gemini can explain the result but cannot choose or change it."
+    ),
+    "timing": (
+        "⏰ Daily analysis compares 3/5/7/14/30/45/60-day windows in 15-minute "
+        "Bangkok slots. Type `show status` for today’s selected time, effective "
+        "execution time, decision age, and any reason a pair is blocked."
+    ),
+    "risk": (
+        "🛡️ Crypto prices can move sharply and losses are possible. Natural-language "
+        "chat is read-only, every trading change requires an exact allowlisted "
+        "command, and invalid or stale state fails closed."
+    ),
+    "markets": (
+        "📈 The configured markets are BTC/GBP, HYPE/USD, and SOL/GBP. BTC and SOL "
+        "spend GBP directly; HYPE uses the bot’s guarded GBP-to-USD funding route. "
+        "Type `show status` to see which pairs are currently enabled."
+    ),
+    "controls": (
+        "🔐 I can explain a change in normal language, but chat cannot apply it. "
+        "Type `help` and use the exact allowlisted `!dca` command shown there; "
+        "I will never claim a natural-language request changed trading."
+    ),
+    "capabilities": (
+        "💬 Ask me about DCA, regimes, timing, risk, markets, pair status, or bot "
+        "health. I can route read-only requests and explain the system; type `help` "
+        "for the exact controls."
+    ),
+}
+CLASSIFY_PROMPT = """You are the read-only intent and topic classifier for a
+Kraken DCA Discord bot. Understand ordinary conversational language, but do not
+write a reply or provide financial advice.
+
+Choose exactly one action:
+- portfolio: explicitly request a read-only Kraken holdings/balance report.
+- status: ask about pair enablement, current regimes, budgets, decisions, or times.
+- health: ask whether the bot, scheduler, workflows, or configuration are healthy.
+- help: ask for commands or instructions.
+- chat: any other greeting, explanation, educational question, or request to
+  change settings, run analysis, or buy. For chat choose exactly one topic from
+  greeting, dca, regimes, timing, risk, markets, controls, or capabilities.
+- unknown: only an empty or impossible-to-understand message.
+
+Natural language is strictly read-only. Never return an action that changes a
+budget, runs analysis, enables or disables a pair, confirms a change, or places
+an order. Requests for those actions must be chat/controls and must never be
+described as completed. Do not claim access to live prices or news. The exact
+markets are BTC/GBP, HYPE/USD, and SOL/GBP. Deterministic Python—not Gemini—owns
+regimes, amounts, timing, analysis, and execution.
+
+Respond as JSON only with exactly `action` and `topic`. For non-chat actions use
+topic `capabilities`. Do not return prose, parameters, commands, prices, amounts,
+assets, or any additional fields."""
+
+INTENT_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": sorted(VALID_ACTIONS)},
+        "topic": {"type": "string", "enum": sorted(VALID_CHAT_TOPICS)},
+    },
+    "required": ["action", "topic"],
+    "additionalProperties": False,
+}
+
+
+def _rule_based_read_only_intent(text: str) -> dict[str, Any]:
+    """Keep safe, common requests useful when Gemini is unavailable."""
+
+    lowered = text.casefold().strip()
+    if re.search(
+        r"\b(enable|disable|change|set|increase|decrease|buy|purchase|order|"
+        r"analyse|analyze)\b",
+        lowered,
+    ):
+        action, topic = "chat", "controls"
+    elif any(word in lowered for word in ("help", "command", "how do i")):
+        action, topic = "help", "capabilities"
+    elif any(word in lowered for word in ("portfolio", "balance", "holding")):
+        action, topic = "portfolio", "capabilities"
+    elif any(word in lowered for word in ("health", "healthy", "online", "scheduler")):
+        action, topic = "health", "capabilities"
+    elif any(
+        word in lowered
+        for word in (
+            "status",
+            "enabled",
+            "disabled",
+            "regime",
+            "trend",
+            "amount",
+            "execution time",
+            "next buy",
+        )
+    ):
+        action, topic = "status", "capabilities"
+    elif any(word in lowered for word in ("hello", "hi ", "hey", "good morning")):
+        action, topic = "chat", "greeting"
+    elif "risk" in lowered or "safe" in lowered:
+        action, topic = "chat", "risk"
+    elif "time" in lowered or "schedule" in lowered:
+        action, topic = "chat", "timing"
+    elif "market" in lowered or "pair" in lowered:
+        action, topic = "chat", "markets"
+    elif "dca" in lowered:
+        action, topic = "chat", "dca"
+    elif lowered:
+        action, topic = "chat", "capabilities"
+    else:
+        action, topic = "unknown", "capabilities"
+    return _validate_intent({"action": action, "topic": topic})
 
 
 def _validate_intent(intent: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(intent, dict) or intent.get("action") not in VALID_ACTIONS:
-        return {"action": "unknown", "params": {}, "reply": ""}
-    params = intent.get("params")
+        return {
+            "action": "unknown",
+            "params": {},
+            "reply": "",
+            "topic": "capabilities",
+        }
+    action = intent["action"]
+    topic = str(intent.get("topic") or "capabilities")
+    if topic not in VALID_CHAT_TOPICS:
+        topic = "capabilities"
     return {
-        "action": intent["action"],
-        "params": params if isinstance(params, dict) else {},
-        "reply": str(intent.get("reply", ""))[:300],
+        "action": action,
+        # Model-supplied parameters never influence a workflow dispatch.
+        "params": {},
+        # Model prose is never posted. Gemini selects a reviewed explanation.
+        "reply": CHAT_TOPIC_REPLIES[topic] if action == "chat" else "",
+        "topic": topic,
     }
 
 
 async def classify_intent(text: str) -> dict[str, Any]:
-    prompt = f"{CLASSIFY_PROMPT}\nUser message: {text}"
+    if not GEMINI_API_KEY:
+        return _rule_based_read_only_intent(text)
+    prompt = f"{CLASSIFY_PROMPT}\n\nUser message: {text[:1_500]}"
     last_error: Exception | None = None
     for model in AI_MODEL_CANDIDATES:
         try:
             def generate():
-                with genai.Client(api_key=GEMINI_API_KEY) as ai_client:
-                    return ai_client.models.generate_content(model=model, contents=prompt)
+                with genai.Client(
+                    api_key=GEMINI_API_KEY,
+                    http_options=types.HttpOptions(
+                        timeout=GEMINI_TIMEOUT_SECONDS * 1_000,
+                        retry_options=types.HttpRetryOptions(attempts=1),
+                    ),
+                ) as ai_client:
+                    return ai_client.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=CLASSIFY_PROMPT,
+                            response_mime_type="application/json",
+                            response_json_schema=INTENT_RESPONSE_SCHEMA,
+                            temperature=0,
+                            max_output_tokens=80,
+                        ),
+                    )
 
-            response = await asyncio.to_thread(generate)
+            response = await asyncio.wait_for(
+                asyncio.to_thread(generate), timeout=GEMINI_TIMEOUT_SECONDS + 2
+            )
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", response.text.strip())
             return _validate_intent(json.loads(raw))
         except Exception as exc:  # Gemini is optional and never authorizes writes.
             last_error = exc
     _log(f"WARN read-only command classifier unavailable: {type(last_error).__name__}")
-    return {"action": "unknown", "params": {}, "reply": "Classifier unavailable"}
+    return _rule_based_read_only_intent(text)
 
 
 # ---------------------------------------------------------------------------
@@ -1013,6 +1174,57 @@ def _analysis_chain_status(
     return "OPERATIONAL"
 
 
+def _pair_label(symbol: str) -> str:
+    """Render an internal target key as the market name the operator sees."""
+
+    return symbol.replace("_", "/")
+
+
+def _trading_mode_summary() -> str:
+    """Explain order permission without conflating it with pair enablement."""
+
+    if DCA_TRADING_MODE == "shadow":
+        return (
+            "🟡 Trading mode: **SHADOW — REAL KRAKEN ORDERS OFF** | "
+            "analysis and scheduling remain active"
+        )
+    if DCA_TRADING_MODE == "canary":
+        return (
+            "🧪 Trading mode: **CANARY — REAL ORDERS LIMITED TO "
+            f"{_pair_label(DCA_CANARY_SYMBOL)}**"
+        )
+    if DCA_TRADING_MODE == "live":
+        return "🟢 Trading mode: **LIVE — REAL KRAKEN ORDERS ON**"
+    return f"🔴 Trading mode: **{DCA_TRADING_MODE.upper()} — INVALID; ORDERS BLOCKED**"
+
+
+def _order_permission(
+    symbol: str,
+    *,
+    enabled: bool,
+    decision_ready: bool,
+    decision_expired: bool,
+    rules_match: bool,
+) -> str:
+    """Return the effective order posture for one pair in plain language."""
+
+    if not enabled:
+        return "⛔ OFF — PAIR DISABLED"
+    if decision_expired:
+        return "⏰ DONE FOR TODAY — NEXT ANALYSIS TOMORROW"
+    if not decision_ready:
+        return "⛔ BLOCKED — NO CURRENT DECISION"
+    if not rules_match:
+        return "🔄 WAITING FOR FRESH ANALYSIS"
+    if DCA_TRADING_MODE == "shadow":
+        return "🟡 SIMULATION ONLY"
+    if DCA_TRADING_MODE == "canary" and symbol != DCA_CANARY_SYMBOL:
+        return "🟡 SIMULATION ONLY — NOT CANARY"
+    if DCA_TRADING_MODE in {"canary", "live"}:
+        return "🟢 LIVE ORDERS ALLOWED"
+    return "⛔ BLOCKED — INVALID TRADING MODE"
+
+
 def _decision_summary(
     symbol: str,
     rule: Mapping[str, Any],
@@ -1023,51 +1235,79 @@ def _decision_summary(
 ) -> str:
     enabled = rule["BUY_ENABLED"]
     amounts = rule["REGIME_AMOUNTS_GBP"]
-    status = "ENABLED" if enabled else "disabled"
+    configured_status = "ENABLED" if enabled else "DISABLED"
+    configured_icon = "✅" if enabled else "⏸️"
     state_entry = execution.get(symbol, {})
     pending = isinstance(state_entry.get("PENDING_ORDER"), Mapping)
-    pending_text = " | PENDING KRAKEN ORDER RECOVERY" if pending else ""
+    pending_text = " | 🚨 KRAKEN RECOVERY PENDING" if pending else ""
     delivery_count = len(state_entry.get("PENDING_GIST_DELIVERIES", []))
     delivery_text = (
-        f" | PORTFOLIO LEDGER DELIVERY WARNING ({delivery_count} pending)"
+        f" | ⚠️ PORTFOLIO LEDGER DELIVERY WARNING ({delivery_count} pending)"
         if delivery_count
         else ""
     )
     history_data_through = _history_data_through(decision)
     current_date = now.astimezone(TIMEZONE).date().isoformat()
-    if (
+    decision_expired = (
+        decision["ANALYSIS_STATUS"] == "READY"
+        and (
+            decision["ANALYSIS_DATE"] != current_date
+            or parse_utc_iso(decision["VALID_UNTIL"]) < now
+        )
+    )
+    decision_ready = (
         decision["ANALYSIS_STATUS"] == "READY"
         and decision["ANALYSIS_DATE"] == current_date
         and parse_utc_iso(decision["VALID_UNTIL"]) >= now
-    ):
+    )
+    rules_match = decision["RULES_HASH"] == rules_hash(symbol, rule)
+    permission = _order_permission(
+        symbol,
+        enabled=enabled,
+        decision_ready=decision_ready,
+        decision_expired=decision_expired,
+        rules_match=rules_match,
+    )
+    if decision_ready:
         regime = decision["REGIME"]
         amount = _display_amount(effective_amount(rule, decision))
         next_time = _local_timestamp(decision["EXECUTE_AT"])
         selected_time = _local_timestamp(decision["SELECTED_AT"])
         age = _decision_age(decision, now)
-        current_hash = rules_hash(symbol, rule)
-        decision_status = "READY" if decision["RULES_HASH"] == current_hash else "RULES MISMATCH"
+        decision_status = (
+            "✅ CURRENT"
+            if rules_match
+            else "🔄 REFRESH REQUIRED — budgets changed after this analysis"
+        )
+    elif decision_expired:
+        regime = decision["REGIME"]
+        amount = _display_amount(effective_amount(rule, decision))
+        next_time = _local_timestamp(decision["EXECUTE_AT"])
+        selected_time = _local_timestamp(decision["SELECTED_AT"])
+        age = _decision_age(decision, now)
+        decision_status = (
+            "⏰ EXPIRED — no late order will be replayed; "
+            "tomorrow's analysis resumes it"
+        )
     else:
         regime = "ERROR"
         amount = "skipped"
         next_time = "not scheduled"
         age = _decision_age(decision, now)
         selected_time = "none"
-        decision_status = (
-            "STALE/EXPIRED"
-            if decision["ANALYSIS_STATUS"] == "READY"
-            else decision["ANALYSIS_STATUS"]
-        )
+        decision_status = f"❌ {decision['ANALYSIS_STATUS']}"
     return (
-        f"**{symbol}** — {status} | UPTREND/lower "
+        f"{configured_icon} **{_pair_label(symbol)}** (`{symbol}`) | Configured: "
+        f"**{configured_status}** | Orders: **{permission}**\n"
+        f"  💷 UPTREND/lower "
         f"{_display_amount(amounts['LOW'])} | SIDEWAYS/midpoint "
         f"{_display_amount(amount_for_tier_gbp(rule, 'MID'))} | DOWNTREND/higher "
         f"{_display_amount(amounts['UP'])}\n"
-        f"  Analysis: {decision_status} | Regime: `{regime}` | Effective: {amount} | "
+        f"  📊 Analysis: {decision_status} | Regime: `{regime}` | Spend: {amount} | "
         f"Selected: `{selected_time}` | Effective: `{next_time}` | Age: `{age}`\n"
-        f"  Analysis date: `{decision['ANALYSIS_DATE']}` | Decision: `{decision['DECISION_ID']}` | "
-        f"Execution: `{decision['EXECUTION_STATUS']}` | Data through: `{history_data_through}`\n"
-        f"  Last buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}`"
+        f"  🧾 Analysis date: `{decision['ANALYSIS_DATE']}` | Data through: `{history_data_through}` | "
+        f"Last buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}` | "
+        f"Decision: `{decision['DECISION_ID']}`"
         f"{pending_text}{delivery_text}"
     )
 
@@ -1172,12 +1412,28 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         workflow_health,
         awaiting_symbols=awaiting_symbols,
     )
-    lines = [
-        "**Kraken mixed-market DCA status (GBP budgets)**",
-        f"Trading mode: **{DCA_TRADING_MODE}**"
-        + (f" (`{DCA_CANARY_SYMBOL}` only)" if DCA_TRADING_MODE == "canary" else ""),
-        _format_analysis_workflow_health(workflow_health),
+    current_date = now.astimezone(TIMEZONE).date().isoformat()
+    refresh_symbols = [
+        symbol
+        for symbol in ALLOWED_TARGETS
+        if rules[symbol]["BUY_ENABLED"]
+        and analysis["TARGETS"][symbol]["ANALYSIS_STATUS"] == "READY"
+        and analysis["TARGETS"][symbol]["ANALYSIS_DATE"] == current_date
+        and analysis["TARGETS"][symbol]["RULES_HASH"]
+        != rules_hash(symbol, rules[symbol])
     ]
+    lines = [
+        "🤖 **Kraken mixed-market DCA status (GBP budgets)**",
+        _trading_mode_summary(),
+        "⚙️ " + _format_analysis_workflow_health(workflow_health),
+    ]
+    if refresh_symbols:
+        labels = ", ".join(_pair_label(symbol) for symbol in refresh_symbols)
+        lines.append(
+            "🔄 **Fresh analysis required:** "
+            f"{labels} budgets changed after today's decisions. "
+            "No order can use an old decision."
+        )
     for symbol in ALLOWED_TARGETS:
         lines.append(
             _decision_summary(
@@ -1214,9 +1470,16 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         workflow_health=workflow_health,
         watchdog_health=watchdog_health,
     )
-    lines.append(f"Railway scheduler: **{scheduler}**")
-    lines.append(_format_analysis_watchdog_health(watchdog_health))
-    lines.append(f"Analysis/scheduling chain: **{chain_status}**")
+    displayed_chain_status = (
+        "WAITING FOR FRESH ANALYSIS"
+        if refresh_symbols
+        and chain_status == "ATTENTION REQUIRED"
+        and _schedule_error is None
+        else chain_status
+    )
+    lines.append(f"⏱️ Railway scheduler: **{scheduler}**")
+    lines.append("🛟 " + _format_analysis_watchdog_health(watchdog_health))
+    lines.append(f"🔗 Analysis/scheduling chain: **{displayed_chain_status}**")
     analysis_ready = all(
         decision["ANALYSIS_STATUS"] == "READY"
         and decision["ANALYSIS_DATE"] == now.astimezone(TIMEZONE).date().isoformat()
@@ -1236,21 +1499,21 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
             else "automatic retry paused with scheduler"
         )
         lines.append(
-            "Portfolio ledger delivery: **WARNING — "
+            "⚠️ Portfolio ledger delivery: **WARNING — "
             f"{delivery_count} pending record(s); {retry_status}**"
         )
     else:
-        lines.append("Portfolio ledger delivery: **clear (0 pending records)**")
+        lines.append("📒 Portfolio ledger delivery: **clear (0 pending records)**")
     if ghostfolio_health["status"] in {"CLEAR", "PENDING"}:
         lines.append(
-            "Local Ghostfolio completion: **"
+            "👻 Local Ghostfolio completion: **"
             f"{ghostfolio_health['status'].lower()}** "
             f"({ghostfolio_health['completed']} receipt(s), "
             f"{ghostfolio_health['pending']} pending)"
         )
     else:
         lines.append(
-            "Local Ghostfolio completion: **"
+            "👻 Local Ghostfolio completion: **"
             f"{ghostfolio_health['status'].lower()}**"
         )
     if (
@@ -1259,9 +1522,9 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         and pending_count == 0
         and chain_status == "OPERATIONAL"
     ):
-        lines.append("Trading posture: **ready-but-disabled** (no target can submit a new order).")
+        lines.append("⏸️ Trading posture: **ready-but-disabled** (no target can submit a new order).")
     elif all_disabled:
-        lines.append("Trading posture: **disabled and fail-closed; readiness needs attention**.")
+        lines.append("⛔ Trading posture: **disabled and fail-closed; readiness needs attention**.")
     await message.reply("\n".join(lines)[:1_990])
 
 
@@ -1403,17 +1666,32 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     await message.reply("\n".join(lines)[:1_990])
 
 
-HELP_TEXT = """**Kraken mixed-market DCA controls (GBP budgets)**
+HELP_TEXT = """🐙 **Kraken mixed-market DCA controls — clear command guide**
+Markets: **BTC/GBP**, **HYPE/USD**, and **SOL/GBP**. Budgets are in GBP.
 
-`!dca set BTC amounts to 10 low and 20 high`
+📊 **Read only**
+`show status` or `!dca status` — pair state, today’s analysis, times, and order permission
+`!dca health` — scheduler, workflow, analysis, ledger, and Ghostfolio health
+`show portfolio` or `!dca portfolio` — queue a read-only Kraken holdings report
+`help`, `!help`, or `!dca help` — show this guide
+
+🔎 **Run deterministic analysis** *(allowlisted user)*
+`!dca analyze BTC` — replace BTC with HYPE or SOL
+`!dca analyze all` — analyze all three pairs
+
+💷 **Change a budget** *(disable the pair first)*
+`!dca set BTC amounts to 12.50 low and 25 high`
+
+⏸️ **Disable or review-enable a pair**
 `!dca disable BTC`
-`!dca enable BTC` (then send the exact confirmation returned)
-`!dca analyze BTC` or `!dca analyze all`
-`show status`
-`!dca health`
+`!dca enable BTC` — review first, then copy the exact confirmation returned
 
-Budget edits require the target to be disabled. Write and analysis commands
-require the exact lowercase `!dca ` prefix and an allowlisted Discord user.
+💬 **Chat with Gemini**
+Talk normally for explanations or read-only requests. Natural language cannot
+change budgets, run analysis, enable/disable a pair, or place an order.
+
+🛡️ Write and analysis commands require the exact lowercase `!dca ` prefix and
+an allowlisted Discord user. “Queued” does not mean “completed.”
 """
 
 
@@ -1808,12 +2086,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-ACTION_HANDLERS = {
+READ_ONLY_ACTION_HANDLERS = {
     "portfolio": handle_portfolio,
     "status": handle_status,
     "help": handle_help,
     "health": handle_health,
-    "analyze": handle_analyze,
 }
 
 
@@ -1825,6 +2102,10 @@ async def on_ready() -> None:
     _log(
         f"INFO access channel_restricted={bool(CHANNEL_ID)} "
         f"allowlisted_users={len(_allowed_user_ids())}"
+    )
+    _log(
+        f"INFO Gemini chat configured={bool(GEMINI_API_KEY)} "
+        f"primary_model={AI_MODEL_CANDIDATES[0]} read_only=true"
     )
     _workflow_contract_error = await asyncio.to_thread(validate_workflow_contracts)
     if _workflow_contract_error:
@@ -1869,11 +2150,21 @@ _SET_AMOUNTS_RE = re.compile(
 _DISABLE_RE = re.compile(r"^!dca disable ([A-Za-z]+)$")
 _ENABLE_RE = re.compile(r"^!dca enable ([A-Za-z]+)$")
 _ANALYZE_RE = re.compile(r"^!dca analyze (all|[A-Za-z]+)$")
+_COMMAND_LIKE_RE = re.compile(r"(?<!\w)!dca\b", re.IGNORECASE)
 
 
 async def _handle_exact_dca_command(text: str, message: discord.Message) -> bool:
     """Handle exact safety-critical commands without AI interpretation."""
 
+    if text == "!dca help":
+        await handle_help({}, message)
+        return True
+    if text == "!dca status":
+        await handle_status({}, message)
+        return True
+    if text == "!dca portfolio":
+        await handle_portfolio({}, message)
+        return True
     if text.startswith("!dca confirm"):
         await _handle_enable_confirmation(message, text)
         return True
@@ -1898,7 +2189,8 @@ async def _handle_exact_dca_command(text: str, message: discord.Message) -> bool
         return True
     if text.startswith(CONFIG_WRITE_PREFIX):
         await message.reply(
-            "Unrecognized exact DCA command. Use `help`; spelling and spacing are safety checks."
+            "🧭 Unrecognized exact DCA command; no changes were made. Type `help`; "
+            "spelling and spacing are safety checks."
         )
         return True
     return False
@@ -1927,8 +2219,17 @@ async def on_message(message: discord.Message) -> None:
         return
     if await _handle_exact_dca_command(text, message):
         return
+    if _COMMAND_LIKE_RE.search(text):
+        await message.reply(
+            "🧭 Command not accepted; no changes were made. Type `help` and copy "
+            "an exact lowercase command."
+        )
+        return
     if text.casefold() == "show status":
         await handle_status({}, message)
+        return
+    if text.casefold() == "show portfolio":
+        await handle_portfolio({}, message)
         return
     if text.casefold() in {"help", "!help"}:
         await handle_help({}, message)
@@ -1936,11 +2237,16 @@ async def on_message(message: discord.Message) -> None:
 
     async with message.channel.typing():
         intent = await classify_intent(text)
-    handler = ACTION_HANDLERS.get(intent["action"])
+    handler = READ_ONLY_ACTION_HANDLERS.get(intent["action"])
     if handler:
         await handler(intent.get("params", {}), message)
+    elif intent["action"] == "chat":
+        await message.reply(intent["reply"])
     else:
-        await message.reply("I did not understand that. Type `help` for exact commands.")
+        await message.reply(
+            "🤔 I didn’t understand that safely. Ask about the bot or type `help` "
+            "for the exact commands."
+        )
 
 
 if __name__ == "__main__":

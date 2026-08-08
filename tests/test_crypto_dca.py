@@ -196,6 +196,22 @@ class DecisionGateTests(unittest.TestCase):
                 "READY",
             )
 
+    def test_budget_change_requires_fresh_analysis_in_plain_language(self):
+        original_rules = rules_with("SOL_GBP", low=10, up=20)
+        decision = ready_decision("SOL_GBP", original_rules["SOL_GBP"])
+        live_rule = {
+            "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 20},
+            "BUY_ENABLED": True,
+        }
+
+        status, reason, amount = crypto_dca._decision_gate(
+            "SOL_GBP", live_rule, decision, NOW
+        )
+
+        self.assertEqual(status, "REFRESH_REQUIRED")
+        self.assertIn("GBP budget changed", reason)
+        self.assertIsNone(amount)
+
     def test_start_date_requires_same_local_day_analysis(self):
         rules = rules_with("BTC_GBP", low=10, up=20)
         execute_at = datetime(2026, 8, 6, 21, 30, tzinfo=timezone.utc)
@@ -294,7 +310,7 @@ class DecisionGateTests(unittest.TestCase):
             crypto_dca._decision_gate(
                 "BTC_GBP", rules["BTC_GBP"], decision, NOW
             )[0],
-            "ERROR",
+            "REFRESH_REQUIRED",
         )
 
 
@@ -1015,6 +1031,34 @@ class TradeExecutionTests(unittest.TestCase):
 
 
 class MainSchedulingTests(unittest.TestCase):
+    def test_budget_change_sends_one_clear_refresh_notice_and_never_trades(self):
+        original_rules = rules_with("SOL_GBP", low=10, up=20)
+        analysis = analysis_for(
+            original_rules,
+            {"SOL_GBP": ready_decision("SOL_GBP", original_rules["SOL_GBP"])},
+        )
+        live_rules = json.loads(json.dumps(original_rules))
+        live_rules["SOL_GBP"]["REGIME_AMOUNTS_GBP"]["LOW"] = 12.5
+        with (
+            patch.object(crypto_dca, "DCA_TARGET_MAP_JSON", json.dumps(live_rules)),
+            patch.object(crypto_dca, "DCA_ANALYSIS_STATE_JSON", json.dumps(analysis)),
+            patch.object(crypto_dca, "DCA_EXECUTION_STATE_JSON", "{}"),
+            patch.object(crypto_dca, "DCA_SYMBOLS_JSON", ""),
+            patch.object(crypto_dca, "_utc_now", return_value=NOW),
+            patch.object(crypto_dca, "execute_trade") as execute,
+            patch.object(crypto_dca, "send_discord_alert") as alert,
+        ):
+            self.assertFalse(crypto_dca.main())
+
+        execute.assert_not_called()
+        alert.assert_called_once()
+        self.assertIn("SOL/GBP is waiting for fresh analysis", alert.call_args.args[0])
+        self.assertIn("No Kraken order was attempted", alert.call_args.args[0])
+        self.assertEqual(
+            alert.call_args.kwargs["title"], "🔄 DCA Analysis Refresh Required"
+        )
+        self.assertFalse(alert.call_args.kwargs["is_error"])
+
     def test_future_start_date_allows_analysis_but_blocks_new_orders(self):
         rules = rules_with("BTC_GBP")
         analysis = analysis_for(
@@ -1164,7 +1208,7 @@ class MainSchedulingTests(unittest.TestCase):
         calls = {call.args[0]: call.args[1] for call in execute.call_args_list}
         self.assertEqual(calls, {"BTC_GBP": 10.0, "HYPE_USD": 15.0})
 
-    def test_error_or_missed_decision_alerts_and_never_trades(self):
+    def test_missed_decision_is_expected_quiet_non_replay(self):
         rules = rules_with("BTC_GBP")
         decision = ready_decision(
             "BTC_GBP", rules["BTC_GBP"], now=NOW - timedelta(hours=2)
@@ -1181,9 +1225,9 @@ class MainSchedulingTests(unittest.TestCase):
             patch.object(crypto_dca, "execute_trade") as execute,
             patch.object(crypto_dca, "send_discord_alert") as alert,
         ):
-            self.assertFalse(crypto_dca.main())
+            self.assertTrue(crypto_dca.main())
         execute.assert_not_called()
-        self.assertTrue(alert.call_args.kwargs["is_error"])
+        alert.assert_not_called()
 
     def test_stale_disabled_asset_hash_does_not_block_another_asset(self):
         rules = rules_with("BTC_GBP")
