@@ -58,11 +58,13 @@ def ready_decision(target, rule, *, now=NOW, regime="UPTREND", offset=0):
     }
 
 
-def analysis_for(rules, decisions):
-    state = empty_analysis_state(rules, now=NOW)
+def analysis_for(rules, decisions, *, now=NOW):
+    state = empty_analysis_state(rules, now=now)
     for target in crypto_dca.ALLOWED_TARGETS:
         if target not in decisions:
-            state["TARGETS"][target] = ready_decision(target, rules[target])
+            state["TARGETS"][target] = ready_decision(
+                target, rules[target], now=now
+            )
     state["TARGETS"].update(decisions)
     return state
 
@@ -166,6 +168,11 @@ class DecisionGateTests(unittest.TestCase):
         analysis = analysis_for(rules, decisions)
 
         self.assertEqual(crypto_dca._global_history_gate(analysis, NOW)[0], True)
+
+        rollover = datetime(2026, 8, 5, 17, 2, tzinfo=timezone.utc)
+        ready, reason = crypto_dca._global_history_gate(analysis, rollover)
+        self.assertFalse(ready)
+        self.assertIn("analysis date is not 2026-08-06", reason)
 
         analysis["TARGETS"]["HYPE_USD"]["ANALYSIS_STATUS"] = "ERROR"
         analysis["TARGETS"]["HYPE_USD"]["HISTORY"] = {"STATUS": "ERROR"}
@@ -1031,6 +1038,121 @@ class TradeExecutionTests(unittest.TestCase):
 
 
 class MainSchedulingTests(unittest.TestCase):
+    def test_prior_day_ready_state_is_quiet_before_daily_analysis(self):
+        rules = rules_with("BTC_GBP")
+        analysis = analysis_for(
+            rules, {"BTC_GBP": ready_decision("BTC_GBP", rules["BTC_GBP"])}
+        )
+
+        for current in (
+            datetime(2026, 8, 5, 17, 2, tzinfo=timezone.utc),
+            datetime(2026, 8, 5, 21, 19, 59, tzinfo=timezone.utc),
+        ):
+            with self.subTest(current=current):
+                with (
+                    patch.object(
+                        crypto_dca, "DCA_TARGET_MAP_JSON", json.dumps(rules)
+                    ),
+                    patch.object(
+                        crypto_dca,
+                        "DCA_ANALYSIS_STATE_JSON",
+                        json.dumps(analysis),
+                    ),
+                    patch.object(crypto_dca, "DCA_EXECUTION_STATE_JSON", "{}"),
+                    patch.object(crypto_dca, "DCA_SYMBOLS_JSON", ""),
+                    patch.object(crypto_dca, "_utc_now", return_value=current),
+                    patch.object(crypto_dca, "execute_trade") as execute,
+                    patch.object(crypto_dca, "send_discord_alert") as alert,
+                ):
+                    self.assertTrue(crypto_dca.main())
+                    execute.assert_not_called()
+                    alert.assert_not_called()
+
+    def test_prior_day_ready_state_alerts_at_daily_analysis_deadline(self):
+        rules = rules_with("BTC_GBP")
+        analysis = analysis_for(
+            rules, {"BTC_GBP": ready_decision("BTC_GBP", rules["BTC_GBP"])}
+        )
+        deadline = datetime(2026, 8, 5, 21, 20, tzinfo=timezone.utc)
+        with (
+            patch.object(crypto_dca, "DCA_TARGET_MAP_JSON", json.dumps(rules)),
+            patch.object(
+                crypto_dca, "DCA_ANALYSIS_STATE_JSON", json.dumps(analysis)
+            ),
+            patch.object(crypto_dca, "DCA_EXECUTION_STATE_JSON", "{}"),
+            patch.object(crypto_dca, "DCA_SYMBOLS_JSON", ""),
+            patch.object(crypto_dca, "_utc_now", return_value=deadline),
+            patch.object(crypto_dca, "execute_trade") as execute,
+            patch.object(crypto_dca, "send_discord_alert") as alert,
+        ):
+            self.assertFalse(crypto_dca.main())
+
+        execute.assert_not_called()
+        alert.assert_called_once()
+        self.assertTrue(alert.call_args.kwargs["is_error"])
+
+    def test_unhealthy_or_older_prior_state_is_not_quiet_during_rollover(self):
+        rules = rules_with("BTC_GBP")
+        unhealthy = empty_analysis_state(rules, now=NOW)
+        older_time = NOW - timedelta(days=1)
+        older = analysis_for(
+            rules,
+            {
+                "BTC_GBP": ready_decision(
+                    "BTC_GBP", rules["BTC_GBP"], now=older_time
+                )
+            },
+            now=older_time,
+        )
+        rollover = datetime(2026, 8, 5, 17, 2, tzinfo=timezone.utc)
+        for analysis in (unhealthy, older):
+            with self.subTest(state_date=analysis["ANALYSIS_DATE"]):
+                with (
+                    patch.object(
+                        crypto_dca, "DCA_TARGET_MAP_JSON", json.dumps(rules)
+                    ),
+                    patch.object(
+                        crypto_dca,
+                        "DCA_ANALYSIS_STATE_JSON",
+                        json.dumps(analysis),
+                    ),
+                    patch.object(crypto_dca, "DCA_EXECUTION_STATE_JSON", "{}"),
+                    patch.object(crypto_dca, "DCA_SYMBOLS_JSON", ""),
+                    patch.object(crypto_dca, "_utc_now", return_value=rollover),
+                    patch.object(crypto_dca, "execute_trade") as execute,
+                    patch.object(crypto_dca, "send_discord_alert") as alert,
+                ):
+                    self.assertFalse(crypto_dca.main())
+
+                execute.assert_not_called()
+                alert.assert_called_once()
+
+    def test_pending_recovery_still_runs_during_daily_rollover_wait(self):
+        rules = rules_with("BTC_GBP")
+        analysis = analysis_for(
+            rules, {"BTC_GBP": ready_decision("BTC_GBP", rules["BTC_GBP"])}
+        )
+        pending = pending_intent(trade_date="2026-08-05")
+        state = {"BTC_GBP": {"LAST_BUY_DATE": "", "PENDING_ORDER": pending}}
+        rollover = datetime(2026, 8, 5, 17, 2, tzinfo=timezone.utc)
+        with (
+            patch.object(crypto_dca, "DCA_TARGET_MAP_JSON", json.dumps(rules)),
+            patch.object(
+                crypto_dca, "DCA_ANALYSIS_STATE_JSON", json.dumps(analysis)
+            ),
+            patch.object(
+                crypto_dca, "DCA_EXECUTION_STATE_JSON", json.dumps(state)
+            ),
+            patch.object(crypto_dca, "DCA_SYMBOLS_JSON", ""),
+            patch.object(crypto_dca, "_utc_now", return_value=rollover),
+            patch.object(crypto_dca, "execute_trade", return_value=True) as execute,
+            patch.object(crypto_dca, "send_discord_alert") as alert,
+        ):
+            self.assertTrue(crypto_dca.main())
+
+        execute.assert_called_once_with("BTC_GBP", 20.0, map_key="BTC_GBP")
+        alert.assert_not_called()
+
     def test_budget_change_sends_one_clear_refresh_notice_and_never_trades(self):
         original_rules = rules_with("SOL_GBP", low=10, up=20)
         analysis = analysis_for(

@@ -63,6 +63,9 @@ rules, decisions, pending state, and scheduler posture.
 
 1. GitHub Actions runs at 04:07 Asia/Bangkok, with an idempotent 04:37 recovery.
    Railway checks for a missing run after 04:20.
+   From midnight until 04:20, a healthy prior-day state is an expected waiting
+   posture: no old decision can trade, pending recovery remains active, and no
+   stale-date incident is sent unless the state is otherwise unhealthy.
 2. Deterministic Python classifies each pair as `UPTREND`, `DOWNTREND`, or
    `SIDEWAYS`.
 3. Python selects the higher / midpoint / lower GBP spend for downtrend /

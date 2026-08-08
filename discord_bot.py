@@ -30,7 +30,9 @@ import requests
 from dca_config import (
     ALLOWED_TARGETS,
     ConfigError,
+    DAILY_ANALYSIS_EXPECTED_BY,
     amount_for_tier_gbp,
+    awaiting_daily_analysis_refresh,
     decision_analyzed_on_or_after,
     decision_age_minutes,
     effective_amount,
@@ -81,7 +83,7 @@ ANALYSIS_WORKFLOW_HEALTH_MAX_AGE = timedelta(hours=30)
 # The primary workflow is scheduled for 04:07 Bangkok. Give GitHub Actions a
 # bounded startup window before treating a missing start-day decision as an
 # operational error.
-START_DAY_ANALYSIS_EXPECTED_BY = time(4, 20)
+START_DAY_ANALYSIS_EXPECTED_BY = DAILY_ANALYSIS_EXPECTED_BY
 
 GH_API = "https://api.github.com"
 GH_HEADERS = {
@@ -102,6 +104,7 @@ _dca_schedule: dict[str, dict[str, Any]] = {}
 _pending_recovery_symbols: set[str] = set()
 _pending_gist_delivery_symbols: set[str] = set()
 _awaiting_start_day_symbols: set[str] = set()
+_awaiting_daily_analysis = False
 _dca_dispatch_guard: dict[tuple[str, str], float] = {}
 _schedule_error: str | None = None
 _schedule_warning: str | None = None
@@ -1205,11 +1208,14 @@ def _order_permission(
     decision_ready: bool,
     decision_expired: bool,
     rules_match: bool,
+    daily_analysis_pending: bool = False,
 ) -> str:
     """Return the effective order posture for one pair in plain language."""
 
     if not enabled:
         return "⛔ OFF — PAIR DISABLED"
+    if daily_analysis_pending:
+        return "⏳ WAITING — TODAY'S ANALYSIS NOT DUE YET"
     if decision_expired:
         return "⏰ DONE FOR TODAY — NEXT ANALYSIS TOMORROW"
     if not decision_ready:
@@ -1232,6 +1238,7 @@ def _decision_summary(
     execution: Mapping[str, Any],
     *,
     now: datetime,
+    daily_analysis_pending: bool = False,
 ) -> str:
     enabled = rule["BUY_ENABLED"]
     amounts = rule["REGIME_AMOUNTS_GBP"]
@@ -1267,8 +1274,16 @@ def _decision_summary(
         decision_ready=decision_ready,
         decision_expired=decision_expired,
         rules_match=rules_match,
+        daily_analysis_pending=daily_analysis_pending,
     )
-    if decision_ready:
+    if daily_analysis_pending:
+        regime = decision["REGIME"]
+        amount = _display_amount(effective_amount(rule, decision))
+        next_time = _local_timestamp(decision["EXECUTE_AT"])
+        selected_time = _local_timestamp(decision["SELECTED_AT"])
+        age = _decision_age(decision, now)
+        decision_status = "⏳ PRIOR DAY — awaiting 04:07 analysis"
+    elif decision_ready:
         regime = decision["REGIME"]
         amount = _display_amount(effective_amount(rule, decision))
         next_time = _local_timestamp(decision["EXECUTE_AT"])
@@ -1406,6 +1421,9 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
     )
     now = datetime.now(timezone.utc)
     awaiting_symbols = _pending_start_day_analysis_symbols(rules, analysis, now)
+    daily_analysis_pending = awaiting_daily_analysis_refresh(
+        analysis, now, TIMEZONE
+    )
     watchdog_health = _analysis_watchdog_health(
         analysis,
         now,
@@ -1442,6 +1460,7 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
                 analysis["TARGETS"][symbol],
                 execution,
                 now=now,
+                daily_analysis_pending=daily_analysis_pending,
             )
         )
     all_disabled = not any(rule["BUY_ENABLED"] for rule in rules.values())
@@ -1451,6 +1470,12 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         scheduler = f"running with skipped target(s) — {_schedule_warning}"
     elif not DCA_CRON_ENABLED:
         scheduler = "paused by DCA_CRON_ENABLED=false"
+    elif daily_analysis_pending:
+        scheduler = (
+            "armed; awaiting 04:07 daily analysis for "
+            f"{now.astimezone(TIMEZONE).date().isoformat()} {TIMEZONE.key}; "
+            f"{len(_dca_schedule)} active target(s)"
+        )
     elif awaiting_symbols:
         scheduler = (
             "armed; awaiting 04:07 start-day analysis for "
@@ -1480,7 +1505,7 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
     lines.append(f"⏱️ Railway scheduler: **{scheduler}**")
     lines.append("🛟 " + _format_analysis_watchdog_health(watchdog_health))
     lines.append(f"🔗 Analysis/scheduling chain: **{displayed_chain_status}**")
-    analysis_ready = all(
+    analysis_ready = daily_analysis_pending or all(
         decision["ANALYSIS_STATUS"] == "READY"
         and decision["ANALYSIS_DATE"] == now.astimezone(TIMEZONE).date().isoformat()
         and decision["RULES_HASH"] == rules_hash(symbol, rules[symbol])
@@ -1543,6 +1568,9 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     )
     now = datetime.now(timezone.utc)
     awaiting_symbols = _pending_start_day_analysis_symbols(rules, analysis, now)
+    daily_analysis_pending = awaiting_daily_analysis_refresh(
+        analysis, now, TIMEZONE
+    )
     watchdog_health = _analysis_watchdog_health(
         analysis,
         now,
@@ -1555,7 +1583,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     mismatched = []
     for symbol in ALLOWED_TARGETS:
         decision = analysis["TARGETS"][symbol]
-        if symbol in awaiting_symbols:
+        if daily_analysis_pending or symbol in awaiting_symbols:
             continue
         if decision["ANALYSIS_STATUS"] != "READY":
             errors.append(symbol)
@@ -1584,7 +1612,11 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     )
     enabled_count = sum(rule["BUY_ENABLED"] for rule in rules.values())
     analysis_ok = (
-        not errors and not stale and not mismatched and not awaiting_symbols
+        not errors
+        and not stale
+        and not mismatched
+        and not awaiting_symbols
+        and (not daily_analysis_pending or enabled_count == 0)
     )
     local_scheduler_ok = (
         DCA_CRON_ENABLED
@@ -1597,15 +1629,15 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
         watchdog_health=watchdog_health,
     )
     scheduler_ok = chain_status == "OPERATIONAL"
-    awaiting_start_analysis = (
+    awaiting_analysis = (
         enabled_count > 0
         and pending_count == 0
         and scheduler_ok
-        and bool(awaiting_symbols)
+        and (bool(awaiting_symbols) or daily_analysis_pending)
     )
     posture = (
         "ARMED"
-        if awaiting_start_analysis
+        if awaiting_analysis
         else
         "READY-BUT-DISABLED"
         if (
@@ -1625,8 +1657,12 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
         "- " + _format_analysis_workflow_health(workflow_health),
         "- " + _format_analysis_watchdog_health(watchdog_health),
         (
-            "- Analysis: awaiting 04:07 start-day analysis"
-            if awaiting_start_analysis
+            (
+                "- Analysis: awaiting 04:07 start-day analysis"
+                if awaiting_symbols
+                else "- Analysis: awaiting 04:07 daily analysis"
+            )
+            if awaiting_analysis or daily_analysis_pending
             else f"- Analysis: fresh READY {len(ready)}/3"
         ),
         f"- Execution state: valid; pending Kraken recoveries {pending_count}",
@@ -1653,11 +1689,11 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
             f"- First permitted trade date: {_schedule_start_date.isoformat()} "
             f"{TIMEZONE.key}"
         )
-    if errors and not awaiting_start_analysis:
+    if errors and not awaiting_analysis:
         lines.append("- Analysis ERROR: " + ", ".join(errors))
-    if stale and not awaiting_start_analysis:
+    if stale and not awaiting_analysis:
         lines.append("- Stale decisions: " + ", ".join(stale))
-    if mismatched and not awaiting_start_analysis:
+    if mismatched and not awaiting_analysis:
         lines.append("- Rules mismatch: " + ", ".join(mismatched))
     if _schedule_error:
         lines.append(f"- Scheduler validation: FAILED (`{_schedule_error}`)")
@@ -1706,10 +1742,12 @@ async def handle_help(params: dict[str, Any], message: discord.Message) -> None:
 
 def _clear_schedule(error: str | None = None) -> None:
     global _schedule_error, _schedule_warning, _schedule_start_date
+    global _awaiting_daily_analysis
     _dca_schedule.clear()
     _pending_recovery_symbols.clear()
     _pending_gist_delivery_symbols.clear()
     _awaiting_start_day_symbols.clear()
+    _awaiting_daily_analysis = False
     _schedule_error = error
     _schedule_warning = None
     _schedule_start_date = None
@@ -1726,7 +1764,9 @@ def refresh_dca_schedule(
     """Build a fail-closed schedule from durable GitHub configuration."""
 
     global _schedule_error, _schedule_warning, _schedule_start_date
+    global _awaiting_daily_analysis
     _awaiting_start_day_symbols.clear()
+    _awaiting_daily_analysis = False
     try:
         if execution_json is None:
             raise ConfigError("DCA_EXECUTION_STATE is unavailable")
@@ -1783,6 +1823,12 @@ def refresh_dca_schedule(
         _dca_schedule.clear()
         _schedule_error = None
         _schedule_warning = None
+        return True
+    if awaiting_daily_analysis_refresh(analysis, current, TIMEZONE):
+        _dca_schedule.clear()
+        _schedule_error = None
+        _schedule_warning = None
+        _awaiting_daily_analysis = True
         return True
     current_date = current.astimezone(TIMEZONE).date().isoformat()
     global_history_failures = []
@@ -1920,6 +1966,11 @@ def _format_cron_status() -> str:
         return f"Scheduler invalid: {_schedule_error}"
     if _schedule_warning:
         return f"Scheduler running with skipped target(s): {_schedule_warning}"
+    if _awaiting_daily_analysis:
+        return (
+            "Scheduler armed; awaiting 04:07 daily analysis "
+            f"until {START_DAY_ANALYSIS_EXPECTED_BY:%H:%M} {TIMEZONE.key}"
+        )
     if _awaiting_start_day_symbols:
         return (
             "Scheduler armed; awaiting 04:07 start-day analysis for "

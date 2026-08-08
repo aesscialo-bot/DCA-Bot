@@ -17,6 +17,7 @@ from dca_config import (
     ConfigError,
     MAX_PENDING_GIST_DELIVERIES,
     TIMING_POLICY_VERSION,
+    awaiting_daily_analysis_refresh,
     decision_analyzed_on_or_after,
     decision_age_minutes,
     ensure_gist_delivery_capacity,
@@ -1151,6 +1152,17 @@ def main():
     global_history_reason = analysis_error or "analysis state is unavailable"
     if analysis is not None:
         global_history_ready, global_history_reason = _global_history_gate(analysis, now)
+    if (
+        not global_history_ready
+        and analysis is not None
+        and awaiting_daily_analysis_refresh(analysis, now, SELECTED_TZ)
+    ):
+        print(
+            "Awaiting the scheduled 04:07 daily analysis; yesterday's "
+            "decisions remain blocked and no new Kraken order was attempted.",
+            flush=True,
+        )
+        return all_succeeded
     if not global_history_ready:
         message = (
             "New Kraken orders are globally blocked until all three pairs have "

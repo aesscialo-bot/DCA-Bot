@@ -7,7 +7,7 @@ configuration before performing any side effect.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
 import json
@@ -31,6 +31,7 @@ TARGET_ROUTES = {
 RULE_FIELDS = frozenset({"REGIME_AMOUNTS_GBP", "BUY_ENABLED"})
 REGIME_AMOUNT_FIELDS = frozenset({"LOW", "UP"})
 TIMING_POLICY_VERSION = "multi-window-3-5-7-14-30-45-60-v2"
+DAILY_ANALYSIS_EXPECTED_BY = time(4, 20)
 ANALYSIS_STATE_FIELDS = frozenset(
     {"VERSION", "GENERATED_AT", "POLICY_VERSION", "ANALYSIS_DATE", "TARGETS"}
 )
@@ -823,6 +824,54 @@ def decision_age_minutes(
     return (reference.astimezone(timezone.utc) - parse_utc_iso(analyzed_at)).total_seconds() / 60
 
 
+def awaiting_daily_analysis_refresh(
+    analysis: Mapping[str, Any],
+    now: datetime,
+    selected_tz,
+    *,
+    expected_by: time = DAILY_ANALYSIS_EXPECTED_BY,
+) -> bool:
+    """Return whether a healthy prior-day state is awaiting today's analysis.
+
+    New orders must remain blocked at local midnight because yesterday's
+    decisions cannot be reused. Until the bounded 04:20 recovery threshold,
+    however, one complete prior-day state is the normal input to the scheduled
+    04:07 analysis rather than an operational failure.
+    """
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ConfigError("daily analysis refresh check requires an aware timestamp")
+    if not isinstance(expected_by, time) or expected_by.tzinfo is not None:
+        raise ConfigError("daily analysis expected-by time must be timezone-naive")
+    local_now = now.astimezone(selected_tz)
+    if local_now.time() >= expected_by:
+        return False
+    prior_date = (local_now.date() - timedelta(days=1)).isoformat()
+    if (
+        not isinstance(analysis, Mapping)
+        or analysis.get("POLICY_VERSION") != TIMING_POLICY_VERSION
+        or analysis.get("ANALYSIS_DATE") != prior_date
+    ):
+        return False
+    targets = analysis.get("TARGETS")
+    if not isinstance(targets, Mapping):
+        return False
+    for target in TARGET_KEYS:
+        decision = targets.get(target)
+        if not isinstance(decision, Mapping):
+            return False
+        history = decision.get("HISTORY")
+        if (
+            decision.get("POLICY_VERSION") != TIMING_POLICY_VERSION
+            or decision.get("ANALYSIS_DATE") != prior_date
+            or decision.get("ANALYSIS_STATUS") != READY_STATUS
+            or not isinstance(history, Mapping)
+            or history.get("STATUS") != READY_STATUS
+        ):
+            return False
+    return True
+
+
 def decision_analyzed_on_or_after(
     decision: Mapping[str, Any], start_date: date | None, selected_tz
 ) -> bool:
@@ -1140,6 +1189,7 @@ __all__ = [
     "ANALYSIS_STATE_VERSION",
     "ANALYSIS_STATUSES",
     "ConfigError",
+    "DAILY_ANALYSIS_EXPECTED_BY",
     "ERROR_STATUS",
     "EXECUTION_STATUSES",
     "GIST_DELIVERY_FIELDS",
@@ -1158,6 +1208,7 @@ __all__ = [
     "TIMING_POLICY_VERSION",
     "amount_for_tier_gbp",
     "amount_tier_for_regime",
+    "awaiting_daily_analysis_refresh",
     "decision_is_usable",
     "decision_age_minutes",
     "decision_analyzed_on_or_after",
