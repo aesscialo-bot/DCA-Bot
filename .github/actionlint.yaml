@@ -1,0 +1,6 @@
+paths:
+  .github/workflows/update_dca_config.yml:
+    # GitHub supports concurrency.queue, but actionlint 1.7.12 does not yet.
+    # Keep this exception scoped to that exact key and section.
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'

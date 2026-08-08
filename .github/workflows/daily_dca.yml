@@ -71,9 +71,6 @@ jobs:
           GH_PAT_FOR_VARS: ${{ secrets.GH_PAT_FOR_VARS }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GHOSTFOLIO_TOKEN: ${{ secrets.GHOSTFOLIO_TOKEN }}
-          GHOSTFOLIO_URL: ${{ vars.GHOSTFOLIO_URL || 'https://ghostfol.io' }}
-          PORTFOLIO_ACCOUNT_MAP: ${{ vars.PORTFOLIO_ACCOUNT_MAP }}
           TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Bangkok' }}
           DCA_START_DATE: ${{ vars.DCA_START_DATE }}
           DCA_SYMBOLS_JSON: ${{ inputs.symbols_json || '' }}

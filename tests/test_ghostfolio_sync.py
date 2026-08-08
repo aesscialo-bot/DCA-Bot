@@ -1438,10 +1438,17 @@ class GhostfolioSyncTests(unittest.TestCase):
         reconcile.assert_not_called()
 
     def test_old_holdings_intent_is_receipted_before_newer_event_import(self):
+        reference = datetime.now(timezone.utc).replace(microsecond=0)
         old_snapshot = signed_snapshot()
+        old_snapshot["as_of"] = (
+            reference - timedelta(minutes=60)
+        ).isoformat().replace("+00:00", "Z")
+        resign_snapshot(old_snapshot)
         receipt_value = {
             "snapshot_hash": old_snapshot["canonical_hash"],
-            "reconciled_at": "2026-08-07T04:15:00Z",
+            "reconciled_at": (
+                reference - timedelta(minutes=45)
+            ).isoformat().replace("+00:00", "Z"),
             "adjustments": [
                 {"target": "BTC_GBP", "quantity_delta": "0.2"}
             ],
@@ -1452,12 +1459,16 @@ class GhostfolioSyncTests(unittest.TestCase):
             "receipt": receipt_value,
         })
         new_event = event("NEWER-SOL-FILL")
-        new_event["occurred_at"] = "2026-08-07T04:30:00Z"
+        new_event["occurred_at"] = (
+            reference - timedelta(minutes=30)
+        ).isoformat().replace("+00:00", "Z")
         resign_event(new_event)
         current_snapshot = json.loads(
             ghostfolio_sync.canonical(old_snapshot)
         )
-        current_snapshot["as_of"] = "2026-08-07T05:00:00Z"
+        current_snapshot["as_of"] = (
+            reference - timedelta(minutes=5)
+        ).isoformat().replace("+00:00", "Z")
         current_snapshot["holdings"]["SOL_GBP"]["quantity"] = "3.1"
         resign_snapshot(current_snapshot)
         payload = {
@@ -1489,9 +1500,6 @@ class GhostfolioSyncTests(unittest.TestCase):
                     {
                         "GHOSTFOLIO_ACCOUNT_MAP": json.dumps({"SOL_GBP": "kraken"}),
                     },
-                ),
-                patch.object(
-                    ghostfolio_sync, "HOLDINGS_SNAPSHOT_MAX_AGE_SECONDS", 21600
                 ),
                 patch.object(
                     ghostfolio_sync, "STATE_PATH", Path(directory) / "state.json"

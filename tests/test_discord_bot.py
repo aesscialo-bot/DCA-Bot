@@ -87,7 +87,16 @@ def analysis_state(
             "POLICY_VERSION": TIMING_POLICY_VERSION,
             "ANALYSIS_DATE": analysis_date,
             "HISTORY": (
-                {"STATUS": "READY", "HASH": "a" * 64}
+                {
+                    "STATUS": "READY",
+                    "FROM": (generated_at - timedelta(days=65))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "THROUGH": (generated_at - timedelta(minutes=15))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "HASH": "a" * 64,
+                }
                 if status == "READY" else {"STATUS": "ERROR"}
             ),
             "SIGNALS": {},
@@ -167,6 +176,26 @@ class DiscordBotControlTests(unittest.TestCase):
         discord_bot._schedule_error = None
         discord_bot._schedule_warning = None
         discord_bot._schedule_start_date = None
+        discord_bot._workflow_contract_error = None
+        discord_bot._analysis_watchdog_last_dispatch = None
+        self.workflow_health = {
+            "status": "HEALTHY",
+            "configured_ref": "main",
+            "actual_ref": "main",
+            "head_sha": "0123456789abcdef",
+            "run_status": "completed",
+            "conclusion": "success",
+            "updated_at": "2026-08-05T03:55:00Z",
+            "run_number": 42,
+            "reason": None,
+        }
+        self.workflow_health_patch = patch.object(
+            discord_bot,
+            "get_analysis_workflow_health",
+            return_value=self.workflow_health,
+        )
+        self.workflow_health_patch.start()
+        self.addCleanup(self.workflow_health_patch.stop)
         self.rules = rules()
         self.analysis = analysis_state(self.rules)
 
@@ -571,11 +600,19 @@ class DiscordBotControlTests(unittest.TestCase):
             patch.object(discord_bot, "DCA_CRON_ENABLED", True),
         ):
             asyncio.run(discord_bot.handle_status({}, status_message))
+        self.assertIn("Kraken mixed-market DCA status", status_message.replies[-1])
         self.assertIn("BTC_GBP", status_message.replies[-1])
         self.assertIn("UPTREND/lower £10", status_message.replies[-1])
         self.assertIn("SIDEWAYS/midpoint £15", status_message.replies[-1])
         self.assertIn("DOWNTREND/higher £20", status_message.replies[-1])
+        self.assertEqual(status_message.replies[-1].count("Data through:"), 3)
+        self.assertIn("2026-08-05 10:45 +07", status_message.replies[-1])
+        self.assertIn("GitHub analysis workflow: **HEALTHY**", status_message.replies[-1])
+        self.assertIn("actual ref: `main@0123456789ab`", status_message.replies[-1])
+        self.assertIn("Analysis watchdog: **SATISFIED**", status_message.replies[-1])
+        self.assertIn("Analysis/scheduling chain: **OPERATIONAL**", status_message.replies[-1])
         self.assertIn("ready-but-disabled", status_message.replies[-1])
+        self.assertLessEqual(len(status_message.replies[-1]), 2_000)
 
         with (
             patch.object(
@@ -590,6 +627,72 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("READY-BUT-DISABLED", health_message.replies[-1])
         self.assertIn("fresh READY 3/3", health_message.replies[-1])
         self.assertIn("Buy-enabled targets: 0/3", health_message.replies[-1])
+        self.assertIn("Kraken mixed-market DCA controls", discord_bot.HELP_TEXT)
+        self.assertLessEqual(len(health_message.replies[-1]), 2_000)
+
+    def test_status_and_health_label_unknown_workflow_evidence_fail_closed(self):
+        unknown = {
+            **self.workflow_health,
+            "status": "UNKNOWN",
+            "actual_ref": None,
+            "head_sha": None,
+            "run_status": None,
+            "conclusion": None,
+            "updated_at": None,
+            "reason": "GitHub workflow evidence is unavailable",
+        }
+        status_message = MessageStub()
+        health_message = MessageStub()
+        with (
+            patch.object(
+                discord_bot,
+                "get_repo_variable",
+                side_effect=variable_reader(self.rules, self.analysis),
+            ),
+            patch.object(discord_bot, "get_analysis_workflow_health", return_value=unknown),
+            patch.object(discord_bot, "datetime", FrozenDateTime),
+            patch.object(discord_bot, "DCA_CRON_ENABLED", True),
+        ):
+            asyncio.run(discord_bot.handle_status({}, status_message))
+            asyncio.run(discord_bot.handle_health({}, health_message))
+
+        status = status_message.replies[-1]
+        health = health_message.replies[-1]
+        self.assertIn("GitHub analysis workflow: **UNKNOWN**", status)
+        self.assertIn("Railway scheduler: **running", status)
+        self.assertIn("Analysis/scheduling chain: **UNKNOWN**", status)
+        self.assertNotIn("ready-but-disabled", status)
+        self.assertIn("DCA health: ATTENTION REQUIRED", health)
+        self.assertIn("Analysis/scheduling chain: UNKNOWN", health)
+
+    def test_missing_history_through_is_reported_as_unknown(self):
+        decision = deepcopy(self.analysis["TARGETS"]["BTC_GBP"])
+        decision["HISTORY"].pop("THROUGH")
+
+        summary = discord_bot._decision_summary(
+            "BTC_GBP",
+            self.rules["BTC_GBP"],
+            decision,
+            {},
+            now=NOW,
+        )
+
+        self.assertIn("Data through: `unknown`", summary)
+
+    def test_chain_never_reports_operational_for_unhealthy_workflow_evidence(self):
+        with patch.object(discord_bot, "DCA_CRON_ENABLED", True):
+            for workflow_status in ("UNKNOWN", "FAILING", "BLOCKED", "STALE"):
+                with self.subTest(workflow_status=workflow_status):
+                    self.assertEqual(
+                        discord_bot._analysis_chain_status(
+                            local_scheduler_ok=True,
+                            workflow_health={"status": workflow_status},
+                            watchdog_health={"status": "SATISFIED"},
+                        ),
+                        "UNKNOWN"
+                        if workflow_status == "UNKNOWN"
+                        else "ATTENTION REQUIRED",
+                    )
 
     def test_status_and_health_separate_portfolio_delivery_from_kraken_recovery(self):
         execution = {
@@ -1171,6 +1274,126 @@ class DiscordBotSchedulerTests(unittest.TestCase):
 
 
 class DiscordBotWorkflowAndGeminiTests(unittest.TestCase):
+    @patch.object(discord_bot.requests, "get")
+    def test_analysis_workflow_health_reports_actual_successful_ref(self, get):
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = {
+            "workflow_runs": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "head_branch": "main",
+                    "head_sha": "abcdef0123456789",
+                    "updated_at": "2026-08-05T03:55:00Z",
+                    "run_number": 81,
+                }
+            ]
+        }
+        with (
+            patch.object(discord_bot, "GH_PAT", "configured"),
+            patch.object(discord_bot, "GITHUB_REPO", "owner/repository"),
+            patch.object(discord_bot, "GITHUB_WORKFLOW_REF", "main"),
+            patch.object(discord_bot, "_workflow_contract_error", None),
+        ):
+            health = discord_bot.get_analysis_workflow_health(now=NOW)
+
+        self.assertEqual(health["status"], "HEALTHY")
+        self.assertEqual(health["configured_ref"], "main")
+        self.assertEqual(health["actual_ref"], "main")
+        self.assertEqual(health["head_sha"], "abcdef0123456789")
+        self.assertEqual(
+            get.call_args.kwargs["params"], {"branch": "main", "per_page": 20}
+        )
+
+    @patch.object(discord_bot.requests, "get")
+    def test_analysis_workflow_health_blocks_on_auth_failure(self, get):
+        get.return_value.status_code = 401
+        with (
+            patch.object(discord_bot, "GH_PAT", "configured"),
+            patch.object(discord_bot, "GITHUB_REPO", "owner/repository"),
+            patch.object(discord_bot, "GITHUB_WORKFLOW_REF", "main"),
+            patch.object(discord_bot, "_workflow_contract_error", None),
+        ):
+            health = discord_bot.get_analysis_workflow_health(now=NOW)
+
+        self.assertEqual(health["status"], "BLOCKED")
+        self.assertEqual(health["reason"], "GitHub workflow API HTTP 401")
+
+    @patch.object(discord_bot.requests, "get")
+    def test_analysis_workflow_health_preserves_any_active_run_guard(self, get):
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = {
+            "workflow_runs": [
+                {"status": "completed", "conclusion": "success"},
+                {
+                    "status": "in_progress",
+                    "conclusion": None,
+                    "head_branch": "main",
+                    "head_sha": "1234567890abcdef",
+                },
+            ]
+        }
+        with (
+            patch.object(discord_bot, "GH_PAT", "configured"),
+            patch.object(discord_bot, "GITHUB_REPO", "owner/repository"),
+            patch.object(discord_bot, "GITHUB_WORKFLOW_REF", "main"),
+            patch.object(discord_bot, "_workflow_contract_error", None),
+        ):
+            health = discord_bot.get_analysis_workflow_health(now=NOW)
+
+        self.assertEqual(health["status"], "ACTIVE")
+        self.assertEqual(health["run_status"], "in_progress")
+
+    @patch.object(discord_bot.requests, "get")
+    def test_old_success_is_stale_and_cannot_make_chain_operational(self, get):
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = {
+            "workflow_runs": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "head_branch": "main",
+                    "head_sha": "abcdef0123456789",
+                    "updated_at": (NOW - timedelta(hours=31))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "run_number": 80,
+                }
+            ]
+        }
+        with (
+            patch.object(discord_bot, "GH_PAT", "configured"),
+            patch.object(discord_bot, "GITHUB_REPO", "owner/repository"),
+            patch.object(discord_bot, "GITHUB_WORKFLOW_REF", "main"),
+            patch.object(discord_bot, "_workflow_contract_error", None),
+            patch.object(discord_bot, "DCA_CRON_ENABLED", True),
+        ):
+            health = discord_bot.get_analysis_workflow_health(now=NOW)
+            chain = discord_bot._analysis_chain_status(
+                local_scheduler_ok=True,
+                workflow_health=health,
+                watchdog_health={"status": "ATTENTION"},
+            )
+
+        self.assertEqual(health["status"], "STALE")
+        self.assertIn("older than 30 hours", health["reason"])
+        self.assertEqual(chain, "ATTENTION REQUIRED")
+
+    @patch.object(discord_bot.requests, "get")
+    def test_analysis_workflow_health_is_unknown_without_run_evidence(self, get):
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = {"workflow_runs": []}
+        with (
+            patch.object(discord_bot, "GH_PAT", "configured"),
+            patch.object(discord_bot, "GITHUB_REPO", "owner/repository"),
+            patch.object(discord_bot, "GITHUB_WORKFLOW_REF", "main"),
+            patch.object(discord_bot, "_workflow_contract_error", None),
+        ):
+            health = discord_bot.get_analysis_workflow_health(now=NOW)
+
+        self.assertEqual(health["status"], "UNKNOWN")
+        self.assertIn("no workflow runs", health["reason"])
+
     @patch.object(discord_bot.requests, "post")
     def test_dispatch_uses_configured_workflow_ref(self, post):
         post.return_value.status_code = 204

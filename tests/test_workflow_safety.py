@@ -37,6 +37,13 @@ class WorkflowSafetyTests(unittest.TestCase):
         self.assertIn("GIST_TOKEN: ${{ secrets.GIST_TOKEN }}", text)
         self.assertIn("GH_PAT_FOR_VARS: ${{ secrets.GH_PAT_FOR_VARS }}", text)
 
+    def test_daily_dca_has_no_direct_ghostfolio_credentials(self):
+        text = self._read("daily_dca.yml")
+        self.assertIn('GHOSTFOLIO_DIRECT_SYNC_ENABLED: "false"', text)
+        self.assertNotIn("GHOSTFOLIO_TOKEN:", text)
+        self.assertNotIn("GHOSTFOLIO_URL:", text)
+        self.assertNotIn("PORTFOLIO_ACCOUNT_MAP:", text)
+
     def test_portfolio_has_no_push_trigger(self):
         text = self._read("portfolio_check.yml")
         self.assertNotRegex(text, r"(?m)^\s*push:\s*$")
@@ -104,6 +111,12 @@ class WorkflowSafetyTests(unittest.TestCase):
         self.assertIn("gh variable get DCA_EXECUTION_STATE", text)
         self.assertIn("export DCA_TARGET_MAP DCA_ANALYSIS_STATE DCA_EXECUTION_STATE", text)
         self.assertIn("group: dca-rule-writers", text)
+
+    def test_rule_writer_uses_max_queue_without_cancelling_active(self):
+        text = self._read("update_dca_config.yml")
+        self.assertIn("group: dca-rule-writers", text)
+        self.assertIn("queue: max", text)
+        self.assertIn("cancel-in-progress: false", text)
 
 
 if __name__ == "__main__":
