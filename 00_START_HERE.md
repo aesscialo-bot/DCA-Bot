@@ -369,7 +369,10 @@ repository and an existing branch whose rules permit the outbox service
 identity's compare-and-swap commits. Configure repository variables
 `DCA_OUTBOX_REPOSITORY_OWNER`, `DCA_OUTBOX_REPOSITORY_NAME`,
 `DCA_OUTBOX_REPOSITORY_BRANCH`, `DCA_OUTBOX_AUDIT_PATH`,
-`DCA_OUTBOX_EVENT_PATH`, and `DCA_OUTBOX_HOLDINGS_PATH`, plus the Actions secret
+`DCA_OUTBOX_EVENT_PATH`, `DCA_OUTBOX_HOLDINGS_PATH`,
+`DCA_OUTBOX_OPENING_BASIS_SOURCE_PATH` (ending in
+`kraken_opening_basis_source_v1.json`), and `DCA_OUTBOX_OPENING_BASIS_PATH`
+(ending in `kraken_opening_basis_v1.json`), plus the Actions secret
 `DCA_OUTBOX_REPOSITORY_TOKEN`. This launch uses the existing classic controller
 credential as a time-bounded compatibility value; rotate it after launch to a
 fine-grained token limited to Contents read/write for that one private
@@ -377,6 +380,30 @@ repository and remove the classic value. Paths are repository-relative POSIX
 paths and have no code defaults. The producer refuses missing
 settings, public repositories, failed authorization, malformed files, and
 unresolved SHA conflicts. `GIST_ID` and `GIST_TOKEN` do not enable a fallback.
+
+### Import pre-cutover Kraken performance cost
+
+Use the manual `Kraken Opening Performance Basis` workflow. This is a one-time
+performance-book basis capture and is not a tax-basis calculation. It never
+uses current ticker prices.
+
+1. Confirm the Kraken key has `Query closed orders & trades` and `Query ledger
+   entries`, no withdrawal permission, and an unrestricted history start.
+2. Choose one fixed UTC `generated_at`. Run `source` in `preview`, review the
+   canonical hash and record counts, then run `source` in `publish` with the
+   same timestamp and reviewed hash.
+3. Record the source repository commit printed by the publish run. Run `basis`
+   in `preview` with that same timestamp and source commit. Review every
+   position's coverage and the compact canonical hash.
+4. Run `basis` in `publish` with the identical timestamp, source commit, and
+   hash. An exact retry is a no-op; different bytes at either fixed path are
+   rejected and require an explicitly reviewed versioned supersession.
+
+Only `complete` positions supply an opening-cost overlay to Portfolio Compass.
+Deposits, transfers, rewards, sells, adjustments, missing ledgers, historical
+USD funding that cannot be conserved from zero cash, and opening-quantity gaps
+remain visibly `missing`. Do not fill those gaps with a current price or a
+manually estimated exchange rate.
 
 The Railway Discord controller reads the exact event ledger and Ghostfolio
 event-receipt path from one resolved immutable commit. A dedicated

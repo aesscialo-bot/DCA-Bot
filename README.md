@@ -211,6 +211,16 @@ Required repository variables:
 - `DCA_OUTBOX_AUDIT_PATH` (repository-relative legacy Markdown audit path)
 - `DCA_OUTBOX_EVENT_PATH` (repository-relative PortfolioEventV3 JSONL path)
 - `DCA_OUTBOX_HOLDINGS_PATH` (repository-relative signed snapshot JSON path)
+- `DCA_OUTBOX_OPENING_BASIS_SOURCE_PATH` (must end in
+  `kraken_opening_basis_source_v1.json`)
+- `DCA_OUTBOX_OPENING_BASIS_PATH` (must end in
+  `kraken_opening_basis_v1.json`)
+
+`DCA_OPENING_BASIS_FUNDING_LINKS_JSON` is optional. The producer normally
+infers each historical GBP/USD leg from the target/date deterministic Kraken
+client order IDs and conserved USD ledger balances. If supplied, the mapping
+is only an additional reviewed constraint from crypto order ID to funding
+order ID; it cannot make otherwise incomplete evidence complete.
 
 `DCA_CRON_ENABLED` is a Railway runtime variable, not a GitHub repository
 variable. It must be `true` for normal scheduling and should be set to `false`
@@ -261,7 +271,8 @@ Optional secrets:
 - `GEMINI_API_KEY`
 
 GitHub Actions does not receive a Ghostfolio URL, token, or account map.
-Ghostfolio is reporting-only: hosted runners publish the three source artifacts
+Ghostfolio is reporting-only: hosted runners publish the recurring audit,
+event, and holdings artifacts plus the two manually reviewed opening-basis artifacts
 to a dedicated private GitHub repository and never connect directly to the PC
 or to a hosted Ghostfolio instance.
 
@@ -280,6 +291,12 @@ Kraken API credentials must allow query and order operations but must never have
 withdrawal permission. Production JSON state is loaded inside workflow steps,
 masked line-by-line, and passed through the GitHub environment file. Workflows
 must never print a complete rules, analysis, or execution-state document.
+
+The one-time opening-basis source capture additionally requires Kraken
+`Query closed orders & trades` and `Query ledger entries`. `GetApiKeyInfo`
+must prove an unrestricted history start (`queryFrom=0`), a query end that is
+unrestricted or covers the cutover, and a key expiry that covers generation.
+The producer refuses to infer completeness from a time-restricted API key.
 
 ## Discord controls
 
@@ -434,6 +451,38 @@ health also rejects a missing snapshot, a snapshot older than two hours, a
 timestamp rollback, a changed hash at the same timestamp, or an unfinished
 reconciliation receipt. This makes a dropped GitHub schedule visible instead
 of repeatedly reporting an old Kraken balance as current.
+
+### Pre-cutover Kraken performance basis
+
+`Kraken Opening Performance Basis` is a manual-only, two-stage workflow. It
+reconstructs the reviewed BTC, HYPE, and SOL quantities at
+`2026-08-06T04:21:00.000Z`; it never treats the holdings snapshot's live ticker
+as acquisition cost. The result is a GBP **performance-book cost**, not tax-lot
+or statutory tax basis.
+
+Run `source / preview` with one fixed UTC `generated_at`, review its counts and
+canonical hash, then run `source / publish` with the same timestamp and hash.
+The source file retains only the exact normalized trade, ledger, order, access,
+request, and pagination fields consumed by reconstruction. It is capped at
+1,000,000 bytes for the PC consumer. Capture the repository commit printed by
+the published source run.
+
+Next run `basis / preview` with the same `generated_at` and the captured source
+commit. Review the compact hash and each position's `complete` or `missing`
+coverage. Run `basis / publish` only with that exact source commit and reviewed
+hash. Both files are write-once: byte-identical retries are no-ops and any
+different existing content fails closed. Keeping the source commit fixed makes
+a retry reproduce identical compact bytes even if a later holdings snapshot is
+published meanwhile.
+
+Completeness requires every pre-cutover acquisition, actual historical pair,
+fee currency, and target-asset movement to reconcile to the reviewed opening.
+USD acquisitions additionally require closed deterministic buy/funding orders,
+a fully paginated GBP/USD fill, zero pre-existing USD cash, no intervening USD
+movement, and no unexplained post-buy USD balance. A sale, deposit, transfer,
+reward, adjustment, missing ledger, ambiguous funding route, or quantity gap
+leaves only that affected position `missing`; known partial acquisitions remain
+auditable but do not create a cost overlay.
 
 The consumer resolves the private repository branch once per poll and pins
 events, holdings, and all receipt ledgers to that immutable commit.
