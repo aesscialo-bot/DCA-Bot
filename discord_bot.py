@@ -1828,7 +1828,9 @@ def refresh_dca_schedule(
             invalid_enabled.append(f"{symbol}: rules mismatch")
             continue
         if parse_utc_iso(decision["VALID_UNTIL"]) < current.astimezone(timezone.utc):
-            invalid_enabled.append(f"{symbol}: stale decision")
+            # A completed window is an expected terminal state, not a broken
+            # scheduler. Status still shows the pair as done for today, while
+            # tomorrow's analysis creates its next opportunity.
             continue
         if decision_age_minutes(decision, now=current) < 0:
             invalid_enabled.append(f"{symbol}: future analysis timestamp")
