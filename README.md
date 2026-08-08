@@ -225,24 +225,23 @@ Required Railway runtime variables:
 Railway may also contain `GEMINI_API_KEY` for optional read-only conversational
 intent classification. Exact DCA control commands never depend on AI.
 
-Optional repository variables:
-
-- `GHOSTFOLIO_URL`
-- `PORTFOLIO_ACCOUNT_MAP`
-
 Required GitHub Actions secrets:
 
 - `KRAKEN_API_KEY`
 - `KRAKEN_API_SECRET`
 - `DISCORD_WEBHOOK_URL`
 - `GH_PAT_FOR_VARS`
+- `GIST_ID`
+- `GIST_TOKEN`
 
 Optional secrets:
 
 - `GEMINI_API_KEY`
-- `GIST_ID`
-- `GIST_TOKEN`
-- `GHOSTFOLIO_TOKEN`
+
+GitHub Actions does not receive a Ghostfolio URL, token, or account map.
+Ghostfolio is reporting-only: the localhost sidecar consumes the durable Gist
+outbox and signed Kraken holdings snapshot, so hosted runners never connect
+directly to the PC or to a hosted Ghostfolio instance.
 
 Kraken API credentials must allow query and order operations but must never have
 withdrawal permission. Production JSON state is loaded inside workflow steps,
@@ -299,6 +298,11 @@ decision for every canonical target, and no credential or complete production
 state JSON in public logs. No manual intervention is required after activation.
 
 ## Local Ghostfolio
+
+On this PC, the operator-facing installation is stored under
+`C:\Users\anand\GLaDOS\Ghostfolio`; the Compose files are in its
+`Application Files` folder and the accessible login key remains at
+`C:\Users\anand\GLaDOS\Ghostfolio\Key.txt`.
 
 The isolated `dca-ghostfolio` Compose project pins Ghostfolio 3.43.0 and keeps
 PostgreSQL 15 and Redis off host ports. Only `127.0.0.1:3333` is exposed. The

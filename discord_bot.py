@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from copy import deepcopy
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import json
 import os
@@ -71,6 +71,7 @@ DCA_AMOUNT_MIN_GBP = 5.0
 DCA_AMOUNT_MAX_GBP = 1_000.0
 ENABLE_CONFIRMATION_TTL_SECONDS = 300
 DISPATCH_RETRY_SECONDS = 30 * 60
+ANALYSIS_WORKFLOW_HEALTH_MAX_AGE = timedelta(hours=30)
 # The primary workflow is scheduled for 04:07 Bangkok. Give GitHub Actions a
 # bounded startup window before treating a missing start-day decision as an
 # operational error.
@@ -335,6 +336,50 @@ def validate_workflow_contracts() -> str | None:
 
 def analysis_workflow_active() -> bool:
     """Return whether GitHub already has queued/in-progress analysis on the ref."""
+
+    return get_analysis_workflow_health()["status"] == "ACTIVE"
+
+
+def get_analysis_workflow_health(*, now: datetime | None = None) -> dict[str, Any]:
+    """Return bounded, non-secret evidence about the configured analysis workflow.
+
+    The watchdog already depends on GitHub's workflow-runs endpoint.  Status uses
+    the same endpoint so it can distinguish an active/successful workflow from a
+    failed run or missing evidence instead of inferring GitHub health from the
+    local Railway scheduler.
+    """
+
+    result: dict[str, Any] = {
+        "status": "UNKNOWN",
+        "configured_ref": GITHUB_WORKFLOW_REF or None,
+        "actual_ref": None,
+        "head_sha": None,
+        "run_status": None,
+        "conclusion": None,
+        "updated_at": None,
+        "run_number": None,
+        "reason": None,
+    }
+    if _workflow_contract_error:
+        return {
+            **result,
+            "status": "BLOCKED",
+            "reason": _workflow_contract_error,
+        }
+    missing = [
+        name
+        for name, value in (
+            ("GH_PAT", GH_PAT),
+            ("GITHUB_REPO", GITHUB_REPO),
+            ("GITHUB_WORKFLOW_REF", GITHUB_WORKFLOW_REF),
+        )
+        if not value
+    ]
+    if missing:
+        return {
+            **result,
+            "reason": "missing " + ", ".join(missing),
+        }
     try:
         response = requests.get(
             f"{GH_API}/repos/{GITHUB_REPO}/actions/workflows/crypto_analysis.yml/runs",
@@ -342,14 +387,80 @@ def analysis_workflow_active() -> bool:
             params={"branch": GITHUB_WORKFLOW_REF, "per_page": 20},
             timeout=15,
         )
-        if response.status_code != 200:
-            return False
-        return any(
-            run.get("status") in {"queued", "in_progress", "waiting", "pending"}
-            for run in response.json().get("workflow_runs", [])
+    except requests.RequestException as exc:
+        return {
+            **result,
+            "reason": f"GitHub workflow observation failed ({type(exc).__name__})",
+        }
+    if response.status_code != 200:
+        blocked = response.status_code in {401, 403, 404}
+        return {
+            **result,
+            "status": "BLOCKED" if blocked else "UNKNOWN",
+            "reason": f"GitHub workflow API HTTP {response.status_code}",
+        }
+    try:
+        runs = response.json().get("workflow_runs")
+        if not isinstance(runs, list):
+            raise TypeError("workflow_runs must be a list")
+        valid_runs = [run for run in runs if isinstance(run, Mapping)]
+        latest = valid_runs[0] if valid_runs else None
+        if latest is None:
+            return {**result, "reason": "no workflow runs found on configured ref"}
+        active_statuses = {"queued", "in_progress", "waiting", "pending", "requested"}
+        active = next(
+            (run for run in valid_runs if run.get("status") in active_statuses),
+            None,
         )
-    except (TypeError, requests.RequestException):
-        return False
+        observed = active or latest
+        run_status = observed.get("status")
+        conclusion = observed.get("conclusion")
+        actual_ref = observed.get("head_branch")
+        head_sha = observed.get("head_sha")
+        updated_at = observed.get("updated_at")
+        run_number = observed.get("run_number")
+        health_reason = None
+        if active is not None:
+            health_status = "ACTIVE"
+        elif run_status == "completed" and conclusion == "success":
+            if not isinstance(updated_at, str):
+                health_status = "UNKNOWN"
+                health_reason = "successful workflow run has no update timestamp"
+            else:
+                try:
+                    updated = parse_utc_iso(updated_at)
+                    reference = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+                    age = reference - updated
+                except (ConfigError, TypeError, ValueError):
+                    health_status = "UNKNOWN"
+                    health_reason = "successful workflow run has an invalid update timestamp"
+                else:
+                    if age < -timedelta(minutes=5):
+                        health_status = "UNKNOWN"
+                        health_reason = "successful workflow run timestamp is in the future"
+                    elif age > ANALYSIS_WORKFLOW_HEALTH_MAX_AGE:
+                        health_status = "STALE"
+                        health_reason = "latest successful workflow run is older than 30 hours"
+                    else:
+                        health_status = "HEALTHY"
+        elif run_status == "completed":
+            health_status = "FAILING"
+        else:
+            health_status = "UNKNOWN"
+            health_reason = "unrecognised workflow run state"
+        return {
+            **result,
+            "status": health_status,
+            "actual_ref": actual_ref if isinstance(actual_ref, str) else None,
+            "head_sha": head_sha if isinstance(head_sha, str) else None,
+            "run_status": run_status if isinstance(run_status, str) else None,
+            "conclusion": conclusion if isinstance(conclusion, str) else None,
+            "updated_at": updated_at if isinstance(updated_at, str) else None,
+            "run_number": run_number if isinstance(run_number, int) else None,
+            "reason": health_reason,
+        }
+    except (AttributeError, TypeError, ValueError):
+        return {**result, "reason": "invalid GitHub workflow response"}
 
 
 def get_repo_variable(name: str) -> str | None:
@@ -755,6 +866,145 @@ async def handle_portfolio(params: dict[str, Any], message: discord.Message) -> 
         await message.reply("Failed to queue the portfolio check.")
 
 
+def _history_data_through(decision: Mapping[str, Any]) -> str:
+    """Render the last source candle timestamp without implying missing evidence."""
+
+    history = decision.get("HISTORY")
+    if not isinstance(history, Mapping):
+        return "unknown"
+    value = history.get("THROUGH")
+    if not isinstance(value, str) or not value.strip():
+        return "unknown"
+    rendered = _local_timestamp(value)
+    return "unknown" if rendered == "not scheduled" else rendered
+
+
+def _format_analysis_workflow_health(health: Mapping[str, Any]) -> str:
+    """Format one concise line of GitHub workflow evidence for Discord."""
+
+    status = str(health.get("status") or "UNKNOWN").upper()
+    configured_ref = health.get("configured_ref") or "missing"
+    actual_ref = health.get("actual_ref")
+    head_sha = health.get("head_sha")
+    actual = "unknown"
+    if isinstance(actual_ref, str) and actual_ref:
+        actual = actual_ref
+        if isinstance(head_sha, str) and head_sha:
+            actual += f"@{head_sha[:12]}"
+    run_state = health.get("run_status") or "unobserved"
+    conclusion = health.get("conclusion")
+    if conclusion:
+        run_state = f"{run_state}/{conclusion}"
+    updated_at = health.get("updated_at")
+    observed = _local_timestamp(updated_at) if isinstance(updated_at, str) else "unknown"
+    line = (
+        f"GitHub analysis workflow: **{status}** | configured ref: `{configured_ref}` | "
+        f"actual ref: `{actual}` | run: `{run_state}` | observed: `{observed}`"
+    )
+    reason = health.get("reason")
+    if isinstance(reason, str) and reason:
+        line += f" | `{reason}`"
+    return line
+
+
+def _analysis_complete_for_watchdog(
+    analysis: Mapping[str, Any], now: datetime
+) -> bool:
+    current_date = now.astimezone(TIMEZONE).date().isoformat()
+    targets = analysis.get("TARGETS")
+    return (
+        analysis.get("ANALYSIS_DATE") == current_date
+        and isinstance(targets, Mapping)
+        and all(
+            isinstance(item, Mapping) and item.get("ANALYSIS_STATUS") == "READY"
+            for item in targets.values()
+        )
+    )
+
+
+def _analysis_watchdog_health(
+    analysis: Mapping[str, Any],
+    now: datetime,
+    workflow_health: Mapping[str, Any],
+    *,
+    awaiting_symbols: set[str] | None = None,
+) -> dict[str, str]:
+    """Describe watchdog evidence independently from local scheduler health."""
+
+    local_now = now.astimezone(TIMEZONE)
+    if awaiting_symbols:
+        return {
+            "status": "WAITING",
+            "detail": "start-day analysis is not due yet",
+        }
+    if _analysis_complete_for_watchdog(analysis, now):
+        return {
+            "status": "SATISFIED",
+            "detail": f"current-date analysis is complete ({local_now.date().isoformat()})",
+        }
+    if local_now.time() < START_DAY_ANALYSIS_EXPECTED_BY:
+        return {
+            "status": "WAITING",
+            "detail": f"recovery check begins at {START_DAY_ANALYSIS_EXPECTED_BY:%H:%M} {TIMEZONE.key}",
+        }
+    if _workflow_contract_error:
+        return {"status": "BLOCKED", "detail": _workflow_contract_error}
+    workflow_status = str(workflow_health.get("status") or "UNKNOWN").upper()
+    if workflow_status == "ACTIVE":
+        return {
+            "status": "MONITORING",
+            "detail": "GitHub analysis run is queued or in progress",
+        }
+    if _analysis_watchdog_last_dispatch is not None:
+        return {
+            "status": "ATTENTION",
+            "detail": "recovery dispatch was accepted but current analysis is still incomplete",
+        }
+    if workflow_status in {"BLOCKED", "FAILING"}:
+        return {
+            "status": "BLOCKED",
+            "detail": f"GitHub analysis workflow is {workflow_status.lower()}",
+        }
+    if workflow_status == "UNKNOWN":
+        return {
+            "status": "UNKNOWN",
+            "detail": "GitHub workflow evidence is unavailable",
+        }
+    return {
+        "status": "ATTENTION",
+        "detail": "current analysis is incomplete and no recovery run is active",
+    }
+
+
+def _format_analysis_watchdog_health(health: Mapping[str, Any]) -> str:
+    status = str(health.get("status") or "UNKNOWN").upper()
+    detail = str(health.get("detail") or "no watchdog evidence")
+    return f"Analysis watchdog: **{status}** | {detail}"
+
+
+def _analysis_chain_status(
+    *,
+    local_scheduler_ok: bool,
+    workflow_health: Mapping[str, Any],
+    watchdog_health: Mapping[str, Any],
+) -> str:
+    """Combine independent scheduler evidence without overstating readiness."""
+
+    if not DCA_CRON_ENABLED:
+        return "PAUSED"
+    workflow_status = str(workflow_health.get("status") or "UNKNOWN").upper()
+    watchdog_status = str(watchdog_health.get("status") or "UNKNOWN").upper()
+    if workflow_status == "UNKNOWN" or watchdog_status == "UNKNOWN":
+        return "UNKNOWN"
+    if (
+        not local_scheduler_ok
+        or workflow_status not in {"HEALTHY", "ACTIVE"}
+        or watchdog_status not in {"SATISFIED", "WAITING", "MONITORING"}
+    ):
+        return "ATTENTION REQUIRED"
+    return "OPERATIONAL"
+
+
 def _decision_summary(
     symbol: str,
     rule: Mapping[str, Any],
@@ -775,6 +1025,7 @@ def _decision_summary(
         if delivery_count
         else ""
     )
+    history_data_through = _history_data_through(decision)
     current_date = now.astimezone(TIMEZONE).date().isoformat()
     if (
         decision["ANALYSIS_STATUS"] == "READY"
@@ -807,7 +1058,7 @@ def _decision_summary(
         f"  Analysis: {decision_status} | Regime: `{regime}` | Effective: {amount} | "
         f"Selected: `{selected_time}` | Effective: `{next_time}` | Age: `{age}`\n"
         f"  Analysis date: `{decision['ANALYSIS_DATE']}` | Decision: `{decision['DECISION_ID']}` | "
-        f"Execution: `{decision['EXECUTION_STATUS']}`\n"
+        f"Execution: `{decision['EXECUTION_STATUS']}` | Data through: `{history_data_through}`\n"
         f"  Last buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}`"
         f"{pending_text}{delivery_text}"
     )
@@ -895,13 +1146,23 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         )
         return
 
-    ghostfolio_health = await asyncio.to_thread(get_ghostfolio_delivery_health)
+    ghostfolio_health, workflow_health = await asyncio.gather(
+        asyncio.to_thread(get_ghostfolio_delivery_health),
+        asyncio.to_thread(get_analysis_workflow_health),
+    )
     now = datetime.now(timezone.utc)
+    awaiting_symbols = _pending_start_day_analysis_symbols(rules, analysis, now)
+    watchdog_health = _analysis_watchdog_health(
+        analysis,
+        now,
+        workflow_health,
+        awaiting_symbols=awaiting_symbols,
+    )
     lines = [
-        "**Kraken USD-pair DCA status (GBP budgets)**",
+        "**Kraken mixed-market DCA status (GBP budgets)**",
         f"Trading mode: **{DCA_TRADING_MODE}**"
         + (f" (`{DCA_CANARY_SYMBOL}` only)" if DCA_TRADING_MODE == "canary" else ""),
-        f"Workflow ref: `{GITHUB_WORKFLOW_REF or 'missing'}`",
+        _format_analysis_workflow_health(workflow_health),
     ]
     for symbol in ALLOWED_TARGETS:
         lines.append(
@@ -914,7 +1175,6 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
             )
         )
     all_disabled = not any(rule["BUY_ENABLED"] for rule in rules.values())
-    awaiting_symbols = _pending_start_day_analysis_symbols(rules, analysis, now)
     if _schedule_error:
         scheduler = f"INVALID — {_schedule_error}"
     elif _schedule_warning:
@@ -930,7 +1190,19 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         )
     else:
         scheduler = f"running; {len(_dca_schedule)} active target(s)"
-    lines.append(f"Scheduler: **{scheduler}**")
+    local_scheduler_ok = (
+        DCA_CRON_ENABLED
+        and _schedule_error is None
+        and _schedule_warning is None
+    )
+    chain_status = _analysis_chain_status(
+        local_scheduler_ok=local_scheduler_ok,
+        workflow_health=workflow_health,
+        watchdog_health=watchdog_health,
+    )
+    lines.append(f"Railway scheduler: **{scheduler}**")
+    lines.append(_format_analysis_watchdog_health(watchdog_health))
+    lines.append(f"Analysis/scheduling chain: **{chain_status}**")
     analysis_ready = all(
         decision["ANALYSIS_STATUS"] == "READY"
         and decision["ANALYSIS_DATE"] == now.astimezone(TIMEZONE).date().isoformat()
@@ -971,9 +1243,7 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         all_disabled
         and analysis_ready
         and pending_count == 0
-        and DCA_CRON_ENABLED
-        and _schedule_error is None
-        and _schedule_warning is None
+        and chain_status == "OPERATIONAL"
     ):
         lines.append("Trading posture: **ready-but-disabled** (no target can submit a new order).")
     elif all_disabled:
@@ -990,9 +1260,18 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
             "- New orders: blocked"
         )
         return
-    ghostfolio_health = await asyncio.to_thread(get_ghostfolio_delivery_health)
+    ghostfolio_health, workflow_health = await asyncio.gather(
+        asyncio.to_thread(get_ghostfolio_delivery_health),
+        asyncio.to_thread(get_analysis_workflow_health),
+    )
     now = datetime.now(timezone.utc)
     awaiting_symbols = _pending_start_day_analysis_symbols(rules, analysis, now)
+    watchdog_health = _analysis_watchdog_health(
+        analysis,
+        now,
+        workflow_health,
+        awaiting_symbols=awaiting_symbols,
+    )
     ready = []
     errors = []
     stale = []
@@ -1030,11 +1309,17 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     analysis_ok = (
         not errors and not stale and not mismatched and not awaiting_symbols
     )
-    scheduler_ok = (
+    local_scheduler_ok = (
         DCA_CRON_ENABLED
         and _schedule_error is None
         and _schedule_warning is None
     )
+    chain_status = _analysis_chain_status(
+        local_scheduler_ok=local_scheduler_ok,
+        workflow_health=workflow_health,
+        watchdog_health=watchdog_health,
+    )
+    scheduler_ok = chain_status == "OPERATIONAL"
     awaiting_start_analysis = (
         enabled_count > 0
         and pending_count == 0
@@ -1060,6 +1345,8 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     lines = [
         f"**DCA health: {posture}**",
         f"- Rules: valid ({len(rules)}/3 mixed targets; GBP budgets)",
+        "- " + _format_analysis_workflow_health(workflow_health),
+        "- " + _format_analysis_watchdog_health(watchdog_health),
         (
             "- Analysis: awaiting 04:07 start-day analysis"
             if awaiting_start_analysis
@@ -1079,8 +1366,9 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
             if ghostfolio_health["status"] in {"CLEAR", "PENDING"}
             else f"- Local Ghostfolio receipts: {ghostfolio_health['status']}"
         ),
-        f"- Scheduler: {'running' if DCA_CRON_ENABLED else 'paused'}; "
+        f"- Railway scheduler: {'running' if DCA_CRON_ENABLED else 'paused'}; "
         f"active targets {len(_dca_schedule)}",
+        f"- Analysis/scheduling chain: {chain_status}",
         f"- Buy-enabled targets: {enabled_count}/3",
     ]
     if _schedule_start_date is not None:
@@ -1098,10 +1386,10 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
         lines.append(f"- Scheduler validation: FAILED (`{_schedule_error}`)")
     if _schedule_warning:
         lines.append(f"- Scheduler skipped target(s): `{_schedule_warning}`")
-    await message.reply("\n".join(lines))
+    await message.reply("\n".join(lines)[:1_990])
 
 
-HELP_TEXT = """**Kraken USD-pair DCA controls (GBP budgets)**
+HELP_TEXT = """**Kraken mixed-market DCA controls (GBP budgets)**
 
 `!dca set BTC amounts to 10 low and 20 high`
 `!dca disable BTC`
@@ -1653,6 +1941,6 @@ if __name__ == "__main__":
         _log("ERROR missing required environment variables: " + ", ".join(missing))
         sys.exit(1)
     _log(
-        f"INFO starting Kraken USD-pair DCA Discord service cron_enabled={DCA_CRON_ENABLED}"
+        f"INFO starting Kraken mixed-market DCA Discord service cron_enabled={DCA_CRON_ENABLED}"
     )
     client.run(DISCORD_BOT_TOKEN, log_handler=None)
