@@ -316,6 +316,17 @@ class KrakenOpeningBasisTests(unittest.TestCase):
         self.assertEqual(position["coverage"], "complete")
         self.assertIsNone(position["acquisitions"][0]["client_order_id"])
 
+    def test_base_fee_consuming_the_full_acquisition_can_never_be_complete(self):
+        trades, ledgers, orders = direct_fixture()
+        rows = [dict(row) for row in ledgers.records]
+        next(row for row in rows if row["id"] == "L-BTC")["fee"] = "0.1"
+        position = build(
+            opening(BTC_GBP="0"), (trades, evidence(rows), orders)
+        )["positions"]["BTC_GBP"]
+
+        self.assertEqual(position["coverage"], "missing")
+        self.assertEqual(position["acquisitions"], [])
+
     def test_usd_route_is_inferred_from_deterministic_orders_and_conserves_cash(self):
         artifact = build(opening(HYPE_USD="0.199"), usd_fixture())
         position = artifact["positions"]["HYPE_USD"]

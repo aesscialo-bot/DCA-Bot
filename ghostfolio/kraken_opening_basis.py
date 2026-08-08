@@ -907,7 +907,7 @@ def _spot_leg(group, target: str, quote: str, ledger_by_id) -> dict:
     quote_cost = sum((decimal_value(row.get("cost"), "Kraken trade cost", positive=True) for row in group), Decimal(0))
     base_amount = sum((signed_decimal(row.get("amount"), "Kraken base ledger amount") for row in base_rows), Decimal(0))
     base_fee = sum((decimal_value(row.get("fee", 0), "Kraken base ledger fee") for row in base_rows), Decimal(0))
-    if base_amount <= 0 or base_fee > base_amount:
+    if base_amount <= 0 or base_fee >= base_amount:
         raise OpeningBasisError("Kraken acquisition base ledger is inconsistent")
     tolerance = TARGETS[target]["tolerance"]
     if abs(base_amount - gross) > tolerance:
