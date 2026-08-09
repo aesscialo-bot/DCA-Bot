@@ -463,6 +463,15 @@ reconstructs the reviewed BTC, HYPE, and SOL quantities at
 as acquisition cost. The result is a GBP **performance-book cost**, not tax-lot
 or statutory tax basis.
 
+The opening quantities are derived only from the immutable reviewed private-
+repository commit recorded in `opening_binding.repository_commit_sha`. The
+binding also records the exact holdings and event paths, Git blob identifiers,
+signed holdings hash, raw event-file SHA-256, and accepted event-prefix hash and
+count. Later balance snapshots and appended DCA events are live reconciliation
+observations; their provider rounding cannot rewrite the reviewed opening.
+Kraken trade-history `source_evidence.repository_commit_sha` remains a separate
+commit so both evidence lineages can be independently verified and fail closed.
+
 Run `source / preview` with one fixed UTC `generated_at`, review its counts and
 canonical hash, then run `source / publish` with the same timestamp and hash.
 The source file retains only the exact normalized trade, ledger, order, access,
