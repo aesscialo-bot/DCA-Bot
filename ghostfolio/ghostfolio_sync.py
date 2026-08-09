@@ -1265,13 +1265,60 @@ def _event_activity_matches(identity, event):
     ))
 
 
-def _hype_activity_topology(activities, account_id, event, *, allow_other=False):
+def _hype_activity_topology(
+    activities,
+    account_id,
+    event,
+    *,
+    expected_opening_marker=None,
+    require_recovered=False,
+    ignore_other_after=None,
+):
     identities = [_stable_hype_activity(row, account_id) for row in activities]
-    opening = [row for row in identities if _opening_marker(row, event["event_id"])]
-    recovered = [row for row in identities if _event_activity_matches(row, event)]
+    classified = [
+        (
+            row,
+            _opening_marker(row, event["event_id"]),
+            _event_activity_matches(row, event),
+        )
+        for row in identities
+    ]
+    opening = [
+        row
+        for row, marker, _ in classified
+        if marker is not None
+        and (expected_opening_marker is None or marker == expected_opening_marker)
+    ]
+    recovered = [row for row, _, matches in classified if matches]
+    other = [
+        row
+        for row, marker, matches in classified
+        if not matches
+        and not (
+            marker is not None
+            and (
+                expected_opening_marker is None
+                or marker == expected_opening_marker
+            )
+        )
+    ]
+    other_is_invalid = bool(other)
+    if ignore_other_after is not None:
+        completed_at = _parse_timestamp(
+            ignore_other_after, "completed HYPE provenance"
+        )
+        other_is_invalid = any(
+            _parse_timestamp(row["date"], "unrelated HYPE activity")
+            <= completed_at
+            for row in other
+        )
+    recovered_is_invalid = (
+        len(recovered) != 1 if require_recovered else len(recovered) > 1
+    )
     if (
-        (not allow_other and len(opening) + len(recovered) != len(identities))
-        or len(opening) != 1 or len(recovered) > 1
+        other_is_invalid
+        or len(opening) != 1
+        or recovered_is_invalid
     ):
         raise RuntimeError("Ghostfolio HYPE recovery activity topology is ambiguous")
     return opening[0], recovered[0] if recovered else None
@@ -1834,7 +1881,12 @@ def _completed_reclassification_status(
     snapshot_hash = provenance["opening_snapshot_hash"]
     _require_hype_source_receipt(payload, snapshot_hash, original)
     opening, recovered = _hype_activity_topology(
-        ghostfolio_hype_activities(token, account_id), account_id, event, allow_other=True
+        ghostfolio_hype_activities(token, account_id),
+        account_id,
+        event,
+        expected_opening_marker=(snapshot_hash, True),
+        require_recovered=True,
+        ignore_other_after=provenance["completed_at"],
     )
     if (
         event["event_id"] not in event_receipts or event_receipt is None

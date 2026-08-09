@@ -20,6 +20,7 @@ SYNTHETIC_OPENING_HASH = "b" * 64
 SYNTHETIC_OPENING_QUANTITY = 1.25
 SYNTHETIC_EVENT_QUANTITY = 0.25
 SYNTHETIC_RESIDUAL_QUANTITY = 1.0
+SYNTHETIC_RECOVERY_COMPLETED_AT = "2026-08-07T08:30:00Z"
 
 
 def repository_environment():
@@ -267,6 +268,33 @@ def hype_recovery_payload():
     }
 
 
+def completed_hype_recovery_payload():
+    payload = hype_recovery_payload()
+    item = confirmed_hype_event()
+    payload["files"][ghostfolio_sync.RECEIPT_FILE] = {
+        "content": ghostfolio_sync.canonical({
+            "order_id": item["event_id"],
+            "event_hash": item["canonical_hash"],
+            "ghostfolio_activity_id": "hype-recovery-activity",
+            "imported_at": SYNTHETIC_RECOVERY_COMPLETED_AT,
+        }) + "\n"
+    }
+    payload["files"][ghostfolio_sync.PROVENANCE_RECLASSIFICATION_RECEIPT_FILE] = {
+        "content": ghostfolio_sync.canonical({
+            "version": 1,
+            "event_id": item["event_id"],
+            "event_hash": item["canonical_hash"],
+            "opening_snapshot_hash": SYNTHETIC_OPENING_HASH,
+            "opening_activity_id": "hype-opening-activity",
+            "original_quantity": "1.25",
+            "residual_quantity": "1",
+            "reclassified_quantity": "0.25",
+            "completed_at": SYNTHETIC_RECOVERY_COMPLETED_AT,
+        }) + "\n"
+    }
+    return payload
+
+
 REPORTING_CONTEXT = {"kraken_account_id": "kraken"}
 SNAPSHOT_NOW = datetime(2026, 8, 7, 4, 30, tzinfo=timezone.utc)
 
@@ -307,6 +335,31 @@ class GhostfolioSyncTests(unittest.TestCase):
         self._provenance_intent_patch.stop()
         self._intent_patch.stop()
         self._intent_directory.cleanup()
+
+    def _process_completed_hype_reclassification(self, activities, payload=None):
+        if payload is None:
+            payload = completed_hype_recovery_payload()
+        events = ghostfolio_sync.parse_events(
+            ghostfolio_sync.file_content(payload, ghostfolio_sync.EVENT_FILE)
+        )
+        receipts = ghostfolio_sync.parse_event_receipts(
+            ghostfolio_sync.file_content(payload, ghostfolio_sync.RECEIPT_FILE),
+            events,
+        )
+        with (
+            patch.dict(
+                ghostfolio_sync.os.environ,
+                {"GHOSTFOLIO_ACCOUNT_MAP": json.dumps({"HYPE_USD": "kraken"})},
+            ),
+            patch.object(
+                ghostfolio_sync,
+                "ghostfolio_hype_activities",
+                return_value=activities,
+            ),
+        ):
+            return ghostfolio_sync.process_hype_provenance_reclassification(
+                payload, events, receipts, "token", "kraken"
+            )
 
     def test_repository_snapshot_reads_every_artifact_at_one_commit(self):
         environment = repository_environment()
@@ -1187,6 +1240,133 @@ class GhostfolioSyncTests(unittest.TestCase):
                 )
             )
         self.assertEqual(completed_without_private_env["status"], "COMPLETE")
+
+    def test_completed_hype_reclassification_ignores_later_event_and_reconciliation(self):
+        payload = completed_hype_recovery_payload()
+        old_event = confirmed_hype_event()
+        later_event = {
+            **old_event,
+            "event_id": "OTEST2-CRYPTO-ORDER",
+            "crypto_order_id": "OTEST2-CRYPTO-ORDER",
+            "funding_order_id": "OTEST2-FUNDING-ORDER",
+            "occurred_at": "2026-08-08T06:02:03Z",
+        }
+        resign_event(later_event)
+        payload["files"][ghostfolio_sync.EVENT_FILE]["content"] += (
+            ghostfolio_sync.canonical(later_event) + "\n"
+        )
+        later_activity = {
+            **hype_event_activity(later_event),
+            "id": "hype-later-event-activity",
+        }
+        later_receipt = {
+            "order_id": later_event["event_id"],
+            "event_hash": later_event["canonical_hash"],
+            "ghostfolio_activity_id": later_activity["id"],
+            "imported_at": "2026-08-08T06:03:00Z",
+        }
+        payload["files"][ghostfolio_sync.RECEIPT_FILE]["content"] += (
+            ghostfolio_sync.canonical(later_receipt) + "\n"
+        )
+        rounding_reconciliation = {
+            **hype_opening_activity(),
+            "id": "hype-rounding-reconciliation",
+            "comment": (
+                "Kraken opening-balance reconciliation; "
+                f"snapshot={'c' * 64}; target=HYPE_USD"
+            ),
+            "date": "2026-08-08T06:04:00Z",
+            "quantity": 0.00000001,
+        }
+
+        result = self._process_completed_hype_reclassification(
+            [
+                hype_opening_activity(residual=True),
+                hype_event_activity(old_event),
+                later_activity,
+                rounding_reconciliation,
+            ],
+            payload,
+        )
+
+        self.assertEqual(result["status"], "COMPLETE")
+        self.assertFalse(result["clear_intent_after_state"])
+
+    def test_completed_hype_reclassification_rejects_duplicate_exact_evidence(self):
+        old_event = confirmed_hype_event()
+        residual = hype_opening_activity(residual=True)
+        recovered = hype_event_activity(old_event)
+        cases = {
+            "residual": [
+                residual,
+                {**residual, "id": "duplicate-hype-residual"},
+                recovered,
+            ],
+            "recovered": [
+                residual,
+                recovered,
+                {**recovered, "id": "duplicate-hype-recovered"},
+            ],
+        }
+        for label, activities in cases.items():
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(RuntimeError, "topology is ambiguous"),
+            ):
+                self._process_completed_hype_reclassification(activities)
+
+    def test_completed_hype_reclassification_rejects_unrelated_activity_at_or_before_completion(self):
+        old_event = confirmed_hype_event()
+        unrelated = {
+            **hype_event_activity({
+                **old_event,
+                "event_id": "OTEST2-CRYPTO-ORDER",
+                "crypto_order_id": "OTEST2-CRYPTO-ORDER",
+                "funding_order_id": "OTEST2-FUNDING-ORDER",
+            }),
+            "id": "unrelated-hype-activity",
+        }
+        for activity_date in (
+            "2026-08-07T08:29:59Z",
+            SYNTHETIC_RECOVERY_COMPLETED_AT,
+        ):
+            with (
+                self.subTest(activity_date=activity_date),
+                self.assertRaisesRegex(RuntimeError, "topology is ambiguous"),
+            ):
+                self._process_completed_hype_reclassification([
+                    hype_opening_activity(residual=True),
+                    hype_event_activity(old_event),
+                    {**unrelated, "date": activity_date},
+                ])
+
+    def test_completed_hype_reclassification_rejects_missing_or_malformed_activity_dates(self):
+        old_event = confirmed_hype_event()
+        unrelated = {
+            **hype_event_activity({
+                **old_event,
+                "event_id": "OTEST2-CRYPTO-ORDER",
+                "crypto_order_id": "OTEST2-CRYPTO-ORDER",
+                "funding_order_id": "OTEST2-FUNDING-ORDER",
+            }),
+            "id": "unrelated-hype-activity",
+        }
+        cases = {
+            "missing": {
+                key: value for key, value in unrelated.items() if key != "date"
+            },
+            "malformed": {**unrelated, "date": "not-a-timestamp"},
+        }
+        for label, activity in cases.items():
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(RuntimeError, "has no valid ISO timestamp"),
+            ):
+                self._process_completed_hype_reclassification([
+                    hype_opening_activity(residual=True),
+                    hype_event_activity(old_event),
+                    activity,
+                ])
 
     def test_residual_opening_update_uses_exact_put_contract(self):
         item = confirmed_hype_event()
