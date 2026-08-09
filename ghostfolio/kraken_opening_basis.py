@@ -262,15 +262,26 @@ def _api_result(response, label: str) -> dict:
 
 
 def _integer_setting(value, label: str) -> int:
-    if isinstance(value, bool):
+    if type(value) is int:
+        parsed = value
+    elif isinstance(value, str) and re.fullmatch(r"(?:0|[1-9]\d*)", value):
+        try:
+            parsed = int(value)
+        except ValueError as error:
+            raise OpeningBasisError(f"Kraken {label} is invalid") from error
+    else:
         raise OpeningBasisError(f"Kraken {label} is invalid")
-    try:
-        parsed = int(str(value))
-    except (TypeError, ValueError) as error:
-        raise OpeningBasisError(f"Kraken {label} is invalid") from error
-    if parsed < 0 or str(value).strip() not in {str(parsed), f"{parsed}.0"}:
+    if parsed < 0:
         raise OpeningBasisError(f"Kraken {label} is invalid")
     return parsed
+
+
+def _api_integer_setting(result: dict, key: str, label: str) -> int:
+    """Map Kraken's present-null "not set" value to zero, but reject omission."""
+    if key not in result:
+        raise OpeningBasisError(f"Kraken {label} is missing")
+    value = result[key]
+    return 0 if value is None else _integer_setting(value, label)
 
 
 def _required_identifier(value, label: str) -> str:
@@ -380,9 +391,9 @@ def ensure_history_permissions(exchange, *, cutover_at: str, generated_at: str) 
 
     cutover_seconds = epoch_decimal(utc_timestamp(cutover_at, "cutover"))
     generated_seconds = epoch_decimal(utc_timestamp(generated_at, "generated_at"))
-    query_from = _integer_setting(result.get("queryFrom"), "API-key queryFrom")
-    query_to = _integer_setting(result.get("queryTo"), "API-key queryTo")
-    valid_until = _integer_setting(result.get("validUntil"), "API-key validUntil")
+    query_from = _api_integer_setting(result, "queryFrom", "API-key queryFrom")
+    query_to = _api_integer_setting(result, "queryTo", "API-key queryTo")
+    valid_until = _api_integer_setting(result, "validUntil", "API-key validUntil")
     if query_from != 0:
         raise OpeningBasisError("Kraken API key cannot prove unrestricted history start")
     if query_to != 0 and Decimal(query_to) < cutover_seconds:
