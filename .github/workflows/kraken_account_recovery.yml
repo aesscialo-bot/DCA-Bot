@@ -1,0 +1,97 @@
+name: Kraken Reviewed Account Recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Publish source evidence first, then its compact recovery
+        required: true
+        default: source
+        type: choice
+        options:
+          - source
+          - recovery
+      mode:
+        description: Preview and review the canonical hash before publish
+        required: true
+        default: preview
+        type: choice
+        options:
+          - preview
+          - publish
+      generated_at:
+        description: Fixed UTC timestamp reused by source and recovery stages
+        required: true
+        type: string
+      expected_canonical_hash:
+        description: Required for publish; copy the exact reviewed preview hash
+        required: false
+        type: string
+      source_commit_sha:
+        description: Recovery stage pins the exact published source commit
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dca-execution-state-writers
+  cancel-in-progress: false
+
+jobs:
+  account-recovery:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Load protected execution state
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          state="$(gh variable get DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY")"
+          while IFS= read -r line; do
+            [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+          done <<< "$state"
+          delimiter="DCA_RECOVERY_${GITHUB_RUN_ID}_${RANDOM}"
+          printf 'DCA_EXECUTION_STATE<<%s\n%s\n%s\n' "$delimiter" "$state" "$delimiter" >> "$GITHUB_ENV"
+      - name: Build or publish reviewed account recovery
+        env:
+          KRAKEN_API_KEY: ${{ inputs.stage == 'source' && secrets.KRAKEN_API_KEY || '' }}
+          KRAKEN_API_SECRET: ${{ inputs.stage == 'source' && secrets.KRAKEN_API_SECRET || '' }}
+          DCA_OUTBOX_REPOSITORY_OWNER: ${{ vars.DCA_OUTBOX_REPOSITORY_OWNER }}
+          DCA_OUTBOX_REPOSITORY_NAME: ${{ vars.DCA_OUTBOX_REPOSITORY_NAME }}
+          DCA_OUTBOX_REPOSITORY_BRANCH: ${{ vars.DCA_OUTBOX_REPOSITORY_BRANCH }}
+          DCA_OUTBOX_AUDIT_PATH: ${{ vars.DCA_OUTBOX_AUDIT_PATH }}
+          DCA_OUTBOX_EVENT_PATH: ${{ vars.DCA_OUTBOX_EVENT_PATH }}
+          DCA_OUTBOX_HOLDINGS_PATH: ${{ vars.DCA_OUTBOX_HOLDINGS_PATH }}
+          DCA_OUTBOX_OPENING_BASIS_SOURCE_PATH: ${{ vars.DCA_OUTBOX_OPENING_BASIS_SOURCE_PATH }}
+          DCA_OUTBOX_OPENING_BASIS_PATH: ${{ vars.DCA_OUTBOX_OPENING_BASIS_PATH }}
+          DCA_OUTBOX_ACCOUNT_ACTIVITY_SOURCE_PATH: ${{ vars.DCA_OUTBOX_ACCOUNT_ACTIVITY_SOURCE_PATH }}
+          DCA_OUTBOX_ACCOUNT_RECOVERY_PATH: ${{ vars.DCA_OUTBOX_ACCOUNT_RECOVERY_PATH }}
+          DCA_OUTBOX_REPOSITORY_TOKEN: ${{ secrets.DCA_OUTBOX_REPOSITORY_TOKEN }}
+          RECOVERY_STAGE: ${{ inputs.stage }}
+          RECOVERY_MODE: ${{ inputs.mode }}
+          RECOVERY_GENERATED_AT: ${{ inputs.generated_at }}
+          RECOVERY_EXPECTED_HASH: ${{ inputs.expected_canonical_hash }}
+          RECOVERY_SOURCE_COMMIT: ${{ inputs.source_commit_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--stage "$RECOVERY_STAGE" --mode "$RECOVERY_MODE" --generated-at "$RECOVERY_GENERATED_AT")
+          if [ -n "$RECOVERY_EXPECTED_HASH" ]; then
+            args+=(--expected-canonical-hash "$RECOVERY_EXPECTED_HASH")
+          fi
+          if [ -n "$RECOVERY_SOURCE_COMMIT" ]; then
+            args+=(--source-commit-sha "$RECOVERY_SOURCE_COMMIT")
+          fi
+          python -u -m ghostfolio.kraken_account_recovery "${args[@]}"

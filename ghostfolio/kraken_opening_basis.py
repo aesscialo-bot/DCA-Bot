@@ -894,6 +894,7 @@ _PAIR_ALIASES = {
     "BTCUSD": ("BTC_GBP", "USD"), "XBTUSD": ("BTC_GBP", "USD"),
     "XXBTZUSD": ("BTC_GBP", "USD"),
     "HYPEUSD": ("HYPE_USD", "USD"), "HYPEZUSD": ("HYPE_USD", "USD"),
+    "HYPEGBP": ("HYPE_USD", "GBP"), "HYPEZGBP": ("HYPE_USD", "GBP"),
     "SOLGBP": ("SOL_GBP", "GBP"), "SOLZGBP": ("SOL_GBP", "GBP"),
     "SOLUSD": ("SOL_GBP", "USD"), "SOLZUSD": ("SOL_GBP", "USD"),
 }
@@ -981,7 +982,7 @@ def _ledger_rows(group: list[dict], ledger_by_id: dict[str, dict]) -> tuple[list
         raise OpeningBasisError("Kraken trade references missing ledger evidence") from error
     if any(
         str(row.get("type") or "").lower() != "trade"
-        or row.get("subtype") is not None
+        or row.get("subtype") not in {None, "tradespot"}
         for row in rows
     ):
         raise OpeningBasisError("Kraken trade references non-trade ledger evidence")

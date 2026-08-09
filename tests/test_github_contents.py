@@ -320,6 +320,31 @@ class GitHubContentsTests(unittest.TestCase):
             ):
                 github_contents.configured_outbox_paths()
 
+    def test_reviewed_recovery_paths_are_distinct_from_every_artifact(self):
+        environment = {
+            github_contents.AUDIT_PATH_ENV: "outbox/audit.md",
+            github_contents.EVENT_PATH_ENV: "outbox/events.jsonl",
+            github_contents.HOLDINGS_PATH_ENV: "outbox/holdings.json",
+            github_contents.OPENING_BASIS_PATH_ENV: "outbox/opening.json",
+            github_contents.OPENING_BASIS_SOURCE_PATH_ENV: "outbox/opening-source.json",
+            github_contents.ACCOUNT_ACTIVITY_SOURCE_PATH_ENV: "outbox/activity-source.json",
+            github_contents.ACCOUNT_RECOVERY_PATH_ENV: "outbox/recovery.json",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(
+                github_contents.configured_account_activity_source_path(),
+                "outbox/activity-source.json",
+            )
+            self.assertEqual(
+                github_contents.configured_account_recovery_path(),
+                "outbox/recovery.json",
+            )
+        environment[github_contents.ACCOUNT_RECOVERY_PATH_ENV] = "outbox/events.jsonl"
+        with patch.dict(os.environ, environment, clear=True), self.assertRaisesRegex(
+            github_contents.GitHubContentsConfigError, "must be distinct"
+        ):
+            github_contents.configured_account_recovery_path()
+
     def test_destination_cannot_be_the_actions_source_repository(self):
         environment = {
             github_contents.OWNER_ENV: "example",
