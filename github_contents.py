@@ -27,6 +27,8 @@ EVENT_PATH_ENV = "DCA_OUTBOX_EVENT_PATH"
 HOLDINGS_PATH_ENV = "DCA_OUTBOX_HOLDINGS_PATH"
 OPENING_BASIS_PATH_ENV = "DCA_OUTBOX_OPENING_BASIS_PATH"
 OPENING_BASIS_SOURCE_PATH_ENV = "DCA_OUTBOX_OPENING_BASIS_SOURCE_PATH"
+ACCOUNT_ACTIVITY_SOURCE_PATH_ENV = "DCA_OUTBOX_ACCOUNT_ACTIVITY_SOURCE_PATH"
+ACCOUNT_RECOVERY_PATH_ENV = "DCA_OUTBOX_ACCOUNT_RECOVERY_PATH"
 
 API_ROOT = "https://api.github.com"
 API_VERSION = "2022-11-28"
@@ -135,6 +137,39 @@ def configured_opening_basis_source_path() -> str:
     if path in {existing.audit, existing.event, existing.holdings, basis}:
         raise GitHubContentsConfigError(
             "opening-basis source path must be distinct from existing outbox artifacts"
+        )
+    return path
+
+
+def configured_account_activity_source_path() -> str:
+    """Return the distinct immutable source path for reviewed account activity."""
+    path = configured_path(ACCOUNT_ACTIVITY_SOURCE_PATH_ENV)
+    existing = configured_outbox_paths()
+    opening_basis = configured_opening_basis_path()
+    opening_source = configured_opening_basis_source_path()
+    if path in {
+        existing.audit, existing.event, existing.holdings,
+        opening_basis, opening_source,
+    }:
+        raise GitHubContentsConfigError(
+            "account-activity source path must be distinct from existing outbox artifacts"
+        )
+    return path
+
+
+def configured_account_recovery_path() -> str:
+    """Return the distinct compact reviewed account-recovery artifact path."""
+    path = configured_path(ACCOUNT_RECOVERY_PATH_ENV)
+    existing = configured_outbox_paths()
+    opening_basis = configured_opening_basis_path()
+    opening_source = configured_opening_basis_source_path()
+    activity_source = configured_account_activity_source_path()
+    if path in {
+        existing.audit, existing.event, existing.holdings,
+        opening_basis, opening_source, activity_source,
+    }:
+        raise GitHubContentsConfigError(
+            "account-recovery path must be distinct from existing outbox artifacts"
         )
     return path
 

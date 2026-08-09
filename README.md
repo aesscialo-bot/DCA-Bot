@@ -218,6 +218,10 @@ Required repository variables:
   `kraken_opening_basis_source_v1.json`)
 - `DCA_OUTBOX_OPENING_BASIS_PATH` (must end in
   `kraken_opening_basis_v1.json`)
+- `DCA_OUTBOX_ACCOUNT_ACTIVITY_SOURCE_PATH` (must end in
+  `kraken_account_activity_source_v1.json`)
+- `DCA_OUTBOX_ACCOUNT_RECOVERY_PATH` (must end in
+  `kraken_account_recovery_v1.json`)
 
 `DCA_OPENING_BASIS_FUNDING_LINKS_JSON` is optional. The producer normally
 infers each historical GBP/USD leg from the target/date deterministic Kraken
@@ -495,6 +499,38 @@ movement, and no unexplained post-buy USD balance. A sale, deposit, transfer,
 reward, adjustment, missing ledger, ambiguous funding route, or quantity gap
 leaves only that affected position `missing`; known partial acquisitions remain
 auditable but do not create a cost overlay.
+
+### Reviewed post-cutover account recovery
+
+The one-time `Kraken Reviewed Account Recovery` workflow corrects an opening
+classification only when authenticated Kraken activity occurred after the
+fixed cutover but before the first canonical DCA event. It is deliberately a
+new versioned contract; it never rewrites PortfolioEventV3, the already-
+published opening source, or a consumer database. Its Kraken surface is read-
+only: API-key metadata, closed trades, ledgers, and closed-order lookup.
+
+This incident's seam is strictly after `2026-08-06T04:21:00.000Z` through
+`2026-08-07T03:31:59.999999Z`. The producer derives the true cutover position
+from the unrestricted, commit-pinned opening source, then emits each manual GBP
+buy and asset debit with stable Kraken identities. A withdrawal's principal and
+asset fee remain separate evidence fields, while `quantity` is their total
+balance debit so a moving-average consumer carries the correct cost out.
+
+A direct buy requires exact linked trade ledgers and a closed order. Kraken can
+omit a spot trade from TradesHistory while retaining both authenticated ledger
+legs; the only supported ledger-only form is an exact two-row `tradespot` pair
+with one positive target leg and one negative GBP leg sharing a unique reference
+and timestamp. Extra legs, an unknown pair, funding or sell trade, target reward,
+deposit, transfer, or any unclassified target movement rejects the whole compact
+artifact.
+
+Run `source / preview`, review the count and hash, then `source / publish` with
+the same timestamp and reviewed hash. Record the resulting repository commit.
+Run `recovery / preview` pinned to that commit and verify the true opening hash,
+the six activity summaries, and the bound ending hash before `recovery /
+publish`. Both paths are write-once. The compact build must prove that the true
+BTC-only opening plus every seam movement exactly reaches the separately bound
+pre-DCA state; it cannot use ticker prices, rounded exports, or manual values.
 
 The consumer resolves the private repository branch once per poll and pins
 events, holdings, and all receipt ledgers to that immutable commit.

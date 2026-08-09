@@ -734,6 +734,32 @@ class KrakenOpeningBasisTests(unittest.TestCase):
         self.assertEqual(position["coverage"], "complete")
         self.assertIsNone(position["acquisitions"][0]["client_order_id"])
 
+    def test_spot_trade_subtype_is_equivalent_to_legacy_null_subtype(self):
+        trades, ledgers, orders = direct_fixture()
+        spot_ledgers = evidence([
+            {**row, "subtype": "tradespot"} for row in ledgers.records
+        ])
+
+        position = build(
+            opening(BTC_GBP="0.099"), (trades, spot_ledgers, orders)
+        )["positions"]["BTC_GBP"]
+
+        self.assertEqual(position["coverage"], "complete")
+        self.assertEqual(position["cost_basis_gbp"], "5.1")
+
+    def test_non_spot_trade_subtype_remains_unlinked(self):
+        trades, ledgers, orders = direct_fixture()
+        unsupported = evidence([
+            {**row, "subtype": "staking"} for row in ledgers.records
+        ])
+
+        position = build(
+            opening(BTC_GBP="0.099"), (trades, unsupported, orders)
+        )["positions"]["BTC_GBP"]
+
+        self.assertEqual(position["coverage"], "missing")
+        self.assertEqual(position["acquisitions"], [])
+
     def test_base_fee_consuming_the_full_acquisition_can_never_be_complete(self):
         trades, ledgers, orders = direct_fixture()
         rows = [dict(row) for row in ledgers.records]

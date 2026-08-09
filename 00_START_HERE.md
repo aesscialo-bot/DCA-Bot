@@ -414,6 +414,27 @@ USD funding that cannot be conserved from zero cash, and opening-quantity gaps
 remain visibly `missing`. Do not fill those gaps with a current price or a
 manually estimated exchange rate.
 
+If the basis preview reveals that holdings-minus-events classified real
+post-cutover Kraken activity as opening quantity, do **not** publish that basis.
+Use the manual `Kraken Reviewed Account Recovery` workflow instead:
+
+1. Configure the distinct write-once paths ending in
+   `kraken_account_activity_source_v1.json` and
+   `kraken_account_recovery_v1.json`.
+2. Run `source / preview` with a fixed UTC `generated_at`. Review the exact
+   trade, ledger, and order counts, then publish only the identical hash.
+3. Record the published source commit. Run `recovery / preview` with that
+   commit and the same timestamp.
+4. Confirm the true-opening state hash, every summarized `buy` / `asset_out`
+   row, and the reviewed ending-state hash. Publish only those identical bytes.
+
+The reviewed seam is `(2026-08-06T04:21:00.000Z,
+2026-08-07T03:31:59.999999Z]`, before the first canonical DCA event. The
+producer makes no trading call. It accepts only completely linked direct-GBP
+buys, exact paired `tradespot` ledger buys, and exact target withdrawals. An
+asset-out quantity includes withdrawal principal plus its asset fee so the
+consumer's remaining quantity and pro-rata performance cost stay aligned.
+
 The Railway Discord controller reads the exact event ledger and Ghostfolio
 event-receipt path from one resolved immutable commit. A dedicated
 `DCA_OUTBOX_REPOSITORY_TOKEN` with Contents read access takes precedence; until
