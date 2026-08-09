@@ -284,6 +284,23 @@ def _api_integer_setting(result: dict, key: str, label: str) -> int:
     return 0 if value is None else _integer_setting(value, label)
 
 
+def _api_history_bounds(result: dict) -> tuple[int, int, int]:
+    """Normalize Kraken's bounds only when their group is complete or absent."""
+    fields = (
+        ("queryFrom", "API-key queryFrom"),
+        ("queryTo", "API-key queryTo"),
+        ("validUntil", "API-key validUntil"),
+    )
+    present = [key in result for key, _label in fields]
+    if not any(present):
+        return 0, 0, 0
+    if not all(present):
+        raise OpeningBasisError("Kraken API-key history bounds are incomplete")
+    return tuple(
+        _api_integer_setting(result, key, label) for key, label in fields
+    )
+
+
 def _required_identifier(value, label: str) -> str:
     if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
         raise OpeningBasisError(f"Kraken {label} is invalid")
@@ -391,9 +408,7 @@ def ensure_history_permissions(exchange, *, cutover_at: str, generated_at: str) 
 
     cutover_seconds = epoch_decimal(utc_timestamp(cutover_at, "cutover"))
     generated_seconds = epoch_decimal(utc_timestamp(generated_at, "generated_at"))
-    query_from = _api_integer_setting(result, "queryFrom", "API-key queryFrom")
-    query_to = _api_integer_setting(result, "queryTo", "API-key queryTo")
-    valid_until = _api_integer_setting(result, "validUntil", "API-key validUntil")
+    query_from, query_to, valid_until = _api_history_bounds(result)
     if query_from != 0:
         raise OpeningBasisError("Kraken API key cannot prove unrestricted history start")
     if query_to != 0 and Decimal(query_to) < cutover_seconds:

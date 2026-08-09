@@ -503,12 +503,32 @@ class KrakenOpeningBasisTests(unittest.TestCase):
                     "0", str(cutover), str(generated)
                 ))
 
-    def test_api_key_missing_bounds_are_not_treated_as_unrestricted(self):
+    def test_api_key_all_omitted_bounds_are_jointly_unrestricted(self):
+        exchange = ApiInfoExchange()
         for field in ("queryFrom", "queryTo", "validUntil"):
-            exchange = ApiInfoExchange()
             exchange.result.pop(field)
-            with self.subTest(field=field), self.assertRaisesRegex(
-                basis.OpeningBasisError, rf"{field} is missing"
+        self.assertEqual(
+            basis.ensure_history_permissions(
+                exchange,
+                cutover_at=basis.CUTOVER_AT,
+                generated_at="2026-08-08T00:00:00Z",
+            ),
+            basis.AccessEvidence("0", "0", "0"),
+        )
+
+    def test_api_key_partially_present_bounds_are_incomplete(self):
+        fields = ("queryFrom", "queryTo", "validUntil")
+        for presence_bitmap in range(1, (1 << len(fields)) - 1):
+            exchange = ApiInfoExchange()
+            present = {
+                field
+                for index, field in enumerate(fields)
+                if presence_bitmap & (1 << index)
+            }
+            for field in set(fields).difference(present):
+                exchange.result.pop(field)
+            with self.subTest(present=sorted(present)), self.assertRaisesRegex(
+                basis.OpeningBasisError, "history bounds are incomplete"
             ):
                 basis.ensure_history_permissions(
                     exchange,
