@@ -430,17 +430,19 @@ def _fetch_pages(exchange, *, method_name: str, container: str, end: int, exact_
     page_manifest = []
     while expected_count is None or offset < expected_count:
         params = {"start": 0, "end": end, "ofs": offset}
+        # CCXT's Kraken signer passes these through urlencode_nested, which
+        # renders Python bools as True/False; Kraken requires lowercase values.
         if container == "trades":
             params.update({
                 "limit": page_size,
                 "type": "all",
-                "trades": False,
-                "without_count": False,
-                "consolidate_taker": False,
-                "ledgers": True,
+                "trades": "false",
+                "without_count": "false",
+                "consolidate_taker": "false",
+                "ledgers": "true",
             })
         else:
-            params.update({"type": "all", "without_count": False})
+            params.update({"type": "all", "without_count": "false"})
         try:
             result = _api_result(method(params), container)
         except OpeningBasisError:
@@ -505,7 +507,9 @@ def _fetch_orders(exchange, trades: HistoryEvidence) -> HistoryEvidence:
     for index in range(0, len(order_ids), 50):
         batch = order_ids[index:index + 50]
         try:
-            result = _api_result(method({"txid": ",".join(batch), "trades": False}), "orders")
+            result = _api_result(
+                method({"txid": ",".join(batch), "trades": "false"}), "orders"
+            )
         except OpeningBasisError:
             raise
         except Exception as error:

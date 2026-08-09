@@ -551,6 +551,67 @@ class KrakenOpeningBasisTests(unittest.TestCase):
                         generated_at="2026-08-08T00:00:00Z",
                     )
 
+    def test_ccxt_private_requests_use_lowercase_boolean_wire_strings(self):
+        class Exchange(ApiInfoExchange):
+            def __init__(self):
+                super().__init__()
+                self.calls = {}
+
+            def privatePostTradesHistory(self, params):
+                self.calls["trades"] = dict(params)
+                return {"error": [], "result": {"count": 1, "trades": {
+                    "T1": {
+                        "ordertxid": "O1", "pair": "BTCGBP", "time": TRADE_TIME,
+                        "type": "buy", "vol": "0.1", "cost": "5",
+                        "ledgers": ["L1"],
+                    }
+                }}}
+
+            def privatePostLedgers(self, params):
+                self.calls["ledgers"] = dict(params)
+                return {"error": [], "result": {"count": 1, "ledger": {
+                    "L1": {
+                        "refid": "T1", "time": TRADE_TIME, "type": "trade",
+                        "subtype": None, "asset": "BTC", "amount": "0.1",
+                        "fee": "0", "balance": "0.1",
+                    }
+                }}}
+
+            def privatePostQueryOrders(self, params):
+                self.calls["orders"] = dict(params)
+                return {"error": [], "result": {
+                    "O1": order("O1", "BTC_GBP", "GBP"),
+                }}
+
+        exchange = Exchange()
+        _, trades, ledgers, orders = basis.fetch_kraken_history(
+            exchange, generated_at="2026-08-08T00:00:00Z"
+        )
+        end = int(CUTOVER_SECONDS)
+        self.assertEqual(exchange.calls, {
+            "trades": {
+                "start": 0, "end": end, "ofs": 0, "limit": 100,
+                "type": "all", "trades": "false", "without_count": "false",
+                "consolidate_taker": "false", "ledgers": "true",
+            },
+            "ledgers": {
+                "start": 0, "end": end, "ofs": 0, "type": "all",
+                "without_count": "false",
+            },
+            "orders": {"txid": "O1", "trades": "false"},
+        })
+
+        source = basis.build_source_artifact(
+            basis.AccessEvidence("0", "0", "0"), trades, ledgers, orders,
+            generated_at="2026-08-08T00:00:00Z", producer_commit="a" * 40,
+        )
+        self.assertIs(source["requests"]["trades"]["trades"], False)
+        self.assertIs(source["requests"]["trades"]["without_count"], False)
+        self.assertIs(source["requests"]["trades"]["consolidate_taker"], False)
+        self.assertIs(source["requests"]["trades"]["ledgers"], True)
+        self.assertIs(source["requests"]["ledgers"]["without_count"], False)
+        self.assertIs(source["requests"]["orders"]["trades"], False)
+
     def test_exact_cutover_rejects_one_microsecond_after(self):
         class Exchange:
             def __init__(self, time):
