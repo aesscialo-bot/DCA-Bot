@@ -474,6 +474,63 @@ class KrakenOpeningBasisTests(unittest.TestCase):
                         generated_at="2026-08-08T00:00:00Z",
                     )
 
+    def test_api_key_null_bounds_are_present_unrestricted_defaults(self):
+        for field in ("queryFrom", "queryTo", "validUntil"):
+            with self.subTest(field=field):
+                access = basis.ensure_history_permissions(
+                    ApiInfoExchange(**{field: None}),
+                    cutover_at=basis.CUTOVER_AT,
+                    generated_at="2026-08-08T00:00:00Z",
+                )
+                self.assertEqual(access, basis.AccessEvidence("0", "0", "0"))
+
+        cutover = int(CUTOVER_SECONDS)
+        generated = int(basis.epoch_decimal(basis.utc_timestamp(
+            "2026-08-08T00:00:00Z", "generated_at"
+        )))
+        for transform in (lambda value: value, str):
+            with self.subTest(representation=transform.__name__):
+                access = basis.ensure_history_permissions(
+                    ApiInfoExchange(
+                        queryFrom=transform(0),
+                        queryTo=transform(cutover),
+                        validUntil=transform(generated),
+                    ),
+                    cutover_at=basis.CUTOVER_AT,
+                    generated_at="2026-08-08T00:00:00Z",
+                )
+                self.assertEqual(access, basis.AccessEvidence(
+                    "0", str(cutover), str(generated)
+                ))
+
+    def test_api_key_missing_bounds_are_not_treated_as_unrestricted(self):
+        for field in ("queryFrom", "queryTo", "validUntil"):
+            exchange = ApiInfoExchange()
+            exchange.result.pop(field)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                basis.OpeningBasisError, rf"{field} is missing"
+            ):
+                basis.ensure_history_permissions(
+                    exchange,
+                    cutover_at=basis.CUTOVER_AT,
+                    generated_at="2026-08-08T00:00:00Z",
+                )
+
+    def test_api_key_bounds_reject_noncanonical_or_noninteger_values(self):
+        malformed = (
+            True, False, "None", -1, "-1", 0.5, "0.5", 0.0, "0.0", "00", " 0"
+        )
+        for field in ("queryFrom", "queryTo", "validUntil"):
+            for value in malformed:
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                    basis.OpeningBasisError, rf"{field} is invalid"
+                ):
+                    basis.ensure_history_permissions(
+                        ApiInfoExchange(**{field: value}),
+                        cutover_at=basis.CUTOVER_AT,
+                        generated_at="2026-08-08T00:00:00Z",
+                    )
+
     def test_exact_cutover_rejects_one_microsecond_after(self):
         class Exchange:
             def __init__(self, time):
@@ -561,6 +618,19 @@ class KrakenOpeningBasisTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(basis.OpeningBasisError, "page hash"):
             basis.parse_source_artifact(json.dumps(tampered))
+
+        for field in ("query_from", "query_to", "key_valid_until"):
+            persisted_null = json.loads(json.dumps(source))
+            persisted_null["access"][field] = None
+            persisted_null["canonical_hash"] = basis.canonical_hash({
+                key: value
+                for key, value in persisted_null.items()
+                if key != "canonical_hash"
+            })
+            with self.subTest(field=field), self.assertRaisesRegex(
+                basis.OpeningBasisError, rf"{field} is invalid"
+            ):
+                basis.parse_source_artifact(json.dumps(persisted_null))
 
     def test_direct_gbp_basis_counts_quote_fee_and_never_double_counts_base_fee(self):
         artifact = build(opening(BTC_GBP="0.099"), direct_fixture())
