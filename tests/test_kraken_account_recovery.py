@@ -61,17 +61,17 @@ def opening_history():
 
 def activity_history(
     *, extra_hype_leg=False, unsupported=False, unknown_trade=False,
-    orphan_trade_ledger=False,
+    orphan_trade_ledger=False, trade_backed_hype=False,
 ):
     trade_rows = [
         {
             "id": "T-SOL", "ordertxid": "O-SOL", "pair": "SOLGBP",
-            "time": SOL_BUY_TIME, "type": "buy", "vol": "0.06000042",
+            "time": SOL_BUY_TIME, "type": "buy", "vol": "0.06",
             "cost": "3.237", "ledgers": ["L-SOL", "L-SOL-GBP"],
         },
         {
             "id": "T-BTC", "ordertxid": "O-BTC", "pair": "BTCGBP",
-            "time": BTC_BUY_TIME, "type": "buy", "vol": "0.0002091122",
+            "time": BTC_BUY_TIME, "type": "buy", "vol": "0.00020911",
             "cost": "10.00048", "ledgers": ["L-BTC", "L-BTC-GBP"],
         },
     ]
@@ -79,7 +79,7 @@ def activity_history(
         {
             "id": "L-HYPE-1", "refid": "T-HYPE-1", "time": HYPE_ONE_TIME,
             "type": "trade", "subtype": "tradespot", "asset": "HYPE",
-            "amount": "0.1000002", "fee": "0", "balance": "0.1000002",
+            "amount": "0.1", "fee": "0", "balance": "0.1",
         },
         {
             "id": "L-HYPE-1-GBP", "refid": "T-HYPE-1", "time": HYPE_ONE_TIME,
@@ -89,7 +89,7 @@ def activity_history(
         {
             "id": "L-HYPE-2", "refid": "T-HYPE-2", "time": HYPE_TWO_TIME,
             "type": "trade", "subtype": "tradespot", "asset": "HYPE",
-            "amount": "0.1000002", "fee": "0", "balance": "0.2000004",
+            "amount": "0.1", "fee": "0", "balance": "0.2",
         },
         {
             "id": "L-HYPE-2-GBP", "refid": "T-HYPE-2", "time": HYPE_TWO_TIME,
@@ -99,7 +99,7 @@ def activity_history(
         {
             "id": "L-SOL", "refid": "T-SOL", "time": SOL_BUY_TIME,
             "type": "trade", "subtype": "tradespot", "asset": "SOL",
-            "amount": "0.06000042", "fee": "0", "balance": "0.06000042",
+            "amount": "0.06", "fee": "0", "balance": "0.06",
         },
         {
             "id": "L-SOL-GBP", "refid": "T-SOL", "time": SOL_BUY_TIME,
@@ -109,12 +109,12 @@ def activity_history(
         {
             "id": "L-SOL-OUT", "refid": "W-SOL", "time": SOL_OUT_TIME,
             "type": "withdrawal", "subtype": None, "asset": "SOL",
-            "amount": "-0.006", "fee": "0.005", "balance": "0.04900042",
+            "amount": "-0.006", "fee": "0.005", "balance": "0.049",
         },
         {
             "id": "L-BTC", "refid": "T-BTC", "time": BTC_BUY_TIME,
             "type": "trade", "subtype": "tradespot", "asset": "BTC",
-            "amount": "0.0002091122", "fee": "0", "balance": "0.0003125522",
+            "amount": "0.00020911", "fee": "0", "balance": "0.00031255",
         },
         {
             "id": "L-BTC-GBP", "refid": "T-BTC", "time": BTC_BUY_TIME,
@@ -124,9 +124,104 @@ def activity_history(
         {
             "id": "L-BTC-OUT", "refid": "W-BTC", "time": BTC_OUT_TIME,
             "type": "withdrawal", "subtype": None, "asset": "BTC",
-            "amount": "-0.000203", "fee": "0.000015", "balance": "0.0000945522",
+            "amount": "-0.000203", "fee": "0.000015", "balance": "0.00009455",
         },
     ]
+    if trade_backed_hype:
+        trade_rows = [
+            {
+                "id": "STCVZJC-FQNIU-T7L7JX",
+                "ordertxid": "SO36H3U-GZ2ZM-DC2CB2", "pair": "HYPEGBP",
+                "time": "1786063662.372044", "type": "buy", "vol": "0.1",
+                "cost": "4.14782",
+                "ledgers": ["LBOK3F-ANOR3-ZE6PTN", "LSQWFW-SWUEE-4TCZZ5"],
+            },
+            {
+                "id": "STYG24C-2VS7E-2RGWY7",
+                "ordertxid": "SO6TZCL-7IUEP-HB7QOO", "pair": "HYPEGBP",
+                "time": "1786063658.957186", "type": "buy", "vol": "0.1",
+                "cost": "4.1486",
+                "ledgers": ["LHNZF4-DXXWG-R5XVEB", "LWYZJB-WL54T-KKIZZW"],
+            },
+            {
+                "id": "TCFP5B-ZMYWX-TCPL7E",
+                "ordertxid": "OTTSCE-7VDKK-TLEH3L", "pair": "SOLGBP",
+                "time": "1786063752.468964", "type": "buy", "vol": "0.06",
+                "cost": "3.237",
+                "ledgers": ["L5A53E-K664A-TNP2HS", "LHIXEW-GBDEW-BIJWVG"],
+            },
+            {
+                "id": "TEQQCQ-Y4WWK-VVNZFH",
+                "ordertxid": "OGU7U3-CC3GL-S73B5T", "pair": "XXBTZGBP",
+                "time": "1786065062.86629", "type": "buy", "vol": "0.00020911",
+                "cost": "10.00048",
+                "ledgers": ["L4J5EW-NJDDG-A6OHU7", "LRYRB6-U45LG-VKO54F"],
+            },
+        ]
+        rows = [
+            {
+                "id": "L4J5EW-NJDDG-A6OHU7", "refid": "TEQQCQ-Y4WWK-VVNZFH",
+                "time": "1786065062.86629", "type": "trade",
+                "subtype": "tradespot", "asset": "GBP", "amount": "-10.0005",
+                "fee": "0.04", "balance": "93.3467",
+            },
+            {
+                "id": "L5A53E-K664A-TNP2HS", "refid": "TCFP5B-ZMYWX-TCPL7E",
+                "time": "1786063752.468964", "type": "trade",
+                "subtype": "tradespot", "asset": "SOL", "amount": "0.06",
+                "fee": "0", "balance": "0.06",
+            },
+            {
+                "id": "LBOK3F-ANOR3-ZE6PTN", "refid": "TVQDYM-4626I-VC5AJ6",
+                "time": "1786063662.424997", "type": "trade",
+                "subtype": "tradespot", "asset": "HYPE", "amount": "0.1",
+                "fee": "0", "balance": "0.2",
+            },
+            {
+                "id": "LHIXEW-GBDEW-BIJWVG", "refid": "TCFP5B-ZMYWX-TCPL7E",
+                "time": "1786063752.468964", "type": "trade",
+                "subtype": "tradespot", "asset": "GBP", "amount": "-3.237",
+                "fee": "0.013", "balance": "103.3872",
+            },
+            {
+                "id": "LHNZF4-DXXWG-R5XVEB", "refid": "TZYTSB-IJNJR-NAK5PZ",
+                "time": "1786063659.029959", "type": "trade",
+                "subtype": "tradespot", "asset": "GBP", "amount": "-4.1486",
+                "fee": "0.0332", "balance": "110.8182",
+            },
+            {
+                "id": "LJDL4D-LY365-JKJ73O",
+                "refid": "FTJPCWx-dZ9hMFZHQgMIIbjpmvE2Gq",
+                "time": "1786065268.593392", "type": "withdrawal",
+                "subtype": None, "asset": "BTC", "amount": "-0.000203",
+                "fee": "0.000015", "balance": "0.00009455",
+            },
+            {
+                "id": "LRYRB6-U45LG-VKO54F", "refid": "TEQQCQ-Y4WWK-VVNZFH",
+                "time": "1786065062.86629", "type": "trade",
+                "subtype": "tradespot", "asset": "BTC", "amount": "0.00020911",
+                "fee": "0", "balance": "0.00031255",
+            },
+            {
+                "id": "LSQWFW-SWUEE-4TCZZ5", "refid": "TVQDYM-4626I-VC5AJ6",
+                "time": "1786063662.424997", "type": "trade",
+                "subtype": "tradespot", "asset": "GBP", "amount": "-4.1478",
+                "fee": "0.0332", "balance": "106.6372",
+            },
+            {
+                "id": "LV7LA2-6O2YU-DBKLLK",
+                "refid": "FTJuLJX-67PrQ7UZBnrpYaS3ayOKk6",
+                "time": "1786064689.178771", "type": "withdrawal",
+                "subtype": None, "asset": "SOL", "amount": "-0.006",
+                "fee": "0.005", "balance": "0.049",
+            },
+            {
+                "id": "LWYZJB-WL54T-KKIZZW", "refid": "TZYTSB-IJNJR-NAK5PZ",
+                "time": "1786063659.029959", "type": "trade",
+                "subtype": "tradespot", "asset": "HYPE", "amount": "0.1",
+                "fee": "0", "balance": "0.1",
+            },
+        ]
     if extra_hype_leg:
         rows.append({
             "id": "L-HYPE-1-EXTRA", "refid": "T-HYPE-1", "time": HYPE_ONE_TIME,
@@ -165,11 +260,28 @@ def activity_history(
         })
     trades = evidence(trade_rows)
     ledgers = evidence(rows)
-    orders = evidence([
+    order_rows = [
         {"id": "O-SOL", "cl_ord_id": None, "status": "closed"},
         {"id": "O-BTC", "cl_ord_id": None, "status": "closed"},
-    ])
+    ]
+    if trade_backed_hype:
+        order_rows = [
+            {"id": "OGU7U3-CC3GL-S73B5T", "cl_ord_id": None, "status": "closed"},
+            {"id": "OTTSCE-7VDKK-TLEH3L", "cl_ord_id": None, "status": "closed"},
+            {"id": "SO36H3U-GZ2ZM-DC2CB2", "cl_ord_id": None, "status": "closed"},
+            {"id": "SO6TZCL-7IUEP-HB7QOO", "cl_ord_id": None, "status": "closed"},
+        ]
+    orders = evidence(order_rows)
     return trades, ledgers, orders
+
+
+def activity_history_with_btc_volume(volume):
+    trades, ledgers, orders = activity_history()
+    trade_rows = [dict(row) for row in trades.records]
+    ledger_rows = [dict(row) for row in ledgers.records]
+    next(row for row in trade_rows if row["id"] == "T-BTC")["vol"] = volume
+    next(row for row in ledger_rows if row["id"] == "L-BTC")["amount"] = volume
+    return evidence(trade_rows), evidence(ledger_rows), orders
 
 
 def source_tuple(history, *, opening=False):
@@ -360,6 +472,33 @@ class KrakenAccountRecoveryTests(unittest.TestCase):
             artifact["reconciliation"]["ending_state_hash"],
             recovery.REVIEWED_END_STATE_HASH,
         )
+        adjustments = {
+            row["target"]: row for row in artifact["balance_adjustments"]
+        }
+        self.assertEqual(set(adjustments), {"BTC_GBP", "HYPE_USD", "SOL_GBP"})
+        self.assertEqual(adjustments["BTC_GBP"]["quantity"], "0.0000000022")
+        self.assertEqual(adjustments["HYPE_USD"]["quantity"], "0.0000004")
+        self.assertEqual(adjustments["SOL_GBP"]["quantity"], "0.00000042")
+        self.assertTrue(all(
+            row["performance_cost_gbp"] == "0" and row["cash_flow_gbp"] == "0"
+            for row in adjustments.values()
+        ))
+        self.assertEqual(
+            artifact["reconciliation"]["balance_adjustment_count"], 3
+        )
+        position = next(
+            row for row in artifact["reconciliation"]["positions"]
+            if row["target"] == "SOL_GBP"
+        )
+        self.assertEqual(position, {
+            "target": "SOL_GBP",
+            "asset": "SOL",
+            "opening_quantity": "0",
+            "ledger_activity_delta": "0.049",
+            "ledger_ending_quantity": "0.049",
+            "balance_adjustment_quantity": "0.00000042",
+            "ending_quantity": "0.04900042",
+        })
 
     def test_buy_source_is_a_strict_discriminated_evidence_union(self):
         buys = [row for row in build()["activities"] if row["kind"] == "buy"]
@@ -372,6 +511,54 @@ class KrakenAccountRecoveryTests(unittest.TestCase):
         self.assertEqual(set(paired["source"]), {
             "evidence_model", "ledger_refid", "ledger_ids",
         })
+
+    def test_trade_backed_hype_accepts_opaque_kraken_ledger_refids(self):
+        history = activity_history(trade_backed_hype=True)
+        self.assertEqual(
+            [len(section.records) for section in history], [4, 10, 4]
+        )
+        btc_trade = next(
+            row for row in history[0].records
+            if row["id"] == "TEQQCQ-Y4WWK-VVNZFH"
+        )
+        btc_quote = next(
+            row for row in history[1].records
+            if row["id"] == "L4J5EW-NJDDG-A6OHU7"
+        )
+        self.assertEqual(btc_trade["cost"], "10.00048")
+        self.assertEqual(btc_quote["amount"], "-10.0005")
+
+        artifact = build(activity=history)
+        hype = [
+            row for row in artifact["activities"]
+            if row["target"] == "HYPE_USD"
+        ]
+
+        self.assertEqual(len(hype), 2)
+        self.assertEqual(
+            [row["source"]["order_id"] for row in hype],
+            ["SO6TZCL-7IUEP-HB7QOO", "SO36H3U-GZ2ZM-DC2CB2"],
+        )
+        self.assertTrue(all(
+            row["source"]["evidence_model"] == "trade-backed-v1"
+            for row in hype
+        ))
+        self.assertEqual(
+            [row["source"]["ledger_ids"] for row in hype],
+            [
+                ["LHNZF4-DXXWG-R5XVEB", "LWYZJB-WL54T-KKIZZW"],
+                ["LBOK3F-ANOR3-ZE6PTN", "LSQWFW-SWUEE-4TCZZ5"],
+            ],
+        )
+        self.assertEqual([row["performance_cost_gbp"] for row in hype], [
+            "4.1818", "4.18102",
+        ])
+        btc = next(
+            row for row in artifact["activities"]
+            if row["kind"] == "buy" and row["target"] == "BTC_GBP"
+        )
+        self.assertEqual(btc["quote_cost"], "10.00048")
+        self.assertEqual(btc["performance_cost_gbp"], "10.04048")
 
     def test_extra_leg_or_unsupported_target_movement_fails_closed(self):
         for history in (
@@ -388,13 +575,38 @@ class KrakenAccountRecoveryTests(unittest.TestCase):
     def test_recovery_must_reach_the_separately_reviewed_pre_dca_state(self):
         with self.assertRaisesRegex(
             recovery.AccountRecoveryError,
-            "does not reach the bound pre-DCA state",
+            "reviewed pre-DCA state hash is invalid",
         ):
             build(end=reviewed_end(SOL_GBP="0.05"))
 
+    def test_balance_adjustment_must_fit_the_reviewed_reporting_quantum(self):
+        original = recovery.BALANCE_ADJUSTMENT_QUANTA["BTC_GBP"]
+        recovery.BALANCE_ADJUSTMENT_QUANTA["BTC_GBP"] = Decimal("0.000000001")
+        try:
+            with self.assertRaisesRegex(
+                recovery.AccountRecoveryError,
+                "BTC_GBP reviewed balance adjustment exceeds its reporting bound",
+            ):
+                build()
+        finally:
+            recovery.BALANCE_ADJUSTMENT_QUANTA["BTC_GBP"] = original
+
+    def test_balance_adjustment_rejects_zero_wrong_sign_and_out_of_bound(self):
+        cases = {
+            "zero": "0.0002091122",
+            "wrong-sign": "0.000209114",
+            "out-of-bound": "0.0002091",
+        }
+        for label, volume in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                recovery.AccountRecoveryError,
+                "BTC_GBP reviewed balance adjustment exceeds its reporting bound",
+            ):
+                build(activity=activity_history_with_btc_volume(volume))
+
     def test_every_activity_and_artifact_hash_is_reproducible(self):
         artifact = build()
-        for row in artifact["activities"]:
+        for row in artifact["activities"] + artifact["balance_adjustments"]:
             unhashed = {key: value for key, value in row.items() if key != "canonical_hash"}
             self.assertEqual(row["canonical_hash"], basis.canonical_hash(unhashed))
         unhashed = {
@@ -425,6 +637,36 @@ class KrakenAccountRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(sol_out["principal_quantity"], "0.006")
         self.assertEqual(sol_out["asset_fee_quantity"], "0.005")
+        self.assertEqual(summary["balance_adjustment_count"], 3)
+        self.assertEqual(summary["balance_adjustments"], [
+            {
+                "adjustment_id": "KRAKEN-BALANCE-ADJUSTMENT-BTC_GBP",
+                "target": "BTC_GBP",
+                "quantity": "0.0000000022",
+                "performance_cost_gbp": "0",
+                "cash_flow_gbp": "0",
+                "reporting_quantum": "0.00000001",
+                "maximum_absolute_quantity": "0.000000005",
+            },
+            {
+                "adjustment_id": "KRAKEN-BALANCE-ADJUSTMENT-HYPE_USD",
+                "target": "HYPE_USD",
+                "quantity": "0.0000004",
+                "performance_cost_gbp": "0",
+                "cash_flow_gbp": "0",
+                "reporting_quantum": "0.000001",
+                "maximum_absolute_quantity": "0.0000005",
+            },
+            {
+                "adjustment_id": "KRAKEN-BALANCE-ADJUSTMENT-SOL_GBP",
+                "target": "SOL_GBP",
+                "quantity": "0.00000042",
+                "performance_cost_gbp": "0",
+                "cash_flow_gbp": "0",
+                "reporting_quantum": "0.000001",
+                "maximum_absolute_quantity": "0.0000005",
+            },
+        ])
         self.assertNotIn("ledger_ids", json.dumps(summary))
 
 

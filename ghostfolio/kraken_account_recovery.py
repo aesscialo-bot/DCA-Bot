@@ -10,7 +10,8 @@ The compact artifact proves three independently useful facts:
 
 * the true cutover position comes from unrestricted Kraken ledger history;
 * every manual buy or asset debit in the bounded seam has exact source rows;
-* applying those rows reaches the separately reviewed pre-DCA position state.
+* applying those rows plus an explicit zero-cost reporting-precision bridge
+  reaches the separately reviewed pre-DCA position state.
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ RECOVERY_METHOD = "opening-plus-manual-ledger-v1"
 SOURCE_EVIDENCE_TYPE = "kraken_account_activity_source"
 SOURCE_NORMALIZATION = "kraken-account-activity-source-v1"
 OPENING_MODEL = "kraken-ledger-at-cutover-v1"
+LEDGER_END_MODEL = "kraken-ledger-after-reviewed-activity-v1"
+BALANCE_ADJUSTMENT_MODEL = "kraken-ledger-reporting-precision-v1"
 ACTIVITY_AFTER = basis.CUTOVER_AT
 ACTIVITY_THROUGH = "2026-08-07T03:31:59.999999Z"
 ACCOUNT_ACTIVITY_SOURCE_FILE = "kraken_account_activity_source_v1.json"
@@ -53,6 +56,11 @@ REVIEWED_TRUE_OPENING_STATE_HASH = (
     "8009256dde71cf239ceef0d7937ff16c42026f466ac34868f9715b515ef48ccf"
 )
 CONSUMER_MAX_BYTES = 1_000_000
+BALANCE_ADJUSTMENT_QUANTA = {
+    "BTC_GBP": Decimal("0.00000001"),
+    "HYPE_USD": Decimal("0.000001"),
+    "SOL_GBP": Decimal("0.000001"),
+}
 
 
 class AccountRecoveryError(RuntimeError):
@@ -782,27 +790,65 @@ def build_recovery_artifact(
         ), Decimal(0))
         for target, contract in basis.TARGETS.items()
     }
-    ending_quantities = {
+    ledger_ending_quantities = {
         target: opening_quantities[target] + seam_delta[target]
         for target in basis.TARGETS
     }
-    for target, expected in reviewed_end.quantities.items():
-        if abs(ending_quantities[target] - expected) > basis.TARGETS[target]["tolerance"]:
-            _error(f"{target} reviewed seam does not reach the bound pre-DCA state")
+    ledger_end_state = _state(
+        LEDGER_END_MODEL, ACTIVITY_THROUGH, ledger_ending_quantities
+    )
     end_state = _state(
         basis.OPENING_MODEL, ACTIVITY_AFTER, reviewed_end.quantities
     )
-    if end_state["state_hash"] != REVIEWED_END_STATE_HASH:
+    if (
+        end_state["state_hash"] != REVIEWED_END_STATE_HASH
+        or reviewed_end.opening_state_hash != REVIEWED_END_STATE_HASH
+    ):
         _error("reviewed pre-DCA state hash is invalid")
+    adjustments = []
+    for target, contract in basis.TARGETS.items():
+        ledger_ending = ledger_ending_quantities[target]
+        reviewed_ending = reviewed_end.quantities[target]
+        adjustment = reviewed_ending - ledger_ending
+        quantum = BALANCE_ADJUSTMENT_QUANTA[target]
+        maximum = quantum / Decimal(2)
+        if adjustment <= 0 or adjustment > maximum:
+            _error(f"{target} reviewed balance adjustment exceeds its reporting bound")
+        adjustment_value = {
+            "version": 1,
+            "kind": "balance_adjustment",
+            "adjustment_id": f"KRAKEN-BALANCE-ADJUSTMENT-{target}",
+            "target": target,
+            "asset": contract["asset"],
+            "occurred_at": ACTIVITY_THROUGH,
+            "quantity": basis.signed_decimal_text(adjustment),
+            "performance_cost_gbp": "0",
+            "cash_flow_gbp": "0",
+            "source": {
+                "model": BALANCE_ADJUSTMENT_MODEL,
+                "opening_source_canonical_hash": opening_source_reference["canonical_hash"],
+                "activity_source_canonical_hash": activity_source_reference["canonical_hash"],
+                "ledger_ending_state_hash": ledger_end_state["state_hash"],
+                "reviewed_ending_state_hash": end_state["state_hash"],
+                "reviewed_end_repository_commit_sha": reviewed_end.repository_commit_sha,
+                "reviewed_holdings_canonical_hash": reviewed_end.holdings_snapshot_hash,
+                "reviewed_events_prefix_hash": reviewed_end.event_prefix_hash,
+                "reporting_quantum": basis.decimal_text(quantum),
+                "maximum_absolute_quantity": basis.decimal_text(maximum),
+            },
+        }
+        adjustments.append(basis._hash_artifact(adjustment_value))
     deltas = [
         {
             "target": target,
             "asset": contract["asset"],
             "opening_quantity": basis.decimal_text(opening_quantities[target]),
-            "activity_delta": basis.signed_decimal_text(seam_delta[target]),
-            "ending_quantity": basis.decimal_text(ending_quantities[target]),
+            "ledger_activity_delta": basis.signed_decimal_text(seam_delta[target]),
+            "ledger_ending_quantity": basis.decimal_text(ledger_ending_quantities[target]),
+            "balance_adjustment_quantity": adjustments[index]["quantity"],
+            "ending_quantity": basis.decimal_text(reviewed_end.quantities[target]),
         }
-        for target, contract in basis.TARGETS.items()
+        for index, (target, contract) in enumerate(basis.TARGETS.items())
     ]
     artifact = {
         "version": VERSION,
@@ -836,13 +882,19 @@ def build_recovery_artifact(
             "positions": costed_opening,
         },
         "activities": activities,
+        "balance_adjustments": adjustments,
         "reconciliation": {
             "opening_state_hash": opening_state["state_hash"],
+            "ledger_ending_state_hash": ledger_end_state["state_hash"],
             "ending_state_hash": end_state["state_hash"],
             "positions": deltas,
             "activity_count": len(activities),
             "activity_prefix_hash": basis.canonical_hash([
                 item["canonical_hash"] for item in activities
+            ]),
+            "balance_adjustment_count": len(adjustments),
+            "balance_adjustment_prefix_hash": basis.canonical_hash([
+                item["canonical_hash"] for item in adjustments
             ]),
         },
     }
@@ -992,6 +1044,7 @@ def _recovery_summary(artifact: dict, *, source_commit: str) -> dict:
         "generated_at": artifact["generated_at"],
         "source_repository_commit_sha": source_commit,
         "opening_state_hash": artifact["opening_state"]["state_hash"],
+        "ledger_ending_state_hash": artifact["reconciliation"]["ledger_ending_state_hash"],
         "ending_state_hash": artifact["reconciliation"]["ending_state_hash"],
         "opening_positions": [
             {
@@ -1022,6 +1075,19 @@ def _recovery_summary(artifact: dict, *, source_commit: str) -> dict:
                 "asset_fee_quantity": item["asset_fee_quantity"],
             })
             for item in artifact["activities"]
+        ],
+        "balance_adjustment_count": len(artifact["balance_adjustments"]),
+        "balance_adjustments": [
+            {
+                "adjustment_id": item["adjustment_id"],
+                "target": item["target"],
+                "quantity": item["quantity"],
+                "performance_cost_gbp": item["performance_cost_gbp"],
+                "cash_flow_gbp": item["cash_flow_gbp"],
+                "reporting_quantum": item["source"]["reporting_quantum"],
+                "maximum_absolute_quantity": item["source"]["maximum_absolute_quantity"],
+            }
+            for item in artifact["balance_adjustments"]
         ],
     }
 

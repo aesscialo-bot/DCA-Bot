@@ -812,13 +812,57 @@ class KrakenOpeningBasisTests(unittest.TestCase):
         self.assertEqual(artifact["positions"]["HYPE_USD"]["coverage"], "missing")
         self.assertEqual(artifact["positions"]["SOL_GBP"]["coverage"], "complete")
 
-    def test_swapped_ledger_references_fail_the_whole_artifact(self):
+    def test_explicit_trade_ledger_links_do_not_assume_opaque_refid_identity(self):
         trades, ledgers, orders = direct_fixture()
         rows = [dict(row) for row in ledgers.records]
         for row in rows:
-            row["refid"] = "T-SWAPPED"
-        with self.assertRaisesRegex(basis.OpeningBasisError, "owning trade"):
-            build(opening(BTC_GBP="0.099"), (trades, evidence(rows), orders))
+            row["refid"] = "TV-OPAQUE-KRAKEN-TRADE"
+
+        artifact = build(
+            opening(BTC_GBP="0.099"),
+            (trades, evidence(rows), orders),
+        )
+
+        self.assertEqual(artifact["positions"]["BTC_GBP"]["coverage"], "complete")
+        self.assertEqual(
+            artifact["positions"]["BTC_GBP"]["acquisitions"][0]["ledger_ids"],
+            ["L-BTC", "L-GBP"],
+        )
+
+    def test_explicit_trade_links_still_require_referenced_ledger_evidence(self):
+        trades, ledgers, orders = direct_fixture()
+        missing = [row for row in ledgers.records if row["id"] != "L-BTC"]
+
+        with self.assertRaisesRegex(basis.OpeningBasisError, "missing ledger evidence"):
+            build(opening(BTC_GBP="0.099"), (trades, evidence(missing), orders))
+
+    def test_quote_cost_must_match_the_fiat_ledger_rounding_precision(self):
+        trades, ledgers, orders = direct_fixture()
+        rounded_trades = evidence([{
+            **trades.records[0],
+            "cost": "5.00004",
+        }])
+        rounded_ledgers = evidence([
+            {**row, "amount": "-5"} if row["id"] == "L-GBP" else row
+            for row in ledgers.records
+        ])
+
+        artifact = build(
+            opening(BTC_GBP="0.099"),
+            (rounded_trades, rounded_ledgers, orders),
+        )
+        self.assertEqual(artifact["positions"]["BTC_GBP"]["cost_basis_gbp"], "5.10004")
+
+        mismatched_trades = evidence([{
+            **trades.records[0],
+            "cost": "5.00006",
+        }])
+        mismatched = build(
+            opening(BTC_GBP="0.099"),
+            (mismatched_trades, rounded_ledgers, orders),
+        )["positions"]["BTC_GBP"]
+        self.assertEqual(mismatched["coverage"], "missing")
+        self.assertIsNone(mismatched["cost_basis_gbp"])
 
     def test_cross_target_ledger_reuse_fails_globally(self):
         trades, ledgers, orders = direct_fixture()

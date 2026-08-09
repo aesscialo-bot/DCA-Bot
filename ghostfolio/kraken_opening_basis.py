@@ -51,6 +51,7 @@ SOURCE_EVIDENCE_TYPE = "kraken_opening_basis_source"
 SOURCE_NORMALIZATION = "kraken-opening-basis-source-v1"
 CONSUMER_MAX_BYTES = 1_000_000
 SELECTED_TZ = ZoneInfo("Asia/Bangkok")
+KRAKEN_FIAT_LEDGER_QUANTUM = Decimal("0.0001")
 
 TARGETS = {
     "BTC_GBP": {"asset": "BTC", "places": 10, "tolerance": Decimal("0.0000000001")},
@@ -930,7 +931,12 @@ def _groups(trades: HistoryEvidence) -> dict[tuple[str, str, str], list[dict]]:
 def _validate_global_trade_ownership(
     trades: HistoryEvidence, ledgers: HistoryEvidence
 ) -> None:
-    """Reject cross-trade ledger reuse and mixed-identity order evidence."""
+    """Reject cross-trade ledger reuse and mixed-identity order evidence.
+
+    Kraken's explicit ``TradesHistory.ledgers`` links are the ownership
+    contract.  A ledger ``refid`` is an opaque Kraken reference and, for some
+    newer spot assets, is not the TradesHistory trade identifier.
+    """
     ledger_owner = {}
     ledger_by_id = {row["id"]: row for row in ledgers.records}
     order_identity = {}
@@ -944,9 +950,9 @@ def _validate_global_trade_ownership(
                     "Kraken ledger identifier is referenced by multiple trades"
                 )
             ledger = ledger_by_id.get(ledger_id)
-            if not isinstance(ledger, dict) or ledger.get("refid") != trade_id:
+            if not isinstance(ledger, dict):
                 raise OpeningBasisError(
-                    "Kraken ledger reference does not match its owning trade"
+                    "Kraken trade references missing ledger evidence"
                 )
         pair = _pair_key(trade.get("pair"))
         if pair not in relevant_pairs:
@@ -972,10 +978,8 @@ def _ledger_rows(group: list[dict], ledger_by_id: dict[str, dict]) -> tuple[list
             if ledger_id not in ids:
                 ids.append(ledger_id)
             row = ledger_by_id.get(ledger_id)
-            if not isinstance(row, dict) or row.get("refid") != trade["id"]:
-                raise OpeningBasisError(
-                    "Kraken ledger reference does not match its trade"
-                )
+            if not isinstance(row, dict):
+                raise OpeningBasisError("Kraken trade references missing ledger evidence")
     try:
         rows = [ledger_by_id[ledger_id] for ledger_id in ids]
     except KeyError as error:
@@ -1010,7 +1014,27 @@ def _spot_leg(group, target: str, quote: str, ledger_by_id) -> dict:
     if quote_amount >= 0:
         raise OpeningBasisError("Kraken acquisition quote ledger is inconsistent")
     quote_tolerance = max(Decimal("0.00000001"), quote_cost * Decimal("0.00000001"))
-    if abs(abs(quote_amount) - quote_cost) > quote_tolerance:
+    quote_cost_matches = abs(abs(quote_amount) - quote_cost) <= quote_tolerance
+    if not quote_cost_matches and len(quote_rows) == 1:
+        # Kraken fiat ledger rows retain fewer decimal places than
+        # TradesHistory costs.  Accept only the exact half-up representation at
+        # Kraken's four-place fiat ledger precision; the unrounded trade cost
+        # remains the performance cost.  The normalized source intentionally
+        # strips insignificant zeroes, so the precision cannot be inferred from
+        # the ledger string itself.
+        ledger_debit = abs(signed_decimal(
+            quote_rows[0].get("amount"), "Kraken quote ledger amount"
+        ))
+        try:
+            quote_cost_matches = (
+                quote_cost.quantize(
+                    KRAKEN_FIAT_LEDGER_QUANTUM, rounding=ROUND_HALF_UP
+                )
+                == ledger_debit
+            )
+        except InvalidOperation:
+            quote_cost_matches = False
+    if not quote_cost_matches:
         raise OpeningBasisError("Kraken trade cost does not match its quote ledger")
     return {
         "trade_ids": sorted(row["id"] for row in group),
