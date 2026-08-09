@@ -45,7 +45,100 @@ def opening(**quantities):
         "SOL_GBP": Decimal("0"),
     }
     values.update({key: Decimal(value) for key, value in quantities.items()})
-    return basis.OpeningBinding("1" * 64, "2" * 64, "3" * 64, values)
+    return basis.OpeningBinding(
+        repository_commit_sha="a" * 40,
+        holdings_path="outbox/holdings.json",
+        holdings_blob_sha="b" * 40,
+        holdings_snapshot_hash="1" * 64,
+        events_path="outbox/events.jsonl",
+        events_blob_sha="c" * 40,
+        events_content_sha256="2" * 64,
+        event_prefix_hash="3" * 64,
+        accepted_event_count=3,
+        opening_state_hash=basis.REVIEWED_OPENING_STATE_HASH,
+        quantities=values,
+    )
+
+
+def signed_holdings(**quantities):
+    contracts = {
+        "BTC_GBP": ("BTC", "BTC/GBP", "GBP"),
+        "HYPE_USD": ("HYPE", "HYPE/USD", "USD"),
+        "SOL_GBP": ("SOL", "SOL/GBP", "GBP"),
+    }
+    snapshot = {
+        "version": 1,
+        "as_of": "2026-08-08T10:00:00Z",
+        "holdings": {
+            target: {
+                "asset": asset,
+                "pair": pair,
+                "quantity": str(quantities[target]),
+                "quote_currency": quote,
+                "unit_price_quote": "1",
+            }
+            for target, (asset, pair, quote) in contracts.items()
+        },
+        "unsupported_nonzero_assets": [],
+    }
+    snapshot["canonical_hash"] = basis.canonical_hash(snapshot)
+    return basis.canonical(snapshot)
+
+
+def portfolio_event(identifier, target, quantity, occurred_at):
+    contracts = {
+        "BTC_GBP": ("BTC", "GBP", "DIRECT_GBP"),
+        "HYPE_USD": ("HYPE", "USD", "GBP_TO_USD"),
+        "SOL_GBP": ("SOL", "GBP", "DIRECT_GBP"),
+    }
+    asset, quote, route = contracts[target]
+    event = {
+        "event_version": 3,
+        "event_id": identifier,
+        "occurred_at": occurred_at,
+        "target": target,
+        "base_currency": asset,
+        "quote_currency": quote,
+        "budget_currency": "GBP",
+        "funding_order_id": f"F-{identifier}" if route == "GBP_TO_USD" else None,
+        "crypto_order_id": identifier,
+        "gbp_debit": "1",
+        "gbp_usd_rate": "1.25" if route == "GBP_TO_USD" else "0",
+        "funded_usd": "1.25" if route == "GBP_TO_USD" else "0",
+        "route": route,
+        "crypto_cost_quote": "1",
+        "crypto_quantity": str(quantity),
+        "unit_price_quote": "1",
+        "funding_fee_quote": "0",
+        "crypto_fee_quote": "0",
+    }
+    event["canonical_hash"] = basis.canonical_hash(event)
+    return event
+
+
+def reviewed_opening_files():
+    events = [
+        portfolio_event(
+            "O-BTC-1", "BTC_GBP", "0.0004156777544144884",
+            "2026-08-07T01:00:00Z",
+        ),
+        portfolio_event(
+            "O-HYPE-1", "HYPE_USD", "0.2989365",
+            "2026-08-07T02:00:00Z",
+        ),
+        portfolio_event(
+            "O-SOL-1", "SOL_GBP", "0.32522054",
+            "2026-08-07T03:00:00Z",
+        ),
+    ]
+    return (
+        signed_holdings(
+            BTC_GBP="0.00051023",
+            HYPE_USD="0.4989369",
+            SOL_GBP="0.37422096",
+        ),
+        "".join(basis.canonical(event) + "\n" for event in events),
+    )
 
 
 def order(order_id, target, quote, when=TRADE_TIME, purpose="buy", status="closed"):
@@ -192,6 +285,169 @@ class KrakenOpeningBasisTests(unittest.TestCase):
         self.assertEqual(basis.BASIS_TYPE, "performance_book_cost")
         self.assertEqual(basis.METHOD, "kraken-pre-cutover-weighted-average-v1")
         self.assertEqual(set(basis.TARGETS), {"BTC_GBP", "HYPE_USD", "SOL_GBP"})
+        self.assertEqual(
+            basis.REVIEWED_OPENING_REPOSITORY_COMMIT_SHA,
+            "b69734117ba55cf74724bc0a208dd941b971b62d",
+        )
+
+    def test_reviewed_opening_binding_records_exact_commit_files_and_hashes(self):
+        holdings, events = reviewed_opening_files()
+        binding = basis.derive_opening_binding(
+            holdings,
+            events,
+            repository_commit_sha=basis.REVIEWED_OPENING_REPOSITORY_COMMIT_SHA,
+            holdings_path="portfolio/kraken_holdings_snapshot_v1.json",
+            holdings_blob_sha="a" * 40,
+            events_path="portfolio/kraken_usd_dca_ghostfolio_events.jsonl",
+            events_blob_sha="b" * 40,
+        )
+
+        self.assertEqual(binding.opening_state_hash, basis.REVIEWED_OPENING_STATE_HASH)
+        self.assertEqual(binding.accepted_event_count, 3)
+        self.assertEqual(binding.quantities, {
+            "BTC_GBP": Decimal("0.0000945522"),
+            "HYPE_USD": Decimal("0.2000004"),
+            "SOL_GBP": Decimal("0.04900042"),
+        })
+        self.assertEqual(
+            binding.events_content_sha256,
+            hashlib.sha256(events.encode("utf-8")).hexdigest(),
+        )
+
+        artifact = build(binding, direct_fixture())
+        self.assertEqual(artifact["opening_binding"], {
+            "repository_commit_sha": basis.REVIEWED_OPENING_REPOSITORY_COMMIT_SHA,
+            "opening_state_hash": basis.REVIEWED_OPENING_STATE_HASH,
+            "holdings": {
+                "path": "portfolio/kraken_holdings_snapshot_v1.json",
+                "blob_sha": "a" * 40,
+                "canonical_hash": binding.holdings_snapshot_hash,
+            },
+            "events": {
+                "path": "portfolio/kraken_usd_dca_ghostfolio_events.jsonl",
+                "blob_sha": "b" * 40,
+                "content_sha256": hashlib.sha256(events.encode("utf-8")).hexdigest(),
+                "prefix_hash": binding.event_prefix_hash,
+                "accepted_event_count": 3,
+            },
+        })
+        self.assertEqual(
+            basis._basis_summary(artifact)["opening_binding"],
+            artifact["opening_binding"],
+        )
+
+    def test_basis_uses_reviewed_commit_despite_later_production_rounding(self):
+        reviewed_holdings, reviewed_events = reviewed_opening_files()
+        later_event = portfolio_event(
+            "O-BTC-2", "BTC_GBP", "0.0005146793565464986",
+            "2026-08-08T13:11:12Z",
+        )
+        later_events = reviewed_events + basis.canonical(later_event) + "\n"
+        later_holdings = signed_holdings(
+            BTC_GBP="0.00102491",
+            HYPE_USD="0.4989369",
+            SOL_GBP="0.37422096",
+        )
+        with self.assertRaisesRegex(
+            basis.OpeningBasisError, "reviewed commitment"
+        ):
+            basis.derive_opening_binding(
+                later_holdings,
+                later_events,
+                repository_commit_sha="c" * 40,
+                holdings_path="outbox/holdings.json",
+                holdings_blob_sha="d" * 40,
+                events_path="outbox/events.jsonl",
+                events_blob_sha="e" * 40,
+            )
+
+        trades, ledgers, orders = direct_fixture()
+        source = basis.build_source_artifact(
+            basis.AccessEvidence("0", "0", "0"), trades, ledgers, orders,
+            generated_at="2026-08-08T00:00:00Z", producer_commit="a" * 40,
+        )
+        source_commit = "c" * 40
+
+        class Repository:
+            def __init__(self):
+                self.reads = []
+
+            def read_text_at_commit(self, path, commit):
+                self.reads.append((path, commit))
+                if path.endswith(basis.OPENING_BASIS_SOURCE_FILE):
+                    if commit != source_commit:
+                        raise AssertionError("source evidence was not commit-pinned")
+                    return RepositoryFile(json.dumps(source), "d" * 40, True)
+                if commit != basis.REVIEWED_OPENING_REPOSITORY_COMMIT_SHA:
+                    raise AssertionError("opening evidence used the mutable source commit")
+                if path.endswith("holdings.json"):
+                    return RepositoryFile(reviewed_holdings, "e" * 40, True)
+                if path.endswith("events.jsonl"):
+                    return RepositoryFile(reviewed_events, "f" * 40, True)
+                raise AssertionError(path)
+
+        repository = Repository()
+        environment = {
+            "DCA_OUTBOX_AUDIT_PATH": "outbox/audit.md",
+            "DCA_OUTBOX_EVENT_PATH": "outbox/events.jsonl",
+            "DCA_OUTBOX_HOLDINGS_PATH": "outbox/holdings.json",
+            "DCA_OUTBOX_OPENING_BASIS_SOURCE_PATH": (
+                "outbox/kraken_opening_basis_source_v1.json"
+            ),
+            "DCA_OUTBOX_OPENING_BASIS_PATH": "outbox/kraken_opening_basis_v1.json",
+        }
+        with patch.dict("os.environ", environment, clear=False):
+            artifact = basis._build_basis_at_commit(
+                repository,
+                pinned_commit=source_commit,
+                generated_at="2026-08-08T00:00:00Z",
+                funding_links={},
+            )
+
+        self.assertEqual(
+            artifact["opening_binding"]["repository_commit_sha"],
+            basis.REVIEWED_OPENING_REPOSITORY_COMMIT_SHA,
+        )
+        self.assertEqual(
+            artifact["source_evidence"]["repository_commit_sha"], source_commit
+        )
+        self.assertEqual(
+            artifact["opening_binding"]["opening_state_hash"],
+            basis.REVIEWED_OPENING_STATE_HASH,
+        )
+
+    def test_reviewed_opening_binding_fails_closed_on_invalid_identity_or_state(self):
+        holdings, events = reviewed_opening_files()
+        common = {
+            "repository_commit_sha": basis.REVIEWED_OPENING_REPOSITORY_COMMIT_SHA,
+            "holdings_path": "outbox/holdings.json",
+            "holdings_blob_sha": "a" * 40,
+            "events_path": "outbox/events.jsonl",
+            "events_blob_sha": "b" * 40,
+        }
+        for field, value, message in (
+            ("repository_commit_sha", "A" * 40, "repository commit"),
+            ("holdings_path", "../holdings.json", "holdings path"),
+            ("events_path", "outbox/holdings.json", "events path"),
+            ("events_blob_sha", "b" * 39, "events blob"),
+        ):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                basis.OpeningBasisError, message
+            ):
+                basis.derive_opening_binding(
+                    holdings, events, **{**common, field: value}
+                )
+
+        changed = json.loads(holdings)
+        changed["holdings"]["BTC_GBP"]["quantity"] = "0.00051024"
+        changed.pop("canonical_hash")
+        changed["canonical_hash"] = basis.canonical_hash(changed)
+        with self.assertRaisesRegex(
+            basis.OpeningBasisError, "reviewed commitment"
+        ):
+            basis.derive_opening_binding(
+                basis.canonical(changed), events, **common
+            )
 
     def test_history_hash_is_order_independent_and_binds_exact_records(self):
         records = [{"id": "T2", "cost": "2"}, {"id": "T1", "cost": "1"}]

@@ -39,6 +39,9 @@ OPENING_MODEL = "holdings-minus-events-v1"
 REVIEWED_OPENING_STATE_HASH = (
     "0535e6245f7ed5606e226a101b7bb3e858c111ee1bf3eb1f46776c5656ea8471"
 )
+REVIEWED_OPENING_REPOSITORY_COMMIT_SHA = (
+    "b69734117ba55cf74724bc0a208dd941b971b62d"
+)
 FUNDING_LINKS_ENV = "DCA_OPENING_BASIS_FUNDING_LINKS_JSON"
 HISTORY_FROM = "1970-01-01T00:00:00Z"
 REQUIRED_PERMISSIONS = frozenset({"query-closed-trades", "query-ledger"})
@@ -201,8 +204,15 @@ class AccessEvidence:
 
 @dataclass(frozen=True)
 class OpeningBinding:
+    repository_commit_sha: str
+    holdings_path: str
+    holdings_blob_sha: str
     holdings_snapshot_hash: str
+    events_path: str
+    events_blob_sha: str
+    events_content_sha256: str
     event_prefix_hash: str
+    accepted_event_count: int
     opening_state_hash: str
     quantities: dict[str, Decimal]
 
@@ -753,7 +763,45 @@ def _event_rows(content: str) -> list[tuple[int, int, dict]]:
     return rows
 
 
-def derive_opening_binding(holdings_content: str, events_content: str) -> OpeningBinding:
+def derive_opening_binding(
+    holdings_content: str,
+    events_content: str,
+    *,
+    repository_commit_sha: str,
+    holdings_path: str,
+    holdings_blob_sha: str,
+    events_path: str,
+    events_blob_sha: str,
+) -> OpeningBinding:
+    if re.fullmatch(r"[0-9a-f]{40}", repository_commit_sha) is None:
+        raise OpeningBasisError("reviewed opening repository commit is invalid")
+    if (
+        not isinstance(holdings_path, str)
+        or not holdings_path
+        or holdings_path.startswith("/")
+        or holdings_path.endswith("/")
+        or "\\" in holdings_path
+        or any(item in {"", ".", ".."} for item in holdings_path.split("/"))
+    ):
+        raise OpeningBasisError("reviewed opening holdings path is invalid")
+    if (
+        not isinstance(events_path, str)
+        or not events_path
+        or events_path.startswith("/")
+        or events_path.endswith("/")
+        or "\\" in events_path
+        or any(item in {"", ".", ".."} for item in events_path.split("/"))
+        or events_path == holdings_path
+    ):
+        raise OpeningBasisError("reviewed opening events path is invalid")
+    for value, label in (
+        (holdings_blob_sha, "holdings"),
+        (events_blob_sha, "events"),
+    ):
+        if not isinstance(value, str) or re.fullmatch(
+            r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value
+        ) is None:
+            raise OpeningBasisError(f"reviewed opening {label} blob is invalid")
     snapshot = parse_holdings_snapshot(holdings_content)
     if snapshot is None:
         raise OpeningBasisError("Kraken holdings snapshot is missing")
@@ -796,8 +844,15 @@ def derive_opening_binding(holdings_content: str, events_content: str) -> Openin
     if state_hash != REVIEWED_OPENING_STATE_HASH:
         raise OpeningBasisError("derived opening state does not match the reviewed commitment")
     return OpeningBinding(
+        repository_commit_sha=repository_commit_sha,
+        holdings_path=holdings_path,
+        holdings_blob_sha=holdings_blob_sha,
         holdings_snapshot_hash=snapshot["canonical_hash"],
+        events_path=events_path,
+        events_blob_sha=events_blob_sha,
+        events_content_sha256=hashlib.sha256(events_content.encode("utf-8")).hexdigest(),
         event_prefix_hash=hashlib.sha256(event_prefix.encode("utf-8")).hexdigest(),
+        accepted_event_count=len(accepted),
         opening_state_hash=state_hash,
         quantities=quantities,
     )
@@ -1294,9 +1349,20 @@ def build_artifact(
         "generated_at": generated_at,
         "cutover_at": CUTOVER_AT,
         "opening_binding": {
-            "holdings_snapshot_hash": binding.holdings_snapshot_hash,
-            "event_prefix_hash": binding.event_prefix_hash,
+            "repository_commit_sha": binding.repository_commit_sha,
             "opening_state_hash": binding.opening_state_hash,
+            "holdings": {
+                "path": binding.holdings_path,
+                "blob_sha": binding.holdings_blob_sha,
+                "canonical_hash": binding.holdings_snapshot_hash,
+            },
+            "events": {
+                "path": binding.events_path,
+                "blob_sha": binding.events_blob_sha,
+                "content_sha256": binding.events_content_sha256,
+                "prefix_hash": binding.event_prefix_hash,
+                "accepted_event_count": binding.accepted_event_count,
+            },
         },
         "source_evidence": source_evidence,
         "history": {
@@ -1421,6 +1487,7 @@ def _basis_summary(artifact: dict) -> dict:
         "canonical_hash": artifact["canonical_hash"],
         "generated_at": artifact["generated_at"],
         "source_repository_commit_sha": artifact["source_evidence"]["repository_commit_sha"],
+        "opening_binding": artifact["opening_binding"],
         "coverage": {
             target: {
                 "coverage": position["coverage"],
@@ -1485,18 +1552,39 @@ def _build_basis_at_commit(
     paths = configured_outbox_paths()
     source_path = configured_opening_basis_source_path()
     source_file = repository.read_text_at_commit(source_path, pinned_commit)
-    holdings_file = repository.read_text_at_commit(paths.holdings, pinned_commit)
-    events_file = repository.read_text_at_commit(paths.event, pinned_commit)
-    if not source_file.exists or not holdings_file.exists or not events_file.exists:
+    if not source_file.exists:
         raise OpeningBasisError(
-            "pinned outbox commit lacks source, holdings, or canonical events"
+            "pinned source commit lacks opening-basis source evidence"
+        )
+    holdings_file = repository.read_text_at_commit(
+        paths.holdings, REVIEWED_OPENING_REPOSITORY_COMMIT_SHA
+    )
+    events_file = repository.read_text_at_commit(
+        paths.event, REVIEWED_OPENING_REPOSITORY_COMMIT_SHA
+    )
+    if (
+        not holdings_file.exists
+        or holdings_file.sha is None
+        or not events_file.exists
+        or events_file.sha is None
+    ):
+        raise OpeningBasisError(
+            "reviewed opening commit lacks holdings or canonical events"
         )
     source, access, trades, ledgers, orders = parse_source_artifact(source_file.content)
     if source["generated_at"] != generated_at:
         raise OpeningBasisError(
             "basis generated_at must reuse the immutable source generated_at"
         )
-    binding = derive_opening_binding(holdings_file.content, events_file.content)
+    binding = derive_opening_binding(
+        holdings_file.content,
+        events_file.content,
+        repository_commit_sha=REVIEWED_OPENING_REPOSITORY_COMMIT_SHA,
+        holdings_path=paths.holdings,
+        holdings_blob_sha=holdings_file.sha,
+        events_path=paths.event,
+        events_blob_sha=events_file.sha,
+    )
     source_reference = {
         "path": source_path,
         "blob_sha": source_file.sha,

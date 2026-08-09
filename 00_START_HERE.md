@@ -390,6 +390,12 @@ Use the manual `Kraken Opening Performance Basis` workflow. This is a one-time
 performance-book basis capture and is not a tax-basis calculation. It never
 uses current ticker prices.
 
+The compact artifact binds opening quantities to a separately reviewed,
+immutable private-repository commit. It records the exact holdings/event paths,
+blobs and content hashes at that commit, while the Kraken history source keeps
+its own immutable commit. New events and rounded live snapshots therefore do
+not re-derive or mutate the reviewed opening state.
+
 1. Confirm the Kraken key has `Query closed orders & trades` and `Query ledger
    entries`, no withdrawal permission, and an unrestricted history start.
 2. Choose one fixed UTC `generated_at`. Run `source` in `preview`, review the
