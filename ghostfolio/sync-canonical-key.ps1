@@ -9,7 +9,7 @@ $gladosRoot = Split-Path $repositoryRoot -Parent
 $ghostfolioRoot = Join-Path $gladosRoot 'Ghostfolio'
 $keyPath = Join-Path $ghostfolioRoot 'Key.txt'
 $archiveDirectory = Join-Path $env:LOCALAPPDATA 'dca-ghostfolio\retired-keys'
-$expectedHoldingSymbols = @('bitcoin', 'HYPE32196USD', 'solana')
+$expectedHoldingSymbols = @('bitcoin', 'HYPE32196USD', 'ethereum', 'solana')
 
 $variables = @{}
 Get-Content -LiteralPath $secretFile | ForEach-Object {

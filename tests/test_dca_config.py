@@ -102,13 +102,13 @@ class RulesSchemaTests(unittest.TestCase):
         rules = dca_config.default_rules_map()
         baseline = dca_config.global_rules_hash(rules)
         changed = copy.deepcopy(rules)
-        changed["HYPE_USD"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 15}
+        changed["ETH_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 15}
         self.assertNotEqual(baseline, dca_config.global_rules_hash(changed))
-        changed["HYPE_USD"]["BUY_ENABLED"] = True
+        changed["ETH_GBP"]["BUY_ENABLED"] = True
         self.assertNotEqual(
             dca_config.global_rules_hash(changed),
-            dca_config.global_rules_hash({**changed, "HYPE_USD": {
-                **changed["HYPE_USD"], "BUY_ENABLED": False
+            dca_config.global_rules_hash({**changed, "ETH_GBP": {
+                **changed["ETH_GBP"], "BUY_ENABLED": False
             }}),
         )
 
@@ -116,11 +116,11 @@ class RulesSchemaTests(unittest.TestCase):
         rules = dca_config.validate_rules_map(dca_config.default_rules_map())
         self.assertEqual(
             dca_config.ALLOWED_TARGETS,
-            ("BTC_GBP", "HYPE_USD", "SOL_GBP"),
+            ("BTC_GBP", "ETH_GBP", "SOL_GBP"),
         )
         self.assertEqual(
             dca_config.TARGET_SYMBOLS,
-            {"BTC_GBP": "BTC/GBP", "HYPE_USD": "HYPE/USD", "SOL_GBP": "SOL/GBP"},
+            {"BTC_GBP": "BTC/GBP", "ETH_GBP": "ETH/GBP", "SOL_GBP": "SOL/GBP"},
         )
         self.assertEqual(tuple(rules), dca_config.ALLOWED_TARGETS)
         for rule in rules.values():
@@ -133,7 +133,7 @@ class RulesSchemaTests(unittest.TestCase):
             )
 
     def test_rejects_legacy_quote_targets_unknown_missing_and_legacy_fields(self):
-        for legacy_target in ("BTC_USD", "BTC_THB", "ETH_GBP", "ADA_GBP"):
+        for legacy_target in ("BTC_USD", "BTC_THB", "HYPE_USD", "ADA_GBP"):
             with self.subTest(legacy_target=legacy_target):
                 rules = dca_config.default_rules_map()
                 rules[legacy_target] = rules.pop("BTC_GBP")
@@ -143,8 +143,8 @@ class RulesSchemaTests(unittest.TestCase):
                     dca_config.validate_rules_map(rules)
 
         rules = dca_config.default_rules_map()
-        rules.pop("HYPE_USD")
-        with self.assertRaisesRegex(ValueError, "missing production targets.*HYPE_USD"):
+        rules.pop("ETH_GBP")
+        with self.assertRaisesRegex(ValueError, "missing production targets.*ETH_GBP"):
             dca_config.validate_rules_map(rules)
 
         for legacy in ("TIME", "AMOUNT", "AMOUNT_GBP", "DYNAMIC_DCA"):
@@ -249,7 +249,7 @@ class RulesSchemaTests(unittest.TestCase):
         self.assertEqual(dca_config.amount_tier_for_regime("DOWNTREND"), "HIGH")
         rules = dca_config.default_rules_map()
         rules["BTC_GBP"] = {**rule, "BUY_ENABLED": True}
-        rules["HYPE_USD"] = {
+        rules["ETH_GBP"] = {
             "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 15},
             "BUY_ENABLED": True,
         }
@@ -259,13 +259,13 @@ class RulesSchemaTests(unittest.TestCase):
         }
         self.assertEqual(dca_config.maximum_daily_exposure_gbp(rules), 50)
 
-    def test_requested_three_asset_policy_keeps_gbp_budgets_on_usd_pairs(self):
+    def test_requested_three_asset_policy_keeps_gbp_budgets_on_gbp_pairs(self):
         rules = {
             "BTC_GBP": {
                 "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 20},
                 "BUY_ENABLED": True,
             },
-            "HYPE_USD": {
+            "ETH_GBP": {
                 "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 15},
                 "BUY_ENABLED": True,
             },
@@ -648,13 +648,13 @@ class StateSchemaTests(unittest.TestCase):
 
     def test_capacity_reserves_worst_case_delivery_for_every_pending_order(self):
         state = {
-            "HYPE_USD": {
+            "ETH_GBP": {
                 "PENDING_ORDER": {
                     "client_order_id": "dca-1234567890abcd",
                     "funding_client_order_id": "dca-fedcba09876543",
                     "trade_date": "2026-08-06",
                     "amount_gbp": 20.0,
-                    "decision_id": "decision-hype",
+                    "decision_id": "decision-eth",
                     "created_at": "2026-08-06T01:00:00Z",
                 }
             }

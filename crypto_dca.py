@@ -1,4 +1,4 @@
-"""Fail-closed execution of GBP-budgeted mixed spot purchases on Kraken."""
+"""Fail-closed execution of GBP-budgeted spot purchases on Kraken."""
 
 from __future__ import annotations
 
@@ -61,6 +61,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 RULES_VARIABLE = "DCA_TARGET_MAP"
 ANALYSIS_STATE_VARIABLE = "DCA_ANALYSIS_STATE"
 EXECUTION_STATE_VARIABLE = "DCA_EXECUTION_STATE"
+TARGET_MIGRATION_LOCK_VARIABLE = "DCA_TARGET_MIGRATION_LOCK"
 PENDING_ORDER_FIELD = "PENDING_ORDER"
 PENDING_GIST_DELIVERIES_FIELD = "PENDING_GIST_DELIVERIES"
 _CLIENT_ORDER_ID_PATTERN = re.compile(r"^dca-[0-9a-f]{14}$")
@@ -85,7 +86,7 @@ def _place_routed_market_buy(
     reconcile_only,
     pre_submit_check,
 ):
-    """Route only HYPE/USD through GBP/USD; native pairs spend GBP directly."""
+    """Route each configured target according to the shared production contract."""
     if TARGET_ROUTES[key] == "DIRECT_GBP":
         return place_market_buy(
             key,
@@ -332,6 +333,16 @@ def _write_repo_json_variable(variable_name, value, *, exists):
     if variable_name == EXECUTION_STATE_VARIABLE:
         value = validate_execution_state(value)
     url, collection_url, headers = _github_variable_context(variable_name)
+    lock_url, _lock_collection_url, _lock_headers = _github_variable_context(
+        TARGET_MIGRATION_LOCK_VARIABLE
+    )
+    lock_response = requests.get(lock_url, headers=headers, timeout=15)
+    if lock_response.status_code == 200:
+        raise RuntimeError("Target migration lock blocks execution-state writes")
+    if lock_response.status_code != 404:
+        raise RuntimeError(
+            "Target migration lock could not be checked before execution-state write"
+        )
     data = {
         "name": variable_name,
         "value": json.dumps(value, separators=(",", ":"), ensure_ascii=False),
@@ -1073,7 +1084,7 @@ def execute_trade(
 
 
 def main():
-    print("--- Starting Kraken GBP-budgeted mixed-market DCA execution ---", flush=True)
+    print("--- Starting Kraken GBP-market DCA execution ---", flush=True)
     try:
         execution_state = _initial_execution_state()
     except (json.JSONDecodeError, ConfigError, RuntimeError, ValueError) as error:

@@ -90,7 +90,7 @@ class DcaConfigWriterTests(unittest.TestCase):
         state["TARGETS"]["BTC_GBP"]["RULES_HASH"] = expected_hash
         # A different disabled target may legitimately have an obsolete READY
         # decision after its own budget edit; it must not block BTC's enable.
-        state["TARGETS"]["HYPE_USD"].update(
+        state["TARGETS"]["ETH_GBP"].update(
             {
                 "ANALYSIS_STATUS": "READY",
                 "EXECUTION_STATUS": "ARMED",
@@ -156,10 +156,10 @@ class DcaConfigWriterTests(unittest.TestCase):
             )
 
     def test_second_queued_enable_rejects_changed_global_pre_state(self):
-        for symbol in ("BTC_GBP", "HYPE_USD"):
+        for symbol in ("BTC_GBP", "ETH_GBP"):
             self.rules[symbol]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
         state = empty_analysis_state(self.rules, now=self.now)
-        for symbol in ("BTC_GBP", "HYPE_USD"):
+        for symbol in ("BTC_GBP", "ETH_GBP"):
             state["TARGETS"][symbol].update(
                 {
                     "ANALYSIS_STATUS": "READY",
@@ -195,10 +195,10 @@ class DcaConfigWriterTests(unittest.TestCase):
                 state,
                 {},
                 action="set_enabled",
-                symbol="HYPE_USD",
+                symbol="ETH_GBP",
                 enabled_json="true",
-                expected_rules_hash=rules_hash("HYPE_USD", self.rules["HYPE_USD"]),
-                expected_decision_id=state["TARGETS"]["HYPE_USD"]["DECISION_ID"],
+                expected_rules_hash=rules_hash("ETH_GBP", self.rules["ETH_GBP"]),
+                expected_decision_id=state["TARGETS"]["ETH_GBP"]["DECISION_ID"],
                 expected_global_rules_hash=reviewed_global_hash,
                 market_minimum_provider=lambda _symbol: 5,
                 now=self.now,

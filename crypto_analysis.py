@@ -1,4 +1,4 @@
-"""Deterministic Kraken mixed-market regime and execution-time analysis.
+"""Deterministic Kraken GBP-market regime and execution-time analysis.
 
 Gemini is an optional narrator only.  All spend-affecting outputs (regime,
 amount tier, and execution time) are calculated locally from completed Kraken
@@ -49,6 +49,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 DCA_TARGET_MAP_ENV = os.environ.get("DCA_TARGET_MAP", "{}")
 DCA_ANALYSIS_STATE_ENV = os.environ.get("DCA_ANALYSIS_STATE", "")
 ANALYSIS_VARIABLE = "DCA_ANALYSIS_STATE"
+TARGET_MIGRATION_LOCK_VARIABLE = "DCA_TARGET_MIGRATION_LOCK"
 PERIODS = (3, 5, 7, 14, 30, 45, 60)
 CORE_PERIODS = (14, 30, 45, 60)
 DCA_TRADING_MODE = os.environ.get("DCA_TRADING_MODE", "shadow").strip().lower()
@@ -59,8 +60,8 @@ WEEKLY_TIMEFRAME_MS = 7 * DAILY_TIMEFRAME_MS
 QUARTER_HOUR_MS = 15 * 60 * 1000
 # SMA150's 20-day slope needs the current SMA and the value 20 completed
 # candles earlier: 150 + 20 = 170 completed daily candles. Requiring more
-# would permanently exclude otherwise analyzable newer Kraken markets such as
-# HYPE/USD without adding another signal to the documented regime policy.
+# would exclude otherwise analyzable newer markets without adding another
+# signal to the documented regime policy.
 MIN_DAILY_CANDLES = 170
 MIN_WEEKLY_CANDLES = 20
 KRAKEN_OHLCV_LIMIT = 720
@@ -88,13 +89,13 @@ def _iso_utc(value: datetime) -> str:
 def _target_from_symbol(value: str) -> str:
     candidate = value.strip().strip("\"'").upper().replace("_", "/")
     if "/" not in candidate:
-        candidate = {"BTC": "BTC/GBP", "HYPE": "HYPE/USD", "SOL": "SOL/GBP"}.get(
+        candidate = {"BTC": "BTC/GBP", "ETH": "ETH/GBP", "SOL": "SOL/GBP"}.get(
             candidate, candidate
         )
     target = candidate.replace("/", "_")
     if target not in TARGET_KEYS:
         raise ValueError(
-            f"Only BTC/GBP, HYPE/USD, and SOL/GBP are supported: {value}"
+            f"Only BTC/GBP, ETH/GBP, and SOL/GBP are supported: {value}"
         )
     return target
 
@@ -835,6 +836,17 @@ def persist_analysis_state(state: Mapping[str, Any]) -> bool:
         "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    lock_response = requests.get(
+        f"{base_url}/{TARGET_MIGRATION_LOCK_VARIABLE}",
+        headers=headers,
+        timeout=20,
+    )
+    if lock_response.status_code == 200:
+        raise RuntimeError("Target migration lock blocks analysis persistence")
+    if lock_response.status_code != 404:
+        raise RuntimeError(
+            "Target migration lock could not be checked before analysis persistence"
+        )
     response = requests.patch(
         f"{base_url}/{ANALYSIS_VARIABLE}",
         headers=headers,

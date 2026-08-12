@@ -107,15 +107,84 @@ class WorkflowSafetyTests(unittest.TestCase):
                         f"{name} does not load {variable}",
                     )
 
-    def test_workflow_inputs_and_steps_describe_mixed_targets_only(self):
+    def test_workflow_inputs_and_steps_describe_gbp_targets_only(self):
         analysis = self._read("crypto_analysis.yml")
         writer = self._read("update_dca_config.yml")
-        self.assertIn("BTC, HYPE, SOL, a canonical configured pair, or all", analysis)
+        portfolio = self._read("portfolio_check.yml")
+        self.assertIn("BTC, ETH, SOL, a canonical configured pair, or all", analysis)
         self.assertIn("Analyze configured Kraken markets", analysis)
-        self.assertNotIn("ETH", analysis)
+        self.assertNotIn("HYPE", analysis)
         self.assertNotIn("ADA", analysis)
-        self.assertIn("BTC_GBP, HYPE_USD, or SOL_GBP", writer)
+        self.assertIn("BTC_GBP, ETH_GBP, or SOL_GBP", writer)
         self.assertIn("Canonical Kraken key", writer)
+        self.assertIn("--targets BTC_GBP,ETH_GBP,SOL_GBP", portfolio)
+        self.assertNotIn("HYPE_USD", portfolio)
+
+    def test_hype_to_eth_migration_is_main_only_audited_and_masks_state(self):
+        migration = self._read("migrate_hype_to_eth.yml")
+        for required in (
+            "github.ref == 'refs/heads/main'",
+            "MIGRATE_HYPE_TO_ETH_GBP",
+            "RAILWAY_CRON_PAUSED",
+            "audit_orders",
+            'result["flow_integrity_ok"]',
+            'result["unresolved_bot_orders"]',
+            'result["unknown_timestamp_closed_bot_orders"]',
+            "gh variable get DCA_TARGET_MAP",
+            "gh variable get DCA_ANALYSIS_STATE",
+            "gh variable get DCA_EXECUTION_STATE",
+            "::add-mask::%s",
+            'done <<< "$analysis"',
+            "dca_target_migration.py",
+            '--analysis "$analysis"',
+            '_CURRENT_STATE_HASHES',
+            "changed after migration validation; refusing write",
+            "DCA_RETIRED_TARGET_STATE",
+            "DCA_TARGET_MIGRATION_LOCK",
+            "--retired \"$retired\"",
+            '"DCA_ANALYSIS_STATE",\n              "DCA_EXECUTION_STATE",\n              "DCA_TARGET_MAP"',
+            "readback verification failed",
+            "group: dca-execution-state-writers",
+            "cancel-in-progress: false",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, migration)
+        self.assertNotIn('echo "$rules"', migration)
+        self.assertNotIn('echo "$execution"', migration)
+        self.assertNotIn(
+            'DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY" 2>/dev/null ||',
+            migration,
+        )
+        self.assertIn("gh run list", migration)
+        self.assertIn("--status in_progress", migration)
+        self.assertLess(
+            migration.index('"DCA_RETIRED_TARGET_STATE"'),
+            migration.index('# Rules are the compatibility boundary'),
+        )
+        self.assertLess(
+            migration.index('"DCA_ANALYSIS_STATE",\n              "DCA_EXECUTION_STATE"'),
+            migration.index('"DCA_EXECUTION_STATE",\n              "DCA_TARGET_MAP"'),
+        )
+        self.assertGreater(
+            migration.index("gh variable delete DCA_TARGET_MIGRATION_LOCK"),
+            migration.index("final {name} verification failed"),
+        )
+
+    def test_all_state_writers_observe_the_target_migration_lock(self):
+        for name in (
+            "crypto_analysis.yml",
+            "daily_dca.yml",
+            "update_dca_config.yml",
+        ):
+            text = self._read(name)
+            with self.subTest(workflow=name):
+                self.assertIn("DCA_TARGET_MIGRATION_LOCK", text)
+        analysis_module = (ROOT / "crypto_analysis.py").read_text(encoding="utf-8")
+        self.assertIn("TARGET_MIGRATION_LOCK_VARIABLE", analysis_module)
+        self.assertIn("blocks analysis persistence", analysis_module)
+        trader_module = (ROOT / "crypto_dca.py").read_text(encoding="utf-8")
+        self.assertIn("TARGET_MIGRATION_LOCK_VARIABLE", trader_module)
+        self.assertIn("blocks execution-state writes", trader_module)
 
     def test_start_date_gate_is_passed_to_analysis_and_trader(self):
         for name in ("crypto_analysis.yml", "daily_dca.yml"):

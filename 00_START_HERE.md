@@ -43,9 +43,9 @@ The configured target set is exactly:
 
 | Pair | `UPTREND` lower | `SIDEWAYS` midpoint | `DOWNTREND` higher | Intended state |
 | --- | ---: | ---: | ---: | --- |
-| `BTC/GBP` | £12.50 | £18.75 | £25 | Enabled |
-| `HYPE/USD` | £12.50 | £15.63 | £18.75 | Enabled |
-| `SOL/GBP` | £12.50 | £15.63 | £18.75 | Enabled |
+| `BTC/GBP` | £12.50 | £18.75 | £25 | Disabled at cutover; re-enable deliberately |
+| `ETH/GBP` | £12.50 | £15.63 | £18.75 | Disabled at cutover; enable after fresh analysis |
+| `SOL/GBP` | £12.50 | £15.63 | £18.75 | Disabled at cutover; re-enable deliberately |
 
 - The bot deliberately buys more in a `DOWNTREND`, the midpoint in a
   `SIDEWAYS` market, and less in an `UPTREND`.
@@ -71,16 +71,15 @@ rules, decisions, pending state, and scheduler posture.
 3. Python selects the higher / midpoint / lower GBP spend for downtrend /
    sideways / uptrend respectively, plus the best 15-minute execution time from
    deterministic 3-, 5-, 7-, 14-, 30-, 45-, and 60-day timing windows on
-   BTC/GBP, HYPE/USD, and SOL/GBP.
+   BTC/GBP, ETH/GBP, and SOL/GBP.
 4. The workflow writes a fresh `DCA_ANALYSIS_STATE` and posts a readable summary
    to Discord.
 5. Railway checks the absolute execution times every five minutes and dispatches
    the trader when a pair is due.
 6. The trader rechecks the live rule, decision, date, window, Kraken minimum,
    pending-order state, and once-per-day guard.
-7. BTC and SOL spend GBP directly on `BTC/GBP` and `SOL/GBP`. Only HYPE uses
-   the explicit `GBP/USD` funding leg before spending confirmed net USD on
-   `HYPE/USD`.
+7. BTC, ETH, and SOL spend GBP directly on `BTC/GBP`, `ETH/GBP`, and `SOL/GBP`.
+   No active target has a funding leg.
 8. Kraken remains the authoritative record and Discord receives the result.
 
 Gemini Flash-Lite explains the completed Python decision. It cannot select or
@@ -176,7 +175,7 @@ show status
 !dca health
 ```
 
-Replace `BTC` with `HYPE` or `SOL` as needed. Enter numbers without a `£` sign
+Replace `BTC` with `ETH` or `SOL` as needed. Enter numbers without a `£` sign
 and with no more than two decimal places. The lower amount cannot exceed the
 higher amount. Both endpoints must be between £5 and £1,000 and at or above
 Kraken's current market minimum before enabling. Zero is permitted only as a
@@ -186,7 +185,7 @@ nearest penny with half-up currency rounding.
 ### Stop buying a pair
 
 ```text
-!dca disable HYPE
+!dca disable ETH
 ```
 
 Disabling is the safe operational meaning of removing a pair. It prevents a new
@@ -211,15 +210,15 @@ The user-owned repository variable is `DCA_TARGET_MAP`. Its approved shape is:
 {
   "BTC_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 25},
-    "BUY_ENABLED": true
+    "BUY_ENABLED": false
   },
-  "HYPE_USD": {
+  "ETH_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 18.75},
-    "BUY_ENABLED": true
+    "BUY_ENABLED": false
   },
   "SOL_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 18.75},
-    "BUY_ENABLED": true
+    "BUY_ENABLED": false
   }
 }
 ```
@@ -263,7 +262,7 @@ Run fresh analysis after a budget change before trying to re-enable or trade.
 ## Adding or permanently removing a pair
 
 Pair membership is a maintainer/Codex code-and-state migration, not a beginner
-JSON setting. The current schema requires exactly `BTC_GBP`, `HYPE_USD`, and
+JSON setting. The current schema requires exactly `BTC_GBP`, `ETH_GBP`, and
 `SOL_GBP`; an extra or missing key fails closed.
 
 For a permanent pair change:
@@ -272,8 +271,9 @@ For a permanent pair change:
 2. Set `DCA_CRON_ENABLED=false` in Railway service variables.
 3. Run a read-only Kraken order audit and confirm there are no unresolved or
    pending intents. Never discard an order or pending state to make this pass.
-4. Confirm the new `BASE/USD` spot market exists on Kraken, can be funded from
-   `GBP/USD`, and satisfies the current Kraken minimum.
+4. Confirm the exact new Kraken spot market exists and satisfies the current
+   GBP-equivalent market minimum. A non-GBP route also requires a reviewed,
+   explicit funding path; `ETH/GBP` is direct and has no funding leg.
 5. Confirm the market has at least 170 completed daily candles, 20 completed
    weekly candles, and seven complete days of 15-minute data.
 6. Have a maintainer prepare a staged compatibility/migration pull request that
@@ -286,12 +286,20 @@ For a permanent pair change:
 8. Merge only after full CI and Docker validation pass. If the release uses a
    single cutover instead of staged compatibility, expect a deliberate temporary
    `NOT READY` fail-closed window while the state migration runs.
-9. Run the authorized migration mechanism. Do not hand-edit analysis or
-   execution state in the GitHub interface.
-10. Regenerate complete analysis with `!dca analyze all`, then run the Portfolio
+9. For the HYPE-to-ETH cutover, run the `Replace HYPE/USD DCA with ETH/GBP`
+   workflow on `main` only after typing both exact confirmations
+   `MIGRATE_HYPE_TO_ETH_GBP` and `RAILWAY_CRON_PAUSED`. It audits Kraken order
+   integrity, masks and hash-binds the complete source state, resets active
+   analysis, starts ETH disabled with no inherited buy date, preserves BTC/SOL
+   buy dates, and writes HYPE's final rule, analysis, and buy date to hash-bound
+   `DCA_RETIRED_TARGET_STATE`.
+   Do not hand-edit analysis or execution state in the GitHub interface.
+10. Run the `Kraken History Bootstrap` workflow with `targets=ETH_GBP` and wait
+    for verified ETH/GBP history coverage. Do not reuse HYPE partitions for ETH.
+11. Regenerate complete analysis with `!dca analyze all`, then run the Portfolio
     Balance Check and verify the new market set.
-11. Enable only the desired pairs with Discord exact confirmation.
-12. Restore `DCA_CRON_ENABLED=true` in Railway and verify `!dca health`.
+12. Enable only the desired pairs with Discord exact confirmation.
+13. Restore `DCA_CRON_ENABLED=true` in Railway and verify `!dca health`.
 
 Primary code locations:
 
@@ -301,6 +309,7 @@ Primary code locations:
 - [Kraken order-audit target list](kraken_order_audit.py#L21-L24)
 - [Analysis workflow input](.github/workflows/crypto_analysis.yml#L7-L13)
 - [Configuration workflow input](.github/workflows/update_dca_config.yml#L3-L17)
+- [Guarded HYPE-to-ETH state migration](.github/workflows/migrate_hype_to_eth.yml)
 - [Automated tests](tests)
 
 Never permanently remove a pair that has a pending order. Reconcile it first.
@@ -317,8 +326,9 @@ These changes require a tested pull request and cannot be made through Discord:
 - Best-time policy: [`crypto_analysis.py`](crypto_analysis.py#L423-L500).
 - Gemini explanation contract and model fallback:
   [`crypto_analysis.py`](crypto_analysis.py#L665-L688).
-- mixed direct-GBP / GBP-funded-USD execution and Kraken reconciliation:
-  [`kraken_client.py`](kraken_client.py).
+- Active direct-GBP execution and Kraken reconciliation:
+  [`kraken_client.py`](kraken_client.py). The GBP-funded-USD connector remains
+  only for legacy/historical recovery compatibility and is not an active route.
 
 `DCA_CRON_ENABLED` is a Railway runtime variable, not a GitHub repository
 variable. Keep it `true` for normal operation. Setting it to `false` pauses new
@@ -455,9 +465,10 @@ portfolio ledger or receipts from a Gist.
    indicate Kraken quantity drift, missing `USDGBP` reporting data, a non-GBP
    custody account, or `portfolio/details` returning `hasError`.
 4. Sign out of Ghostfolio, sign in with the current `Key.txt`, and reload
-   `/en/home/holdings`. The expected active rows are Bitcoin, Hyperliquid USD,
-   and Solana. Do not create another local user or copy activities between user
-   IDs.
+   `/en/home/holdings`. The expected active DCA rows are Bitcoin, Ethereum, and
+   Solana. Historical Hyperliquid activity can remain for the fixed 7 August
+   recovery record. Do not create another local user or copy activities between
+   user IDs.
 
 The signed holdings workflow runs at minutes 11 and 41. The local sidecar polls
 every five minutes and reconciles a new signed snapshot idempotently, so either

@@ -200,9 +200,9 @@ class DiscordBotControlTests(unittest.TestCase):
         self.rules = rules()
         self.analysis = analysis_state(self.rules)
 
-    def test_only_three_production_usd_assets_are_accepted(self):
+    def test_only_three_production_gbp_assets_are_accepted(self):
         self.assertEqual(discord_bot._normalise_usd_key("bitcoin"), "BTC_GBP")
-        self.assertEqual(discord_bot._normalise_usd_key("HYPE/USD"), "HYPE_USD")
+        self.assertEqual(discord_bot._normalise_usd_key("Ethereum"), "ETH_GBP")
         self.assertEqual(discord_bot._normalise_usd_key("BTC/GBP"), "BTC_GBP")
         with self.assertRaisesRegex(ValueError, "Supported assets"):
             discord_bot._normalise_usd_key("CAR")
@@ -323,7 +323,7 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             self.assertEqual(
                 discord_bot._symbols_from_dca_map(),
-                "BTC/GBP, HYPE/USD, SOL/GBP",
+                "BTC/GBP, ETH/GBP, SOL/GBP",
             )
 
     def test_amount_update_is_atomic_and_requires_disabled_target(self):
@@ -334,20 +334,21 @@ class DiscordBotControlTests(unittest.TestCase):
             ),
             patch.object(discord_bot, "trigger_workflow", return_value=True) as dispatch,
         ):
-            asyncio.run(discord_bot.handle_set_amounts("BTC", 10, 20, message))
+            asyncio.run(discord_bot.handle_set_amounts("ETH", 10, 20, message))
         dispatch.assert_called_once_with(
             "update_dca_config.yml",
             {
                 "action": "set_amounts",
-                "symbol": "BTC_GBP",
+                "symbol": "ETH_GBP",
                 "low_amount_gbp_json": "10.0",
                 "up_amount_gbp_json": "20.0",
             },
         )
         self.assertIn("atomic budgets", message.replies[-1])
         self.assertIn("sideways midpoint £15", message.replies[-1])
+        self.assertIn("`!dca analyze ETH`", message.replies[-1])
 
-        enabled_rules = rules(enabled={"BTC_GBP"})
+        enabled_rules = rules(enabled={"ETH_GBP"})
         blocked = MessageStub()
         with (
             patch.object(
@@ -357,7 +358,7 @@ class DiscordBotControlTests(unittest.TestCase):
             ),
             patch.object(discord_bot, "trigger_workflow") as dispatch,
         ):
-            asyncio.run(discord_bot.handle_set_amounts("BTC", 11, 21, blocked))
+            asyncio.run(discord_bot.handle_set_amounts("ETH", 11, 21, blocked))
         dispatch.assert_not_called()
         self.assertIn("disable", blocked.replies[-1])
 
@@ -426,12 +427,12 @@ class DiscordBotControlTests(unittest.TestCase):
     def test_disable_uses_serialized_writer_without_confirmation(self):
         message = MessageStub()
         with patch.object(discord_bot, "trigger_workflow", return_value=True) as dispatch:
-            asyncio.run(discord_bot.handle_disable("HYPE", message))
+            asyncio.run(discord_bot.handle_disable("ETH", message))
         dispatch.assert_called_once_with(
             "update_dca_config.yml",
             {
                 "action": "set_enabled",
-                "symbol": "HYPE_USD",
+                "symbol": "ETH_GBP",
                 "enabled_json": "false",
             },
         )
@@ -662,7 +663,7 @@ class DiscordBotControlTests(unittest.TestCase):
             patch.object(discord_bot, "DCA_CRON_ENABLED", True),
         ):
             asyncio.run(discord_bot.handle_status({}, status_message))
-        self.assertIn("Kraken mixed-market DCA status", status_message.replies[-1])
+        self.assertIn("Kraken GBP-market DCA status", status_message.replies[-1])
         self.assertIn("BTC_GBP", status_message.replies[-1])
         self.assertIn("UPTREND/lower £10", status_message.replies[-1])
         self.assertIn("SIDEWAYS/midpoint £15", status_message.replies[-1])
@@ -689,7 +690,9 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("READY-BUT-DISABLED", health_message.replies[-1])
         self.assertIn("fresh READY 3/3", health_message.replies[-1])
         self.assertIn("Buy-enabled targets: 0/3", health_message.replies[-1])
-        self.assertIn("Kraken mixed-market DCA controls", discord_bot.HELP_TEXT)
+        self.assertIn("3/3 GBP targets", health_message.replies[-1])
+        self.assertNotIn("mixed targets", health_message.replies[-1])
+        self.assertIn("Kraken GBP-market DCA controls", discord_bot.HELP_TEXT)
         self.assertLessEqual(len(health_message.replies[-1]), 2_000)
 
     def test_status_and_health_label_unknown_workflow_evidence_fail_closed(self):
@@ -762,7 +765,7 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("SHADOW — REAL KRAKEN ORDERS OFF", status)
         self.assertIn("BTC/GBP", status)
         self.assertIn("SIMULATION ONLY", status)
-        self.assertIn("HYPE/USD", status)
+        self.assertIn("ETH/GBP", status)
         self.assertIn("OFF — PAIR DISABLED", status)
         self.assertIn("SOL/GBP", status)
         self.assertIn("WAITING FOR FRESH ANALYSIS", status)
@@ -771,12 +774,12 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertLessEqual(len(status), 2_000)
 
     def test_expired_enabled_pair_says_no_replay_and_resumes_tomorrow(self):
-        live_rules = rules(enabled={"HYPE_USD"})
-        decision = analysis_state(live_rules)["TARGETS"]["HYPE_USD"]
+        live_rules = rules(enabled={"ETH_GBP"})
+        decision = analysis_state(live_rules)["TARGETS"]["ETH_GBP"]
 
         summary = discord_bot._decision_summary(
-            "HYPE_USD",
-            live_rules["HYPE_USD"],
+            "ETH_GBP",
+            live_rules["ETH_GBP"],
             decision,
             {},
             now=NOW + timedelta(hours=3),
@@ -789,7 +792,7 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertNotIn("Regime: `ERROR`", summary)
 
     def test_expired_enabled_pair_is_quietly_omitted_from_scheduler(self):
-        live_rules = rules(enabled={"HYPE_USD"})
+        live_rules = rules(enabled={"ETH_GBP"})
         analysis = analysis_state(live_rules)
         execution = {}
 
@@ -803,7 +806,7 @@ class DiscordBotControlTests(unittest.TestCase):
             )
         )
 
-        self.assertNotIn("HYPE_USD", discord_bot._dca_schedule)
+        self.assertNotIn("ETH_GBP", discord_bot._dca_schedule)
         self.assertIsNone(discord_bot._schedule_error)
         self.assertIsNone(discord_bot._schedule_warning)
 
@@ -1004,7 +1007,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         discord_bot._workflow_contract_error = None
 
     def test_v1_analysis_state_clears_schedule_and_fails_closed(self):
-        live_rules = rules(enabled={"BTC_GBP", "HYPE_USD", "SOL_GBP"})
+        live_rules = rules(enabled={"BTC_GBP", "ETH_GBP", "SOL_GBP"})
         decisions = analysis_state(live_rules)
         decisions["VERSION"] = 1
 
@@ -1022,12 +1025,12 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         self.assertIn("VERSION must be 3", discord_bot._schedule_error)
 
     def test_multiple_assets_can_share_or_use_different_absolute_times(self):
-        live_rules = rules(enabled={"BTC_GBP", "HYPE_USD", "SOL_GBP"})
+        live_rules = rules(enabled={"BTC_GBP", "ETH_GBP", "SOL_GBP"})
         decisions = analysis_state(
             live_rules,
             execute_offsets={
                 "BTC_GBP": 30,
-                "HYPE_USD": 30,
+                "ETH_GBP": 30,
                 "SOL_GBP": 45,
             },
         )
@@ -1038,11 +1041,11 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(
             set(discord_bot._dca_schedule),
-            {"BTC_GBP", "HYPE_USD", "SOL_GBP"},
+            {"BTC_GBP", "ETH_GBP", "SOL_GBP"},
         )
         self.assertEqual(
             discord_bot._dca_schedule["BTC_GBP"]["execute_at"],
-            discord_bot._dca_schedule["HYPE_USD"]["execute_at"],
+            discord_bot._dca_schedule["ETH_GBP"]["execute_at"],
         )
         self.assertNotEqual(
             discord_bot._dca_schedule["BTC_GBP"]["execute_at"],
@@ -1096,7 +1099,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         self.assertIn("BTC_GBP: analysis ERROR", discord_bot._schedule_warning)
 
     def test_prior_day_ready_state_waits_quietly_until_daily_analysis_deadline(self):
-        live_rules = rules(enabled={"BTC_GBP", "HYPE_USD", "SOL_GBP"})
+        live_rules = rules(enabled={"BTC_GBP", "ETH_GBP", "SOL_GBP"})
         decisions = analysis_state(
             live_rules,
             generated_at=datetime(2026, 8, 5, 12, 20, tzinfo=timezone.utc),
@@ -1284,7 +1287,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         self.assertEqual(discord_bot._awaiting_start_day_symbols, set())
 
     def test_disabled_asset_rules_mismatch_does_not_block_enabled_asset(self):
-        live_rules = rules(enabled={"HYPE_USD"})
+        live_rules = rules(enabled={"ETH_GBP"})
         decisions = analysis_state(live_rules)
         live_rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 11, "UP": 21}
 
@@ -1293,10 +1296,10 @@ class DiscordBotSchedulerTests(unittest.TestCase):
                 json.dumps(live_rules), json.dumps(decisions), "{}", now=NOW
             )
         )
-        self.assertEqual(set(discord_bot._dca_schedule), {"HYPE_USD"})
+        self.assertEqual(set(discord_bot._dca_schedule), {"ETH_GBP"})
 
     def test_enabled_pair_error_blocks_all_new_order_schedules(self):
-        live_rules = rules(enabled={"BTC_GBP", "HYPE_USD"})
+        live_rules = rules(enabled={"BTC_GBP", "ETH_GBP"})
         decisions = analysis_state(
             live_rules, status_overrides={"BTC_GBP": "ERROR"}
         )
@@ -1311,7 +1314,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         self.assertIn("BTC_GBP: analysis ERROR", discord_bot._schedule_warning)
 
     def test_due_assets_use_inclusive_minus_five_plus_sixty_window(self):
-        live_rules = rules(enabled={"BTC_GBP", "HYPE_USD"})
+        live_rules = rules(enabled={"BTC_GBP", "ETH_GBP"})
         decisions = analysis_state(
             live_rules,
             execute_offsets={symbol: 30 for symbol in ALLOWED_TARGETS},
@@ -1321,7 +1324,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
         )
         self.assertEqual(
             discord_bot._due_symbols_for_dispatch(NOW + timedelta(minutes=25)),
-            ["BTC_GBP", "HYPE_USD"],
+            ["BTC_GBP", "ETH_GBP"],
         )
         self.assertEqual(
             discord_bot._due_symbols_for_dispatch(NOW + timedelta(minutes=91)), []
@@ -1765,8 +1768,8 @@ class DiscordBotWorkflowAndGeminiTests(unittest.TestCase):
             {
                 "action": "chat",
                 "topic": "controls",
-                "params": {"symbol": "HYPE_USD", "enabled": True},
-                "reply": "HYPE enabled and order submitted @everyone",
+                "params": {"symbol": "ETH_GBP", "enabled": True},
+                "reply": "ETH enabled and order submitted @everyone",
             }
         )
 
@@ -1780,10 +1783,10 @@ class DiscordBotWorkflowAndGeminiTests(unittest.TestCase):
     def test_missing_gemini_key_keeps_read_only_natural_language_useful(self):
         with patch.object(discord_bot, "GEMINI_API_KEY", ""):
             status = asyncio.run(
-                discord_bot.classify_intent("Why is HYPE disabled today?")
+                discord_bot.classify_intent("Why is ETH disabled today?")
             )
             write = asyncio.run(
-                discord_bot.classify_intent("Please enable HYPE and buy it now")
+                discord_bot.classify_intent("Please enable ETH and buy it now")
             )
 
         self.assertEqual(status["action"], "status")
@@ -1802,7 +1805,7 @@ class DiscordBotWorkflowAndGeminiTests(unittest.TestCase):
         message.author = SimpleNamespace(id="123")
         message.channel.id = "456"
         message.channel.typing.return_value = TypingStub()
-        message.content = "Please enable HYPE and place its order"
+        message.content = "Please enable ETH and place its order"
         message.mentions = []
         message.reply = AsyncMock()
         intent = discord_bot._validate_intent(

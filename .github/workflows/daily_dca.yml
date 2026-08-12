@@ -46,6 +46,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          lock_error="$RUNNER_TEMP/target-migration-lock-error.txt"
+          if gh variable get DCA_TARGET_MIGRATION_LOCK --repo "$GITHUB_REPOSITORY" >/dev/null 2>"$lock_error"; then
+            echo "A target migration is locked; refusing to trade." >&2
+            exit 1
+          elif ! grep -q 'HTTP 404' "$lock_error"; then
+            echo "Could not check the target migration lock; refusing to trade." >&2
+            exit 1
+          fi
           load_variable() {
             local name="$1"
             local value

@@ -22,6 +22,9 @@ from urllib.request import Request, urlopen
 
 EVENT_FILE = "kraken_usd_dca_ghostfolio_events.jsonl"
 RECEIPT_FILE = "ghostfolio_sync_receipts.jsonl"
+# Keep the repository filename stable: snapshot schema evolution is identified
+# by the signed top-level ``version`` field, and historical receipts bind to the
+# content hash rather than to a renamed path.
 HOLDINGS_SNAPSHOT_FILE = "kraken_holdings_snapshot_v1.json"
 HOLDINGS_RECEIPT_FILE = "ghostfolio_holdings_receipts.jsonl"
 PROVENANCE_RECLASSIFICATION_RECEIPT_FILE = (
@@ -70,12 +73,25 @@ ASSET_PROFILES = {
     # providers, but its CoinGecko importer rejects that asset. The supported
     # Yahoo crypto profile is therefore the audited local identifier.
     "HYPE_USD": {"symbol": "HYPE32196USD", "data_source": "YAHOO"},
+    "ETH_GBP": {"symbol": "ethereum", "data_source": "COINGECKO"},
     "SOL_GBP": {"symbol": "solana", "data_source": "COINGECKO"},
 }
-KRAKEN_HOLDINGS_CONTRACT = {
+LEGACY_KRAKEN_HOLDINGS_CONTRACT_V1 = {
     "BTC_GBP": {"asset": "BTC", "pair": "BTC/GBP", "quote_currency": "GBP"},
     "HYPE_USD": {"asset": "HYPE", "pair": "HYPE/USD", "quote_currency": "USD"},
     "SOL_GBP": {"asset": "SOL", "pair": "SOL/GBP", "quote_currency": "GBP"},
+}
+KRAKEN_HOLDINGS_CONTRACT = {
+    "BTC_GBP": {"asset": "BTC", "pair": "BTC/GBP", "quote_currency": "GBP"},
+    # HYPE is retained in reporting snapshots and historical recovery even
+    # though it is no longer an active DCA target.
+    "HYPE_USD": {"asset": "HYPE", "pair": "HYPE/USD", "quote_currency": "USD"},
+    "ETH_GBP": {"asset": "ETH", "pair": "ETH/GBP", "quote_currency": "GBP"},
+    "SOL_GBP": {"asset": "SOL", "pair": "SOL/GBP", "quote_currency": "GBP"},
+}
+KRAKEN_HOLDINGS_CONTRACTS = {
+    1: LEGACY_KRAKEN_HOLDINGS_CONTRACT_V1,
+    2: KRAKEN_HOLDINGS_CONTRACT,
 }
 PORTFOLIO_EVENT_FIELDS = {
     "event_version",
@@ -119,6 +135,11 @@ PORTFOLIO_EVENT_CONTRACT = {
         "quote_currency": "USD",
         "route": "GBP_TO_USD",
     },
+    "ETH_GBP": {
+        "base_currency": "ETH",
+        "quote_currency": "GBP",
+        "route": "DIRECT_GBP",
+    },
     "SOL_GBP": {
         "base_currency": "SOL",
         "quote_currency": "GBP",
@@ -126,7 +147,12 @@ PORTFOLIO_EVENT_CONTRACT = {
     },
 }
 SYMBOLS = {target: profile["symbol"] for target, profile in ASSET_PROFILES.items()}
-QUANTITY_TOLERANCE = {"BTC_GBP": 1e-10, "HYPE_USD": 1e-8, "SOL_GBP": 1e-8}
+QUANTITY_TOLERANCE = {
+    "BTC_GBP": 1e-10,
+    "HYPE_USD": 1e-8,
+    "ETH_GBP": 1e-10,
+    "SOL_GBP": 1e-8,
+}
 REPORTING_ACCOUNT_NAMES = ("Kraken DCA", "Bitkub Legacy")
 REPORTING_CURRENCY = "GBP"
 REQUIRED_REPORTING_CURRENCIES = ("GBP", "USD")
@@ -666,10 +692,15 @@ def parse_holdings_snapshot(content):
     supplied = snapshot.get("canonical_hash")
     unhashed = {key: value for key, value in snapshot.items() if key != "canonical_hash"}
     actual = hashlib.sha256(canonical(unhashed).encode("utf-8")).hexdigest()
+    version = snapshot.get("version")
+    contract = (
+        KRAKEN_HOLDINGS_CONTRACTS.get(version)
+        if isinstance(version, int) and not isinstance(version, bool)
+        else None
+    )
     if (
         supplied != actual
-        or snapshot.get("version") != 1
-        or isinstance(snapshot.get("version"), bool)
+        or contract is None
         or not isinstance(supplied, str)
         or len(supplied) != 64
         or supplied.lower() != supplied
@@ -689,9 +720,9 @@ def parse_holdings_snapshot(content):
             + ", ".join(unsupported)
         )
     holdings = snapshot.get("holdings")
-    if not isinstance(holdings, dict) or set(holdings) != set(SYMBOLS):
+    if not isinstance(holdings, dict) or set(holdings) != set(contract):
         raise RuntimeError("Kraken holdings snapshot does not contain the exact target set")
-    for target, contract in KRAKEN_HOLDINGS_CONTRACT.items():
+    for target, identity in contract.items():
         item = holdings.get(target)
         if not isinstance(item, dict) or set(item) != {
             "asset",
@@ -701,7 +732,7 @@ def parse_holdings_snapshot(content):
             "unit_price_quote",
         }:
             raise RuntimeError(f"Kraken holdings snapshot item is invalid for {target}")
-        if any(item.get(key) != value for key, value in contract.items()):
+        if any(item.get(key) != value for key, value in identity.items()):
             raise RuntimeError(f"Kraken holdings snapshot identity is invalid for {target}")
         _finite_number(
             item.get("quantity"),
@@ -1417,7 +1448,7 @@ def holdings_drift(snapshot, actual):
     if not isinstance(actual, dict):
         raise RuntimeError("Ghostfolio holdings quantities are invalid")
     drift = {}
-    for target in SYMBOLS:
+    for target in snapshot["holdings"]:
         expected = _finite_number(
             snapshot["holdings"][target]["quantity"],
             f"expected holding quantity for {target}",
@@ -1756,7 +1787,10 @@ def _recovery_snapshot(payload, events, event, opening, *, now=None):
 
 
 def _require_recovery_quantities(snapshot, actual, hype_quantity):
-    for target in SYMBOLS:
+    # Historical HYPE recovery evidence is bound to a three-target v1 snapshot.
+    # Compare exactly the targets signed by that snapshot; a later ETH holding
+    # must neither invalidate nor be mutated by recovery of the older artifact.
+    for target in snapshot["holdings"]:
         expected = hype_quantity if target == HYPE_RECOVERY_TARGET else _strict_decimal(
             snapshot["holdings"][target]["quantity"], f"signed {target}"
         )

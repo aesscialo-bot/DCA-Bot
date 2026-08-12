@@ -12,7 +12,7 @@ on:
           - set_enabled
           - dry_run
       symbol:
-        description: Canonical Kraken key (BTC_GBP, HYPE_USD, or SOL_GBP)
+        description: Canonical Kraken key (BTC_GBP, ETH_GBP, or SOL_GBP)
         required: true
         type: string
       low_amount_gbp_json:
@@ -92,6 +92,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          check_target_migration_lock() {
+            local lock_error="$RUNNER_TEMP/target-migration-lock-error.txt"
+            if gh variable get DCA_TARGET_MIGRATION_LOCK --repo "$GITHUB_REPOSITORY" >/dev/null 2>"$lock_error"; then
+              echo "A target migration is locked; refusing the update." >&2
+              exit 1
+            elif ! grep -q 'HTTP 404' "$lock_error"; then
+              echo "Could not check the target migration lock; refusing the update." >&2
+              exit 1
+            fi
+          }
+          check_target_migration_lock
           if ! DCA_TARGET_MAP=$(gh variable get DCA_TARGET_MAP --repo "$GITHUB_REPOSITORY" 2>/dev/null); then
             echo "Could not read DCA_TARGET_MAP; refusing the update." >&2
             exit 1
@@ -129,6 +140,7 @@ jobs:
             echo "Dry run passed; DCA_TARGET_MAP was not changed."
             exit 0
           fi
+          check_target_migration_lock
           gh variable set DCA_TARGET_MAP \
             --repo "$GITHUB_REPOSITORY" \
             --body "$(<"$OUTPUT_FILE")"

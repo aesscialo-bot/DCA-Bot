@@ -7,23 +7,36 @@ import portfolio_balance
 
 
 class PortfolioConfigurationTests(unittest.TestCase):
-    def test_extracts_unique_usd_markets(self):
+    def test_extracts_unique_configured_markets(self):
         target_map = {
             "BTC_GBP": {"BUY_ENABLED": False},
-            "HYPE_USD": {"BUY_ENABLED": True},
+            "ETH_GBP": {"BUY_ENABLED": True},
             "SOL_GBP": {"BUY_ENABLED": True},
         }
 
         self.assertEqual(
-            portfolio_balance.extract_usd_symbols(target_map),
-            ["BTC/GBP", "HYPE/USD", "SOL/GBP"],
+            portfolio_balance.extract_market_symbols(target_map),
+            ["BTC/GBP", "ETH/GBP", "SOL/GBP"],
         )
 
     def test_rejects_non_gbp_usd_or_noncanonical_market(self):
         with self.assertRaisesRegex(ValueError, "expected a BASE_GBP or BASE_USD"):
-            portfolio_balance.extract_usd_symbols({"BTC_EUR": {}})
+            portfolio_balance.extract_market_symbols({"BTC_EUR": {}})
         with self.assertRaisesRegex(ValueError, "expected a BASE_GBP or BASE_USD"):
-            portfolio_balance.extract_usd_symbols({"btc_usd": {}})
+            portfolio_balance.extract_market_symbols({"btc_usd": {}})
+
+    def test_reporting_keeps_retired_hype_without_restoring_it_as_a_target(self):
+        target_map = {
+            "BTC_GBP": {},
+            "ETH_GBP": {},
+            "SOL_GBP": {},
+        }
+
+        self.assertEqual(
+            portfolio_balance.reporting_market_symbols(target_map),
+            ["BTC/GBP", "ETH/GBP", "SOL/GBP", "HYPE/USD"],
+        )
+        self.assertNotIn("HYPE/USD", portfolio_balance.extract_market_symbols(target_map))
 
     def test_monthly_window_uses_latest_completed_fifth(self):
         timezone = ZoneInfo("Asia/Bangkok")
@@ -40,7 +53,7 @@ class PortfolioConfigurationTests(unittest.TestCase):
 
 
 class KrakenPortfolioDataTests(unittest.TestCase):
-    def test_uses_total_balances_and_kraken_usd_tickers(self):
+    def test_uses_total_balances_and_kraken_market_tickers(self):
         exchange = MagicMock()
         exchange.fetch_balance.return_value = {
             "total": {"BTC": 0.1, "GBP": 125.5, "USD": 7.25},
@@ -49,7 +62,7 @@ class KrakenPortfolioDataTests(unittest.TestCase):
         exchange.fetch_ticker.return_value = {"last": 60_000}
 
         balances = portfolio_balance.get_portfolio_balances(exchange, ["BTC/GBP"])
-        prices = portfolio_balance.get_usd_prices(exchange, ["BTC/GBP"])
+        prices = portfolio_balance.get_market_prices(exchange, ["BTC/GBP"])
 
         self.assertEqual(
             balances,
@@ -88,7 +101,7 @@ class KrakenPortfolioDataTests(unittest.TestCase):
                     "amount": 0.01,
                     "price": 60_000,
                     "cost": 600,
-                    "fee": {"currency": "USD", "cost": 1.5},
+                    "fee": {"currency": "GBP", "cost": 1.5},
                 },
                 {
                     "id": "sell-1",
@@ -126,9 +139,10 @@ class KrakenPortfolioDataTests(unittest.TestCase):
             [trade["trade_id"] for trade in history["BTC"]],
             ["buy-2", "buy-1"],
         )
-        self.assertEqual(history["BTC"][0]["amount_usd"], 1_240)
-        self.assertEqual(history["BTC"][0]["rate_usd"], 62_000)
-        self.assertEqual(history["BTC"][1]["fee_usd"], 1.5)
+        self.assertEqual(history["BTC"][0]["amount_quote"], 1_240)
+        self.assertEqual(history["BTC"][0]["rate_quote"], 62_000)
+        self.assertEqual(history["BTC"][1]["fee_quote"], 1.5)
+        self.assertEqual(history["BTC"][1]["quote_currency"], "GBP")
         self.assertEqual(exchange.fetch_my_trades.call_count, 2)
         self.assertEqual(
             exchange.fetch_my_trades.call_args_list[0].kwargs,
@@ -191,26 +205,47 @@ class PortfolioReportTests(unittest.TestCase):
 
         self.exchange.fetch_ticker.side_effect = ticker
 
-    def test_short_report_values_usd_assets_and_both_cash_balances_in_gbp(self):
+    def test_short_report_values_gbp_assets_and_both_cash_balances_in_gbp(self):
         report = portfolio_balance.build_portfolio_report(
             self.exchange,
             ["BTC/GBP"],
             short_report=True,
         )
 
-        self.assertIn("CONFIGURED KRAKEN HOLDINGS — GBP VALUATION", report)
+        self.assertIn("TRACKED KRAKEN HOLDINGS — GBP VALUATION", report)
         self.assertIn("£1 = $1.2500", report)
-        self.assertIn("Price: $60,000.00", report)
-        self.assertIn("Value: £4,800.00 ($6,000.00)", report)
+        self.assertIn("Price: £60,000.00", report)
+        self.assertIn("Value: £6,000.00", report)
         self.assertIn("GBP: £125.00", report)
         self.assertIn("USD: $25.00 (£20.00)", report)
-        self.assertIn("£4,945.00", report)
+        self.assertIn("£6,145.00", report)
         self.assertIn("Kraken is the source of truth", report)
         self.assertIn("Ghostfolio is an optional mirror", report)
+        self.assertIn("HYPE is retained for reporting only", report)
         self.assertNotIn("BUY HISTORY", report)
         self.exchange.fetch_my_trades.assert_not_called()
 
-    def test_full_report_includes_usd_buy_history_and_gbp_equivalent(self):
+    def test_retired_hype_holding_remains_in_authoritative_total(self):
+        self.exchange.fetch_balance.return_value = {
+            "total": {"HYPE": 2, "GBP": 0, "USD": 0}
+        }
+
+        def ticker(symbol):
+            return {"last": {"HYPE/USD": 40, "GBP/USD": 1.25}[symbol]}
+
+        self.exchange.fetch_ticker.side_effect = ticker
+        report = portfolio_balance.build_portfolio_report(
+            self.exchange,
+            ["HYPE/USD"],
+            short_report=True,
+        )
+
+        self.assertIn("**HYPE**", report)
+        self.assertIn("Price: $40.00 (£32.00)", report)
+        self.assertIn("Value: £64.00", report)
+        self.assertIn("£64.00", report)
+
+    def test_full_report_includes_gbp_buy_history(self):
         timezone = ZoneInfo("Asia/Bangkok")
         window = (
             datetime(2026, 7, 5, 7, tzinfo=timezone),
@@ -222,9 +257,10 @@ class PortfolioReportTests(unittest.TestCase):
                     "trade_id": "trade-1",
                     "order_id": "order-1",
                     "amount_crypto": 0.001,
-                    "amount_usd": 60.0,
-                    "fee_usd": 0.15,
-                    "rate_usd": 60_000.0,
+                    "amount_quote": 60.0,
+                    "fee_quote": 0.15,
+                    "rate_quote": 60_000.0,
+                    "quote_currency": "GBP",
                     "timestamp": datetime(
                         2026, 7, 10, 12, tzinfo=timezone
                     ).timestamp(),
@@ -246,10 +282,10 @@ class PortfolioReportTests(unittest.TestCase):
                 short_report=False,
             )
 
-        self.assertIn("KRAKEN USD BUY HISTORY (05 Jul 2026 → 05 Aug 2026)", report)
-        self.assertIn("$60.00 (£48.00) cost", report)
-        self.assertIn("$0.15 quote fees", report)
-        self.assertIn("at $60,000.00", report)
+        self.assertIn("KRAKEN BUY HISTORY (05 Jul 2026 → 05 Aug 2026)", report)
+        self.assertIn("£60.00 cost", report)
+        self.assertIn("£0.15 quote fees", report)
+        self.assertIn("at £60,000.00", report)
         self.assertIn("order `order-1`", report)
         aggregate.assert_called_once_with(
             self.exchange,

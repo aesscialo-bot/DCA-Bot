@@ -1,4 +1,4 @@
-"""Discord and Railway control plane for GBP-budgeted Kraken USD DCA.
+"""Discord and Railway control plane for GBP-budgeted Kraken GBP-market DCA.
 
 The bot never places an order.  It reads persisted GitHub variables,
 dispatches serialized GitHub Actions workflows, and runs a five-minute Railway
@@ -156,8 +156,8 @@ def _config_write_block_reason(
 
 _FULL_NAMES = {
     "bitcoin": "BTC",
-    "hyperliquid": "HYPE",
-    "hype": "HYPE",
+    "ethereum": "ETH",
+    "ether": "ETH",
     "solana": "SOL",
 }
 
@@ -168,12 +168,12 @@ def _normalise_usd_key(value: str) -> str:
     raw = _FULL_NAMES.get(lowered, raw).upper().replace("/", "_")
     aliases = {
         "BTC": "BTC_GBP", "BTC_GBP": "BTC_GBP",
-        "HYPE": "HYPE_USD", "HYPE_USD": "HYPE_USD",
+        "ETH": "ETH_GBP", "ETH_GBP": "ETH_GBP",
         "SOL": "SOL_GBP", "SOL_GBP": "SOL_GBP",
     }
     key = aliases.get(raw)
     if key not in ALLOWED_TARGETS:
-        raise ValueError("Supported assets are BTC/GBP, HYPE/USD, SOL/GBP")
+        raise ValueError("Supported assets are BTC/GBP, ETH/GBP, SOL/GBP")
     return key
 
 
@@ -576,8 +576,8 @@ CHAT_TOPIC_REPLIES = {
         "command, and invalid or stale state fails closed."
     ),
     "markets": (
-        "📈 The configured markets are BTC/GBP, HYPE/USD, and SOL/GBP. BTC and SOL "
-        "spend GBP directly; HYPE uses the bot’s guarded GBP-to-USD funding route. "
+        "📈 The configured markets are BTC/GBP, ETH/GBP, and SOL/GBP. All three "
+        "spend GBP directly on Kraken. "
         "Type `show status` to see which pairs are currently enabled."
     ),
     "controls": (
@@ -609,7 +609,7 @@ Natural language is strictly read-only. Never return an action that changes a
 budget, runs analysis, enables or disables a pair, confirms a change, or places
 an order. Requests for those actions must be chat/controls and must never be
 described as completed. Do not claim access to live prices or news. The exact
-markets are BTC/GBP, HYPE/USD, and SOL/GBP. Deterministic Python—not Gemini—owns
+markets are BTC/GBP, ETH/GBP, and SOL/GBP. Deterministic Python—not Gemini—owns
 regimes, amounts, timing, analysis, and execution.
 
 Respond as JSON only with exactly `action` and `topic`. For non-chat actions use
@@ -791,7 +791,7 @@ async def handle_set_amounts(
         await message.reply(
             f"Queued atomic budgets for **{symbol}**: lower {_display_amount(low)}, "
             f"sideways midpoint {_display_amount(midpoint)}, higher "
-            f"{_display_amount(high)}. Run `!dca analyze {symbol.removesuffix('_USD')}` "
+            f"{_display_amount(high)}. Run `!dca analyze {symbol.split('_', 1)[0]}` "
             "after the workflow completes."
         )
     else:
@@ -1441,7 +1441,7 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         != rules_hash(symbol, rules[symbol])
     ]
     lines = [
-        "🤖 **Kraken mixed-market DCA status (GBP budgets)**",
+        "🤖 **Kraken GBP-market DCA status (GBP budgets)**",
         _trading_mode_summary(),
         "⚙️ " + _format_analysis_workflow_health(workflow_health),
     ]
@@ -1653,7 +1653,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     )
     lines = [
         f"**DCA health: {posture}**",
-        f"- Rules: valid ({len(rules)}/3 mixed targets; GBP budgets)",
+        f"- Rules: valid ({len(rules)}/3 GBP targets; GBP budgets)",
         "- " + _format_analysis_workflow_health(workflow_health),
         "- " + _format_analysis_watchdog_health(watchdog_health),
         (
@@ -1702,8 +1702,8 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     await message.reply("\n".join(lines)[:1_990])
 
 
-HELP_TEXT = """🐙 **Kraken mixed-market DCA controls — clear command guide**
-Markets: **BTC/GBP**, **HYPE/USD**, and **SOL/GBP**. Budgets are in GBP.
+HELP_TEXT = """🐙 **Kraken GBP-market DCA controls — clear command guide**
+Markets: **BTC/GBP**, **ETH/GBP**, and **SOL/GBP**. Budgets are in GBP.
 
 📊 **Read only**
 `show status` or `!dca status` — pair state, today’s analysis, times, and order permission
@@ -1712,7 +1712,7 @@ Markets: **BTC/GBP**, **HYPE/USD**, and **SOL/GBP**. Budgets are in GBP.
 `help`, `!help`, or `!dca help` — show this guide
 
 🔎 **Run deterministic analysis** *(allowlisted user)*
-`!dca analyze BTC` — replace BTC with HYPE or SOL
+`!dca analyze BTC` — replace BTC with ETH or SOL
 `!dca analyze all` — analyze all three pairs
 
 💷 **Change a budget** *(disable the pair first)*
@@ -2314,6 +2314,6 @@ if __name__ == "__main__":
         _log("ERROR missing required environment variables: " + ", ".join(missing))
         sys.exit(1)
     _log(
-        f"INFO starting Kraken mixed-market DCA Discord service cron_enabled={DCA_CRON_ENABLED}"
+        f"INFO starting Kraken GBP-market DCA Discord service cron_enabled={DCA_CRON_ENABLED}"
     )
     client.run(DISCORD_BOT_TOKEN, log_handler=None)

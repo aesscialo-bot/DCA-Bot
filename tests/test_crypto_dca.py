@@ -2,7 +2,7 @@ import hashlib
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import crypto_dca
 import dca_config
@@ -143,8 +143,8 @@ class DcaConfigurationTests(unittest.TestCase):
 
     def test_optional_symbol_filter_is_strict_and_deduplicated(self):
         self.assertEqual(
-            crypto_dca._parse_symbol_filter('["BTC/GBP", "BTC_GBP", "HYPE_USD"]'),
-            ("BTC_GBP", "HYPE_USD"),
+            crypto_dca._parse_symbol_filter('["BTC/GBP", "BTC_GBP", "ETH_GBP"]'),
+            ("BTC_GBP", "ETH_GBP"),
         )
         self.assertEqual(crypto_dca._parse_symbol_filter("[]"), ())
         with self.assertRaisesRegex(ValueError, "Unsupported"):
@@ -160,7 +160,7 @@ class DcaConfigurationTests(unittest.TestCase):
 
 class DecisionGateTests(unittest.TestCase):
     def test_global_history_gate_requires_all_three_current_ready_decisions(self):
-        rules = rules_with("BTC_GBP", "HYPE_USD", "SOL_GBP")
+        rules = rules_with("BTC_GBP", "ETH_GBP", "SOL_GBP")
         decisions = {
             target: ready_decision(target, rules[target])
             for target in crypto_dca.ALLOWED_TARGETS
@@ -174,12 +174,12 @@ class DecisionGateTests(unittest.TestCase):
         self.assertFalse(ready)
         self.assertIn("analysis date is not 2026-08-06", reason)
 
-        analysis["TARGETS"]["HYPE_USD"]["ANALYSIS_STATUS"] = "ERROR"
-        analysis["TARGETS"]["HYPE_USD"]["HISTORY"] = {"STATUS": "ERROR"}
+        analysis["TARGETS"]["ETH_GBP"]["ANALYSIS_STATUS"] = "ERROR"
+        analysis["TARGETS"]["ETH_GBP"]["HISTORY"] = {"STATUS": "ERROR"}
         ready, reason = crypto_dca._global_history_gate(analysis, NOW)
         self.assertFalse(ready)
-        self.assertIn("HYPE_USD analysis is ERROR", reason)
-        self.assertIn("HYPE_USD history is ERROR", reason)
+        self.assertIn("ETH_GBP analysis is ERROR", reason)
+        self.assertIn("ETH_GBP history is ERROR", reason)
 
     def test_shadow_and_canary_modes_block_unapproved_new_orders(self):
         rules = rules_with("BTC_GBP", "SOL_GBP")
@@ -322,6 +322,40 @@ class DecisionGateTests(unittest.TestCase):
 
 
 class DurableIntentTests(unittest.TestCase):
+    def test_target_migration_lock_blocks_direct_execution_state_write(self):
+        locked = MagicMock(status_code=200)
+        with (
+            patch.object(
+                crypto_dca,
+                "_github_variable_context",
+                return_value=("variable-url", "collection-url", {}),
+            ),
+            patch.object(crypto_dca.requests, "get", return_value=locked),
+            patch.object(crypto_dca.requests, "patch") as write,
+            self.assertRaisesRegex(RuntimeError, "migration lock"),
+        ):
+            crypto_dca._write_repo_json_variable(
+                crypto_dca.EXECUTION_STATE_VARIABLE, {}, exists=True
+            )
+        write.assert_not_called()
+
+    def test_uncertain_target_migration_lock_state_blocks_execution_write(self):
+        uncertain = MagicMock(status_code=503)
+        with (
+            patch.object(
+                crypto_dca,
+                "_github_variable_context",
+                return_value=("variable-url", "collection-url", {}),
+            ),
+            patch.object(crypto_dca.requests, "get", return_value=uncertain),
+            patch.object(crypto_dca.requests, "patch") as write,
+            self.assertRaisesRegex(RuntimeError, "could not be checked"),
+        ):
+            crypto_dca._write_repo_json_variable(
+                crypto_dca.EXECUTION_STATE_VARIABLE, {}, exists=True
+            )
+        write.assert_not_called()
+
     def test_prepare_persists_decision_bound_intent(self):
         with (
             patch.object(
@@ -372,7 +406,7 @@ class DurableIntentTests(unittest.TestCase):
         delivery = pending_gist_delivery()
         state = {
             "BTC_GBP": {"LAST_BUY_DATE": "", "PENDING_ORDER": intent},
-            "HYPE_USD": {"LAST_BUY_DATE": "2026-08-04"},
+            "ETH_GBP": {"LAST_BUY_DATE": "2026-08-04"},
         }
         with (
             patch.object(
@@ -394,7 +428,7 @@ class DurableIntentTests(unittest.TestCase):
             written["BTC_GBP"]["PENDING_GIST_DELIVERIES"], [delivery]
         )
         self.assertNotIn("PENDING_ORDER", written["BTC_GBP"])
-        self.assertEqual(written["HYPE_USD"], {"LAST_BUY_DATE": "2026-08-04"})
+        self.assertEqual(written["ETH_GBP"], {"LAST_BUY_DATE": "2026-08-04"})
 
     def test_completion_atomically_enqueues_confirmed_fill_delivery(self):
         intent = pending_intent()
@@ -1304,13 +1338,13 @@ class MainSchedulingTests(unittest.TestCase):
         execute.assert_not_called()
 
     def test_multiple_assets_can_share_a_window_and_use_own_tiers(self):
-        rules = rules_with("BTC_GBP", "HYPE_USD", low=10, up=20)
+        rules = rules_with("BTC_GBP", "ETH_GBP", low=10, up=20)
         analysis = analysis_for(
             rules,
             {
                 "BTC_GBP": ready_decision("BTC_GBP", rules["BTC_GBP"]),
-                "HYPE_USD": ready_decision(
-                    "HYPE_USD", rules["HYPE_USD"], regime="SIDEWAYS"
+                "ETH_GBP": ready_decision(
+                    "ETH_GBP", rules["ETH_GBP"], regime="SIDEWAYS"
                 ),
             },
         )
@@ -1328,7 +1362,7 @@ class MainSchedulingTests(unittest.TestCase):
 
         self.assertEqual(execute.call_count, 2)
         calls = {call.args[0]: call.args[1] for call in execute.call_args_list}
-        self.assertEqual(calls, {"BTC_GBP": 10.0, "HYPE_USD": 15.0})
+        self.assertEqual(calls, {"BTC_GBP": 10.0, "ETH_GBP": 15.0})
 
     def test_missed_decision_is_expected_quiet_non_replay(self):
         rules = rules_with("BTC_GBP")
