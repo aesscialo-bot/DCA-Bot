@@ -352,10 +352,11 @@ The HYPE-to-ETH cutover must use the manual `Replace HYPE/USD DCA with ETH/GBP`
 workflow on `main`, with exact confirmations `MIGRATE_HYPE_TO_ETH_GBP` and
 `RAILWAY_CRON_PAUSED`. It masks and hash-binds the source rules, analysis, and
 execution state, reruns the read-only Kraken integrity audit, starts ETH
-disabled with an empty buy date, preserves BTC/SOL buy dates, and writes HYPE's
-final rule, analysis, and buy date to the hash-bound
-`DCA_RETIRED_TARGET_STATE` repository variable. Do not delete that archive or
-copy HYPE's buy date or analysis to ETH.
+disabled, and writes HYPE's final rule, analysis, and buy date to the hash-bound
+`DCA_RETIRED_TARGET_STATE` repository variable. The migration intentionally
+carries HYPE's validated `LAST_BUY_DATE` to ETH solely to preserve the
+once-per-Bangkok-day allocation guard; HYPE analysis is archived but never
+copied to ETH. Do not delete the archive.
 
 After migration, run `Kraken History Bootstrap` with `targets=ETH_GBP` and wait
 for verified ETH/GBP coverage. Only then run `!dca analyze all`, run Portfolio

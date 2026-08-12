@@ -122,14 +122,16 @@ class WorkflowSafetyTests(unittest.TestCase):
 
     def test_hype_to_eth_migration_is_main_only_audited_and_masks_state(self):
         migration = self._read("migrate_hype_to_eth.yml")
+        portfolio = self._read("portfolio_check.yml")
         for required in (
             "github.ref == 'refs/heads/main'",
             "MIGRATE_HYPE_TO_ETH_GBP",
             "RAILWAY_CRON_PAUSED",
-            "audit_orders",
-            'result["flow_integrity_ok"]',
-            'result["unresolved_bot_orders"]',
-            'result["unknown_timestamp_closed_bot_orders"]',
+            "audit_orders(profile=HYPE_TO_ETH_SOURCE_AUDIT_PROFILE)",
+            'result["audit_profile"]',
+            'result["safe_for_target_migration"]',
+            'same_day_completed_dca_flow_dates_by_target',
+            'migration-audit.json',
             "gh variable get DCA_TARGET_MAP",
             "gh variable get DCA_ANALYSIS_STATE",
             "gh variable get DCA_EXECUTION_STATE",
@@ -137,6 +139,7 @@ class WorkflowSafetyTests(unittest.TestCase):
             'done <<< "$analysis"',
             "dca_target_migration.py",
             '--analysis "$analysis"',
+            '--audit "$audit"',
             '_CURRENT_STATE_HASHES',
             "changed after migration validation; refusing write",
             "DCA_RETIRED_TARGET_STATE",
@@ -151,6 +154,7 @@ class WorkflowSafetyTests(unittest.TestCase):
                 self.assertIn(required, migration)
         self.assertNotIn('echo "$rules"', migration)
         self.assertNotIn('echo "$execution"', migration)
+        self.assertNotIn("HYPE_TO_ETH_SOURCE_AUDIT_PROFILE", portfolio)
         self.assertNotIn(
             'DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY" 2>/dev/null ||',
             migration,
@@ -169,6 +173,16 @@ class WorkflowSafetyTests(unittest.TestCase):
             migration.index("gh variable delete DCA_TARGET_MIGRATION_LOCK"),
             migration.index("final {name} verification failed"),
         )
+
+    def test_cutover_docs_preserve_only_the_hype_daily_guard(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        guide = (ROOT / "00_START_HERE.md").read_text(encoding="utf-8")
+        for text in (readme, guide):
+            self.assertIn("validated `LAST_BUY_DATE`", text)
+            self.assertIn("once-per-Bangkok-day allocation guard", text)
+            self.assertNotIn("empty buy date", text)
+            self.assertNotIn("no inherited buy date", text)
+            self.assertNotIn("copy HYPE's buy date or analysis to ETH", text)
 
     def test_all_state_writers_observe_the_target_migration_lock(self):
         for name in (

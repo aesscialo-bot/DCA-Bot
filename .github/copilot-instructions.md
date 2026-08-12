@@ -96,6 +96,8 @@ schemas, workflows, or deployment configuration.
   `ETH_GBP` history before fresh all-target analysis. The fixed 7 August HYPE
   recovery workflow, evidence, Ghostfolio provenance logic, and historical
   tests do not become ETH assets or active-target fixtures.
+- Carry HYPE's validated `LAST_BUY_DATE` to ETH solely to preserve the
+  once-per-Bangkok-day allocation guard; never carry HYPE analysis into ETH.
 - A new market needs its exact Kraken spot market, a valid live GBP-equivalent
   minimum, 170 completed daily candles, 20 weekly candles, and seven complete
   days of 15-minute candles. Any non-GBP route additionally needs an explicit,

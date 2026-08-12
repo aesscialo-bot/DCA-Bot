@@ -9,7 +9,7 @@ is paused and that Kraken has no unresolved bot orders.
 from __future__ import annotations
 
 import argparse
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -207,10 +207,14 @@ def _source_execution_state(value: str | Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _new_execution(source: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    # HYPE and ETH occupy the same daily allocation slot across the replacement.
+    # Carrying the validated date prevents a second allocation on the cutover day.
     return validate_execution_state(
         {
             "BTC_GBP": source["BTC_GBP"],
-            "ETH_GBP": {"LAST_BUY_DATE": ""},
+            "ETH_GBP": {
+                "LAST_BUY_DATE": source["HYPE_USD"]["LAST_BUY_DATE"]
+            },
             "SOL_GBP": source["SOL_GBP"],
         }
     )
@@ -227,6 +231,56 @@ def _new_analysis(
             "analysis is required"
         ),
     )
+
+
+def _validate_audit_evidence(
+    value: str | Mapping[str, Any],
+    source_execution: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    evidence = _object(value, "migration audit evidence")
+    if set(evidence) != {"audit_date", "hype_completed_flow_dates"}:
+        raise ValueError("migration audit evidence schema is invalid")
+    audit_date = evidence["audit_date"]
+    try:
+        parsed_audit_date = date.fromisoformat(audit_date)
+    except (TypeError, ValueError):
+        raise ValueError("migration audit date is invalid") from None
+    if parsed_audit_date.isoformat() != audit_date:
+        raise ValueError("migration audit date is invalid")
+    flow_dates = evidence["hype_completed_flow_dates"]
+    if (
+        not isinstance(flow_dates, list)
+        or any(not isinstance(item, str) for item in flow_dates)
+        or len(set(flow_dates)) != len(flow_dates)
+    ):
+        raise ValueError("migration audit HYPE flow dates are invalid")
+    for item in flow_dates:
+        try:
+            parsed_flow_date = date.fromisoformat(item)
+        except ValueError:
+            raise ValueError("migration audit HYPE flow date is invalid") from None
+        if (
+            parsed_flow_date.isoformat() != item
+            or parsed_flow_date not in {parsed_audit_date, parsed_audit_date - timedelta(days=1)}
+        ):
+            raise ValueError("migration audit HYPE flow date is invalid")
+    if len(flow_dates) > 1:
+        raise ValueError("migration audit contains multiple same-day HYPE flows")
+    hype_last_buy = source_execution["HYPE_USD"]["LAST_BUY_DATE"]
+    if hype_last_buy and date.fromisoformat(hype_last_buy) > parsed_audit_date:
+        raise ValueError("HYPE last buy date is later than the migration audit")
+    if flow_dates and hype_last_buy != flow_dates[0]:
+        raise ValueError(
+            "HYPE last buy date does not match authenticated Kraken flow"
+        )
+    if hype_last_buy == audit_date and flow_dates != [audit_date]:
+        raise ValueError(
+            "HYPE last buy date lacks matching authenticated Kraken flow"
+        )
+    return {
+        "audit_date": audit_date,
+        "hype_completed_flow_dates": list(flow_dates),
+    }
 
 
 def _state_hashes(
@@ -375,12 +429,15 @@ def migrate(
     execution_raw: str | Mapping[str, Any],
     retired_raw: str | Mapping[str, Any] | None = None,
     *,
+    audit_raw: str | Mapping[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Return a validated, resumable HYPE-to-ETH cutover document.
 
-    ETH inherits HYPE's two GBP budget endpoints but starts disabled.  BTC and
-    SOL buy dates are retained.  HYPE's final rule and buy date are preserved
+    ETH inherits HYPE's two GBP budget endpoints but starts disabled. HYPE's
+    validated buy date is carried to ETH solely to preserve the once-per-day
+    allocation guard; BTC and SOL buy dates are retained. HYPE's final state is
+    also preserved
     in a hash-bound retired-target archive, while unresolved order or delivery
     evidence blocks the migration instead of being discarded.  With an existing
     archive, each core variable may be either its exact source value or exact
@@ -424,6 +481,8 @@ def migrate(
             current_analysis, normalized_source_rules
         )
         source_execution = _source_execution_state(current_execution)
+        if audit_raw is not None:
+            _validate_audit_evidence(audit_raw, source_execution)
         new_execution = _new_execution(source_execution)
         generated = _migration_time(now)
         new_analysis = _new_analysis(new_rules, generated)
@@ -525,10 +584,17 @@ def main() -> int:
     parser.add_argument("--rules", required=True)
     parser.add_argument("--analysis", required=True)
     parser.add_argument("--execution", required=True)
+    parser.add_argument("--audit", required=True)
     parser.add_argument("--retired", default="")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
-    result = migrate(args.rules, args.analysis, args.execution, args.retired)
+    result = migrate(
+        args.rules,
+        args.analysis,
+        args.execution,
+        args.retired,
+        audit_raw=args.audit,
+    )
     args.output.write_text(
         json.dumps(result, separators=(",", ":"), ensure_ascii=False),
         encoding="utf-8",

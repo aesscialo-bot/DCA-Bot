@@ -6,8 +6,12 @@ or complete exchange order payloads.
 """
 
 import json
+import math
 import re
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
+from types import MappingProxyType
+from typing import Mapping
 from zoneinfo import ZoneInfo
 
 from kraken_client import (
@@ -16,10 +20,43 @@ from kraken_client import (
     get_kraken_exchange,
     to_kraken_symbol,
 )
-from dca_config import TARGET_ROUTES
 
 
-TARGETS = ("BTC_GBP", "ETH_GBP", "SOL_GBP")
+@dataclass(frozen=True)
+class AuditProfile:
+    """Fixed internal contract for deterministic DCA flow validation."""
+
+    name: str
+    routes: Mapping[str, str]
+    require_successful_fills: bool = False
+
+
+ACTIVE_AUDIT_PROFILE = AuditProfile(
+    "ACTIVE_ETH_GBP",
+    MappingProxyType(
+        {
+            "BTC_GBP": "DIRECT_GBP",
+            "ETH_GBP": "DIRECT_GBP",
+            "SOL_GBP": "DIRECT_GBP",
+        }
+    ),
+)
+HYPE_TO_ETH_SOURCE_AUDIT_PROFILE = AuditProfile(
+    "HYPE_TO_ETH_SOURCE",
+    MappingProxyType(
+        {
+            "BTC_GBP": "DIRECT_GBP",
+            "HYPE_USD": "GBP_TO_USD",
+            "SOL_GBP": "DIRECT_GBP",
+        }
+    ),
+    require_successful_fills=True,
+)
+AUDIT_PROFILES = (
+    ACTIVE_AUDIT_PROFILE,
+    HYPE_TO_ETH_SOURCE_AUDIT_PROFILE,
+)
+TARGETS = tuple(ACTIVE_AUDIT_PROFILE.routes)
 FUNDING_MARKET = "GBP_USD"
 LEGACY_AUDIT_MARKETS = ("HYPE_USD", FUNDING_MARKET)
 AUDIT_MARKETS = (*TARGETS, *LEGACY_AUDIT_MARKETS)
@@ -80,7 +117,9 @@ def _has_valid_timestamp(order: dict) -> bool:
     return bool(_terminal_order_local_days(order, ZoneInfo(TIMEZONE_NAME)))
 
 
-def _expected_leg_lookup(local_day) -> dict[str, dict[str, str]]:
+def _expected_leg_lookup(
+    local_day, profile: AuditProfile
+) -> dict[str, dict[str, str]]:
     """Map deterministic IDs to their target and leg without exposing the IDs.
 
     Include the previous local date because an order may open shortly before
@@ -90,9 +129,9 @@ def _expected_leg_lookup(local_day) -> dict[str, dict[str, str]]:
 
     lookup = {}
     for trade_day in (local_day - timedelta(days=1), local_day):
-        for target in TARGETS:
+        for target in profile.routes:
             legs = {"crypto": (target, "buy")}
-            if TARGET_ROUTES[target] == "GBP_TO_USD":
+            if profile.routes[target] == "GBP_TO_USD":
                 legs["funding"] = (FUNDING_MARKET, "funding")
             for leg_name, (market_key, purpose) in legs.items():
                 client_order_id = build_client_order_id(
@@ -109,16 +148,37 @@ def _expected_leg_lookup(local_day) -> dict[str, dict[str, str]]:
     return lookup
 
 
-def _flow_summary(orders: list[dict], local_day) -> dict:
+def _successful_terminal_fill(order: dict) -> bool:
+    if str(order.get("status") or "").strip().lower() != "closed":
+        return False
+    for field in ("filled", "cost"):
+        if isinstance(order.get(field), bool):
+            return False
+        try:
+            value = float(order.get(field))
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(value) or value <= 0:
+            return False
+    return True
+
+
+def _flow_summary(
+    orders: list[dict], local_day, profile: AuditProfile
+) -> dict:
     """Classify bot order legs into complete, incomplete, or invalid flows."""
 
-    expected_legs = _expected_leg_lookup(local_day)
+    expected_legs = _expected_leg_lookup(local_day, profile)
     flows: dict[tuple[str, str], dict[str, list[dict]]] = {}
     mismatched = []
+    invalid_terminal = []
     for order in orders:
         expected = expected_legs.get(_order_client_id(order))
         if expected is None or order.get("symbol") != expected["symbol"]:
             mismatched.append(order)
+            continue
+        if profile.require_successful_fills and not _successful_terminal_fill(order):
+            invalid_terminal.append(order)
             continue
         flow_key = (expected["target"], expected["trade_date"])
         flow = flows.setdefault(flow_key, {"funding": [], "crypto": []})
@@ -127,14 +187,18 @@ def _flow_summary(orders: list[dict], local_day) -> dict:
     complete_flow_count = 0
     incomplete_flow_count = 0
     duplicate_leg_count = 0
+    completed_flows = []
     for (target, _trade_date), flow in flows.items():
         funding_count = len(flow["funding"])
         crypto_count = len(flow["crypto"])
         duplicate_leg_count += max(0, funding_count - 1)
         duplicate_leg_count += max(0, crypto_count - 1)
-        funding_required = TARGET_ROUTES[target] == "GBP_TO_USD"
+        funding_required = profile.routes[target] == "GBP_TO_USD"
         if crypto_count == 1 and funding_count == (1 if funding_required else 0):
             complete_flow_count += 1
+            completed_flows.append(
+                {"target": target, "trade_date": _trade_date}
+            )
         elif funding_count or crypto_count:
             incomplete_flow_count += 1
 
@@ -143,13 +207,22 @@ def _flow_summary(orders: list[dict], local_day) -> dict:
         "incomplete_flow_count": incomplete_flow_count,
         "duplicate_leg_count": duplicate_leg_count,
         "mismatched_leg_count": len(mismatched),
+        "invalid_terminal_leg_count": len(invalid_terminal),
+        "completed_flows": sorted(
+            completed_flows,
+            key=lambda flow: (flow["trade_date"], flow["target"]),
+        ),
         "mismatched_order_id_suffixes": sorted(
             {_order_suffix(order) for order in mismatched}
+        ),
+        "invalid_terminal_order_id_suffixes": sorted(
+            {_order_suffix(order) for order in invalid_terminal}
         ),
         "integrity_ok": (
             incomplete_flow_count == 0
             and duplicate_leg_count == 0
             and not mismatched
+            and not invalid_terminal
         ),
     }
 
@@ -211,8 +284,15 @@ def _fetch_closed_orders_paginated(client, since_ms: int) -> list[dict]:
     raise RuntimeError("Kraken closed-order pagination exceeded its safety limit")
 
 
-def audit_orders(exchange=None, *, now=None) -> dict:
+def audit_orders(
+    exchange=None,
+    *,
+    now=None,
+    profile: AuditProfile = ACTIVE_AUDIT_PROFILE,
+) -> dict:
     """Read account-wide order state for the three targets and their FX leg."""
+    if not any(profile is candidate for candidate in AUDIT_PROFILES):
+        raise ValueError("unsupported Kraken order audit profile")
     selected_tz = ZoneInfo(TIMEZONE_NAME)
     local_now = now.astimezone(selected_tz) if now else datetime.now(selected_tz)
     local_day = local_now.date()
@@ -234,8 +314,8 @@ def audit_orders(exchange=None, *, now=None) -> dict:
     unknown_timestamp_orders = [
         order for order in closed_bot_orders if not _has_valid_timestamp(order)
     ]
-    open_flow_summary = _flow_summary(open_bot_orders, local_day)
-    closed_flow_summary = _flow_summary(same_day_bot_orders, local_day)
+    open_flow_summary = _flow_summary(open_bot_orders, local_day, profile)
+    closed_flow_summary = _flow_summary(same_day_bot_orders, local_day, profile)
 
     markets = {}
     for target in AUDIT_MARKETS:
@@ -291,8 +371,29 @@ def audit_orders(exchange=None, *, now=None) -> dict:
         and closed_flow_summary["integrity_ok"]
         and not unexpected_market_orders
     )
+    completed_by_target = {
+        target: sum(
+            flow["target"] == target
+            for flow in closed_flow_summary["completed_flows"]
+        )
+        for target in profile.routes
+    }
+    completed_dates_by_target = {
+        target: sorted(
+            flow["trade_date"]
+            for flow in closed_flow_summary["completed_flows"]
+            if flow["target"] == target
+        )
+        for target in profile.routes
+    }
+    safe_for_target_migration = (
+        unresolved_total == 0
+        and unknown_closed_timestamp_total == 0
+        and flow_integrity_ok
+    )
 
     return {
+        "audit_profile": profile.name,
         "audit_date": local_day.isoformat(),
         "timezone": TIMEZONE_NAME,
         "unresolved_bot_orders": unresolved_total,
@@ -310,6 +411,11 @@ def audit_orders(exchange=None, *, now=None) -> dict:
         "same_day_mismatched_order_legs": closed_flow_summary[
             "mismatched_leg_count"
         ],
+        "same_day_invalid_terminal_order_legs": closed_flow_summary[
+            "invalid_terminal_leg_count"
+        ],
+        "same_day_completed_dca_flows_by_target": completed_by_target,
+        "same_day_completed_dca_flow_dates_by_target": completed_dates_by_target,
         "unresolved_incomplete_dca_flows": open_flow_summary[
             "incomplete_flow_count"
         ],
@@ -319,8 +425,12 @@ def audit_orders(exchange=None, *, now=None) -> dict:
         "unresolved_mismatched_order_legs": open_flow_summary[
             "mismatched_leg_count"
         ],
+        "unresolved_invalid_terminal_order_legs": open_flow_summary[
+            "invalid_terminal_leg_count"
+        ],
         "unexpected_market_bot_order_legs": len(unexpected_market_orders),
         "flow_integrity_ok": flow_integrity_ok,
+        "safe_for_target_migration": safe_for_target_migration,
         "safe_to_initialize_empty_execution_state": (
             unresolved_total == 0
             and same_day_total == 0
