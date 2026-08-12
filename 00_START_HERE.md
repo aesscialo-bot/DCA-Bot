@@ -290,9 +290,11 @@ For a permanent pair change:
    workflow on `main` only after typing both exact confirmations
    `MIGRATE_HYPE_TO_ETH_GBP` and `RAILWAY_CRON_PAUSED`. It audits Kraken order
    integrity, masks and hash-binds the complete source state, resets active
-   analysis, starts ETH disabled with no inherited buy date, preserves BTC/SOL
-   buy dates, and writes HYPE's final rule, analysis, and buy date to hash-bound
-   `DCA_RETIRED_TARGET_STATE`.
+   analysis, starts ETH disabled, preserves BTC/SOL buy dates, and writes HYPE's
+   final rule, analysis, and buy date to hash-bound `DCA_RETIRED_TARGET_STATE`.
+   It intentionally carries HYPE's validated `LAST_BUY_DATE` to ETH solely to
+   preserve the once-per-Bangkok-day allocation guard; it never copies HYPE
+   analysis to ETH.
    Do not hand-edit analysis or execution state in the GitHub interface.
 10. Run the `Kraken History Bootstrap` workflow with `targets=ETH_GBP` and wait
     for verified ETH/GBP history coverage. Do not reuse HYPE partitions for ETH.

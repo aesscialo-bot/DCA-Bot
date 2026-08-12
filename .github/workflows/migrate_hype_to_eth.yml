@@ -100,15 +100,30 @@ jobs:
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
         run: |
           python - <<'PY'
-          from kraken_order_audit import audit_orders
+          import json
+          import os
+          from pathlib import Path
 
-          result = audit_orders()
+          from kraken_order_audit import (
+              HYPE_TO_ETH_SOURCE_AUDIT_PROFILE,
+              audit_orders,
+          )
+
+          result = audit_orders(profile=HYPE_TO_ETH_SOURCE_AUDIT_PROFILE)
           if (
-              not result["flow_integrity_ok"]
-              or result["unresolved_bot_orders"]
-              or result["unknown_timestamp_closed_bot_orders"]
+              result["audit_profile"] != "HYPE_TO_ETH_SOURCE"
+              or not result["safe_for_target_migration"]
           ):
               raise SystemExit("Kraken order integrity audit failed")
+          evidence = {
+              "audit_date": result["audit_date"],
+              "hype_completed_flow_dates": result[
+                  "same_day_completed_dca_flow_dates_by_target"
+              ]["HYPE_USD"],
+          }
+          Path(os.environ["RUNNER_TEMP"], "migration-audit.json").write_text(
+              json.dumps(evidence, separators=(",", ":")), encoding="utf-8"
+          )
           print("Kraken bot order integrity is clear for target migration.")
           PY
       - name: Read and validate complete current state
@@ -120,6 +135,7 @@ jobs:
           rules="$(gh variable get DCA_TARGET_MAP --repo "$GITHUB_REPOSITORY")"
           analysis="$(gh variable get DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY")"
           execution="$(gh variable get DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY")"
+          audit="$(cat "$RUNNER_TEMP/migration-audit.json")"
           retired_error="$RUNNER_TEMP/retired-variable-error.txt"
           if retired_response="$(gh api \
             "repos/$GITHUB_REPOSITORY/actions/variables/DCA_RETIRED_TARGET_STATE" \
@@ -147,6 +163,7 @@ jobs:
             --rules "$rules" \
             --analysis "$analysis" \
             --execution "$execution" \
+            --audit "$audit" \
             --retired "$retired" \
             --output "$RUNNER_TEMP/migration.json"
       - name: Archive and apply resumable fail-closed state

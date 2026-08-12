@@ -61,7 +61,7 @@ class TargetMigrationTests(unittest.TestCase):
             result["DCA_EXECUTION_STATE"],
             {
                 "BTC_GBP": {"LAST_BUY_DATE": "2026-08-11"},
-                "ETH_GBP": {"LAST_BUY_DATE": ""},
+                "ETH_GBP": {"LAST_BUY_DATE": "2026-08-10"},
                 "SOL_GBP": {"LAST_BUY_DATE": "2026-08-09"},
             },
         )
@@ -79,6 +79,9 @@ class TargetMigrationTests(unittest.TestCase):
         self.assertEqual(archive["REPLACED_BY"], "ETH_GBP")
         self.assertEqual(
             archive["EXECUTION"], {"LAST_BUY_DATE": "2026-08-10"}
+        )
+        self.assertEqual(
+            result["DCA_EXECUTION_STATE"]["ETH_GBP"], archive["EXECUTION"]
         )
         self.assertEqual(
             archive["ANALYSIS"], analysis["TARGETS"]["HYPE_USD"]
@@ -200,6 +203,108 @@ class TargetMigrationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "not valid JSON"):
             migrate(source_rules(), source_analysis(), "", now=NOW)
+
+    def test_current_day_hype_buy_date_carries_to_eth_with_audit_proof(self):
+        execution = {
+            "HYPE_USD": {"LAST_BUY_DATE": "2026-08-12"},
+        }
+        audit = {
+            "audit_date": "2026-08-12",
+            "hype_completed_flow_dates": ["2026-08-12"],
+        }
+
+        result = migrate(
+            source_rules(),
+            source_analysis(),
+            execution,
+            audit_raw=audit,
+            now=NOW,
+        )
+
+        self.assertEqual(
+            result["DCA_EXECUTION_STATE"]["ETH_GBP"]["LAST_BUY_DATE"],
+            "2026-08-12",
+        )
+
+    def test_audit_evidence_must_match_hype_execution_date(self):
+        execution = {"HYPE_USD": {"LAST_BUY_DATE": "2026-08-12"}}
+        for audit, message in (
+            (
+                {"audit_date": "2026-08-12", "hype_completed_flow_dates": []},
+                "lacks matching",
+            ),
+            (
+                {
+                    "audit_date": "2026-08-12",
+                    "hype_completed_flow_dates": ["2026-08-11"],
+                },
+                "does not match",
+            ),
+            (
+                {
+                    "audit_date": "2026-08-11",
+                    "hype_completed_flow_dates": [],
+                },
+                "later than",
+            ),
+        ):
+            with self.subTest(audit=audit), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                migrate(
+                    source_rules(),
+                    source_analysis(),
+                    execution,
+                    audit_raw=audit,
+                    now=NOW,
+                )
+
+    def test_audit_evidence_rejects_noncanonical_or_invalid_dates(self):
+        for audit in (
+            {"audit_date": "20260812", "hype_completed_flow_dates": []},
+            {
+                "audit_date": "2026-08-12",
+                "hype_completed_flow_dates": ["20260812"],
+            },
+            {
+                "audit_date": "2026-08-12",
+                "hype_completed_flow_dates": ["2026-08-10"],
+            },
+            {
+                "audit_date": "2026-08-12",
+                "hype_completed_flow_dates": ["2026-08-12", "2026-08-11"],
+            },
+        ):
+            with self.subTest(audit=audit), self.assertRaisesRegex(
+                ValueError, "audit|multiple"
+            ):
+                migrate(
+                    source_rules(),
+                    source_analysis(),
+                    {},
+                    audit_raw=audit,
+                    now=NOW,
+                )
+
+    def test_resume_rejects_target_execution_with_blank_carried_eth_date(self):
+        source_execution = {
+            "BTC_GBP": {"LAST_BUY_DATE": "2026-08-11"},
+            "HYPE_USD": {"LAST_BUY_DATE": "2026-08-10"},
+            "SOL_GBP": {"LAST_BUY_DATE": "2026-08-09"},
+        }
+        initial = migrate(
+            source_rules(), source_analysis(), source_execution, now=NOW
+        )
+        changed = json.loads(json.dumps(initial["DCA_EXECUTION_STATE"]))
+        changed["ETH_GBP"]["LAST_BUY_DATE"] = ""
+        with self.assertRaisesRegex(ValueError, "neither the archived"):
+            migrate(
+                source_rules(),
+                initial["DCA_ANALYSIS_STATE"],
+                changed,
+                initial["DCA_RETIRED_TARGET_STATE"],
+                now=NOW,
+            )
 
     def test_requires_every_source_target_to_be_disabled(self):
         with self.assertRaisesRegex(ValueError, "disable every"):

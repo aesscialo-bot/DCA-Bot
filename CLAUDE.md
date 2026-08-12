@@ -29,6 +29,9 @@ workflows, or release configuration.
 - `DCA_RETIRED_TARGET_STATE` preserves the hash-bound final HYPE rule, analysis,
   and buy date. The fixed 7 August HYPE recovery assets remain historical and
   must not be converted into ETH fixtures.
+- The HYPE-to-ETH migration carries the validated HYPE `LAST_BUY_DATE` to ETH
+  only to preserve the once-per-Bangkok-day allocation guard. It never carries
+  HYPE analysis into active ETH state.
 
 ## Ownership and security
 
