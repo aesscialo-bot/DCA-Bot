@@ -49,7 +49,8 @@ jobs:
           if gh variable get DCA_TARGET_MIGRATION_LOCK --repo "$GITHUB_REPOSITORY" >/dev/null 2>"$lock_error"; then
             echo "A target migration is locked; refusing analysis state writes." >&2
             exit 1
-          elif ! grep -q 'HTTP 404' "$lock_error"; then
+          elif ! grep -Fq 'HTTP 404' "$lock_error" && \
+              ! grep -Fq 'variable DCA_TARGET_MIGRATION_LOCK was not found' "$lock_error"; then
             echo "Could not check the target migration lock; refusing analysis." >&2
             exit 1
           fi
@@ -67,10 +68,18 @@ jobs:
             printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "$value" "$delimiter" >> "$GITHUB_ENV"
           }
           load_variable DCA_TARGET_MAP
-          if gh variable get DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            load_variable DCA_ANALYSIS_STATE
-          else
+          analysis_error="$RUNNER_TEMP/analysis-state-error.txt"
+          if analysis="$(gh variable get DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY" 2>"$analysis_error")"; then
+            while IFS= read -r line; do
+              [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+            done <<< "$analysis"
+            delimiter="DCA_${GITHUB_RUN_ID}_${RANDOM}"
+            printf 'DCA_ANALYSIS_STATE<<%s\n%s\n%s\n' "$delimiter" "$analysis" "$delimiter" >> "$GITHUB_ENV"
+          elif grep -Fq 'variable DCA_ANALYSIS_STATE was not found' "$analysis_error"; then
             printf 'DCA_ANALYSIS_STATE={}\n' >> "$GITHUB_ENV"
+          else
+            echo "Could not check DCA_ANALYSIS_STATE; refusing analysis." >&2
+            exit 1
           fi
 
       - name: Validate dedicated history storage
