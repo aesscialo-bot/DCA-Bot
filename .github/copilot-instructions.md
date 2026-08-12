@@ -1,22 +1,20 @@
 # Copilot instructions
 
-This repository is the production Kraken mixed-market, GBP-budgeted DCA bot. Read
+This repository is the production Kraken GBP-market, GBP-budgeted DCA bot. Read
 `00_START_HERE.md`, `README.md`, and `CLAUDE.md` before changing behavior,
 schemas, workflows, or deployment configuration.
 
 ## Current production contract
 
-- Supported targets are exactly `BTC_GBP`, `HYPE_USD`, and `SOL_GBP` unless a
+- Supported targets are exactly `BTC_GBP`, `ETH_GBP`, and `SOL_GBP` unless a
   deliberately staged pair-membership migration changes the full system.
 - `DCA_TARGET_MAP` contains every canonical target with only
   `REGIME_AMOUNTS_GBP` (`LOW` lower endpoint and compatibility-named `UP` upper
   endpoint) and boolean `BUY_ENABLED`.
-- Budgets remain GBP-denominated and execute in each configured quote currency.
-- BTC and SOL use direct Kraken GBP markets; HYPE uses `HYPE/USD` with the
-  explicit GBP/USD funding leg. Never use implicit conversion, THB, Bitkub,
-  or the legacy `AMOUNT_GBP` / `TIME` schema.
-- For HYPE only, sell the exact GBP budget on Kraken `GBP/USD` with `fciq`, wait
-  for confirmed net USD, and spend that USD on `HYPE/USD` with `fcib`.
+- Budgets remain GBP-denominated. BTC, ETH, and SOL execute directly on Kraken
+  `BTC/GBP`, `ETH/GBP`, and `SOL/GBP`; no active target has a funding leg.
+  Never use implicit conversion, THB, Bitkub, or the legacy `AMOUNT_GBP` /
+  `TIME` schema.
 - Counter-cyclical spend mapping is `DOWNTREND`→`HIGH`, `SIDEWAYS`→`MID`, and
   `UPTREND`→`LOW`. `MID` is `(LOW + UP) / 2`, rounded to the nearest penny with
   `ROUND_HALF_UP`; `HIGH` reads the stored `UP` endpoint. Never infer spend from
@@ -35,9 +33,10 @@ schemas, workflows, or deployment configuration.
   counter-cyclical regime mapping. Policy-version changes invalidate old
   decisions and require fresh analysis.
 - The trader owns `DCA_EXECUTION_STATE`, including `LAST_BUY_DATE` and durable
-  `PENDING_ORDER` state for both funding and crypto legs.
-- Persist a deterministic two-leg intent before Kraken can receive a create
-  request. Distinct deterministic client IDs are mandatory.
+  `PENDING_ORDER` state. The schema retains distinct buy/funding client IDs for
+  compatibility, but active direct-GBP routes submit only the buy ID.
+- Persist the deterministic intent before Kraken can receive a create request.
+  Never pass the reserved funding ID to a direct-GBP connector call.
 - An existing pending intent is reconciliation-only. Search open and closed
   Kraken orders, never create a replacement leg, and retain the lock while the
   outcome is unknown.
@@ -48,8 +47,9 @@ schemas, workflows, or deployment configuration.
   immediately before Kraken submission.
 - Missing, stale, insufficient, mismatched, or failed analysis always skips the
   purchase. Never reuse an old decision.
-- Keep requested GBP, funding fees, confirmed USD proceeds, crypto cost, crypto
-  fees, gross quantity, and net received quantity distinct.
+- Keep requested GBP, quote-currency cost, fees, gross quantity, and net
+  received quantity distinct. Preserve the richer two-leg fields on historical
+  HYPE recovery records.
 
 ## Configuration and scheduling
 
@@ -68,7 +68,7 @@ schemas, workflows, or deployment configuration.
   `dca-analysis-state-writers`; the trader uses its own serialized execution
   group. Preserve `queue: max` and `cancel-in-progress: false`.
 - The analysis workflow uses 3/5/7/14/30/45/60-day Bangkok windows and the
-  canonical BTC/GBP, HYPE/USD, and SOL/GBP markets.
+  canonical BTC/GBP, ETH/GBP, and SOL/GBP markets.
 - Primary analysis is scheduled for 04:07 Asia/Bangkok with an idempotent
   04:37 recovery run.
   Railway refreshes state and checks due decisions every five minutes.
@@ -91,9 +91,15 @@ schemas, workflows, or deployment configuration.
   migration. Audit Kraken, confirm zero pending intents, and migrate complete
   rules, analysis, and execution state without losing legitimate buy dates or
   recovery records. Run portfolio and analysis checks, then enable deliberately.
-- A new market needs Kraken `BASE/USD`, the `GBP/USD` funding path, a valid live
+- The HYPE-to-ETH cutover uses `migrate_hype_to_eth.yml`; retain its hash-bound
+  rule/analysis/execution archive in `DCA_RETIRED_TARGET_STATE`. Bootstrap
+  `ETH_GBP` history before fresh all-target analysis. The fixed 7 August HYPE
+  recovery workflow, evidence, Ghostfolio provenance logic, and historical
+  tests do not become ETH assets or active-target fixtures.
+- A new market needs its exact Kraken spot market, a valid live GBP-equivalent
   minimum, 170 completed daily candles, 20 weekly candles, and seven complete
-  days of 15-minute candles.
+  days of 15-minute candles. Any non-GBP route additionally needs an explicit,
+  reconciled funding path and its full route-specific test matrix.
 
 ## Deployment and security
 
@@ -121,9 +127,10 @@ schemas, workflows, or deployment configuration.
 - Compile Python, run the complete unit suite, validate all workflow YAML, and
   build the Railway Docker image before merging.
 - Cover exact target schemas, atomic budgets, start-date boundaries, trend and
-  timing rules, live minimums, both order legs, partial/unknown responses,
+  timing rules, live minimums, direct-order partial/unknown responses,
   reconcile-only recovery, duplicate suppression, final live-state checks,
-  scheduler windows, portfolio reporting, and optional logger failures.
+  scheduler windows, portfolio reporting, and optional logger failures. Keep
+  both legs covered by the fixed historical HYPE incident tests.
 - Cover all three exact regime/tier mappings, ordered endpoints, equal
   endpoints, half-penny midpoint rounding, and rejection of obsolete analysis
   state versions/tier pairs.

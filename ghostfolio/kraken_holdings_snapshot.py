@@ -17,9 +17,11 @@ from github_contents import (
 from kraken_client import get_kraken_exchange
 
 
+SNAPSHOT_VERSION = 2
 TARGETS = {
     "BTC_GBP": ("BTC", "BTC/GBP", "GBP"),
     "HYPE_USD": ("HYPE", "HYPE/USD", "USD"),
+    "ETH_GBP": ("ETH", "ETH/GBP", "GBP"),
     "SOL_GBP": ("SOL", "SOL/GBP", "GBP"),
 }
 FIAT = frozenset({"GBP", "USD", "EUR"})
@@ -103,7 +105,7 @@ def build_snapshot(exchange, *, now=None):
         if asset not in supported_assets | FIAT and value > 0
     )
     snapshot = {
-        "version": 1,
+        "version": SNAPSHOT_VERSION,
         "as_of": reference.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
         "holdings": holdings,
         "unsupported_nonzero_assets": unsupported,

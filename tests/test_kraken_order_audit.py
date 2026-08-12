@@ -12,6 +12,16 @@ class KrakenOrderAuditTests(unittest.TestCase):
         self.exchange.fetch_open_orders.return_value = []
         self.exchange.fetch_closed_orders.return_value = []
 
+    def test_active_targets_are_all_direct_gbp_and_legacy_markets_remain_audited(self):
+        self.assertEqual(
+            kraken_order_audit.TARGETS,
+            ("BTC_GBP", "ETH_GBP", "SOL_GBP"),
+        )
+        self.assertEqual(
+            kraken_order_audit.LEGACY_AUDIT_MARKETS,
+            ("HYPE_USD", "GBP_USD"),
+        )
+
     def test_clean_audit_is_safe_and_queries_only_read_endpoints(self):
         result = kraken_order_audit.audit_orders(self.exchange, now=self.now)
 
@@ -128,7 +138,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
 
         self.assertTrue(result["safe_to_initialize_empty_execution_state"])
 
-    def test_complete_two_leg_order_is_one_flow_not_a_duplicate(self):
+    def test_complete_direct_order_is_one_flow_not_a_duplicate(self):
         same_day_ms = int(
             datetime(2026, 8, 5, 1, 0, tzinfo=timezone.utc).timestamp() * 1000
         )
@@ -158,7 +168,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
         )
         self.assertFalse(result["safe_to_initialize_empty_execution_state"])
 
-    def test_orphan_funding_leg_is_incomplete_and_fails_closed(self):
+    def test_legacy_funding_leg_is_mismatched_and_fails_closed(self):
         same_day_ms = int(
             datetime(2026, 8, 5, 1, 0, tzinfo=timezone.utc).timestamp() * 1000
         )
@@ -177,7 +187,8 @@ class KrakenOrderAuditTests(unittest.TestCase):
         result = kraken_order_audit.audit_orders(self.exchange, now=self.now)
 
         self.assertEqual(result["same_day_completed_dca_flows"], 0)
-        self.assertEqual(result["same_day_incomplete_dca_flows"], 1)
+        self.assertEqual(result["same_day_incomplete_dca_flows"], 0)
+        self.assertEqual(result["same_day_mismatched_order_legs"], 1)
         self.assertFalse(result["flow_integrity_ok"])
         self.assertFalse(result["safe_to_initialize_empty_execution_state"])
 

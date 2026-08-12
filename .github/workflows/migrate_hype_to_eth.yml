@@ -1,0 +1,282 @@
+name: Replace HYPE/USD DCA with ETH/GBP
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type MIGRATE_HYPE_TO_ETH_GBP exactly
+        required: true
+        type: string
+      scheduler_confirmation:
+        description: Type RAILWAY_CRON_PAUSED after pausing Railway DCA_CRON_ENABLED
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dca-execution-state-writers
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      inputs.confirmation == 'MIGRATE_HYPE_TO_ETH_GBP' &&
+      inputs.scheduler_confirmation == 'RAILWAY_CRON_PAUSED'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install Kraken runtime
+        run: python -m pip install -r requirements.txt
+      - name: Acquire persistent target-migration lock
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          lock_name=DCA_TARGET_MIGRATION_LOCK
+          lock_value="HYPE_USD_TO_ETH_GBP:${GITHUB_RUN_ID}"
+          lock_error="$RUNNER_TEMP/target-migration-lock-error.txt"
+          if lock_response="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/variables/$lock_name" \
+            2>"$lock_error")"; then
+            existing="$(jq -er '.value | strings' <<< "$lock_response")"
+            case "$existing" in
+              HYPE_USD_TO_ETH_GBP:*)
+                echo "Resuming the existing HYPE-to-ETH target migration lock."
+                ;;
+              *)
+                echo "A different target migration lock is active; refusing this run." >&2
+                exit 1
+                ;;
+            esac
+          elif grep -q 'HTTP 404' "$lock_error"; then
+            gh variable set "$lock_name" --repo "$GITHUB_REPOSITORY" --body "$lock_value"
+            test "$(gh variable get "$lock_name" --repo "$GITHUB_REPOSITORY")" = "$lock_value"
+          else
+            echo "Could not determine whether a target migration lock exists." >&2
+            exit 1
+          fi
+
+          # Analysis and rule writes deliberately retain independent concurrency
+          # groups. Their persistent-lock checks stop queued runs; wait for runs
+          # that may have passed an earlier check before reading source state.
+          for attempt in $(seq 1 120); do
+            active=0
+            for workflow in crypto_analysis.yml update_dca_config.yml; do
+              count="$(gh run list \
+                --repo "$GITHUB_REPOSITORY" \
+                --workflow "$workflow" \
+                --status in_progress \
+                --json databaseId \
+                --jq 'length')"
+              active=$((active + count))
+            done
+            if [ "$active" -eq 0 ]; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 120 ]; then
+              echo "Timed out waiting for pre-lock state writers to finish." >&2
+              exit 1
+            fi
+            sleep 10
+          done
+      - name: Force GitHub execution into shadow mode
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        run: |
+          set -euo pipefail
+          gh variable set DCA_TRADING_MODE --repo "$GITHUB_REPOSITORY" --body shadow
+          test "$(gh variable get DCA_TRADING_MODE --repo "$GITHUB_REPOSITORY")" = shadow
+      - name: Prove Kraken order state is clear
+        env:
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: |
+          python - <<'PY'
+          from kraken_order_audit import audit_orders
+
+          result = audit_orders()
+          if (
+              not result["flow_integrity_ok"]
+              or result["unresolved_bot_orders"]
+              or result["unknown_timestamp_closed_bot_orders"]
+          ):
+              raise SystemExit("Kraken order integrity audit failed")
+          print("Kraken bot order integrity is clear for target migration.")
+          PY
+      - name: Read and validate complete current state
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rules="$(gh variable get DCA_TARGET_MAP --repo "$GITHUB_REPOSITORY")"
+          analysis="$(gh variable get DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY")"
+          execution="$(gh variable get DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY")"
+          retired_error="$RUNNER_TEMP/retired-variable-error.txt"
+          if retired_response="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/variables/DCA_RETIRED_TARGET_STATE" \
+            2>"$retired_error")"; then
+            retired="$(jq -er '.value | strings' <<< "$retired_response")"
+          elif grep -q 'HTTP 404' "$retired_error"; then
+            retired=""
+          else
+            echo "Could not determine whether DCA_RETIRED_TARGET_STATE exists." >&2
+            exit 1
+          fi
+          while IFS= read -r line; do
+            [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+          done <<< "$rules"
+          while IFS= read -r line; do
+            [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+          done <<< "$analysis"
+          while IFS= read -r line; do
+            [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+          done <<< "$execution"
+          while IFS= read -r line; do
+            [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+          done <<< "$retired"
+          python dca_target_migration.py \
+            --rules "$rules" \
+            --analysis "$analysis" \
+            --execution "$execution" \
+            --retired "$retired" \
+            --output "$RUNNER_TEMP/migration.json"
+      - name: Archive and apply resumable fail-closed state
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+
+
+          def canonical_hash(value):
+              import hashlib
+
+              encoded = json.dumps(
+                  value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+              ).encode("utf-8")
+              return hashlib.sha256(encoded).hexdigest()
+
+          path = os.path.join(os.environ["RUNNER_TEMP"], "migration.json")
+          with open(path, encoding="utf-8") as handle:
+              data = json.load(handle)
+          expected = data.pop("_CURRENT_STATE_HASHES")
+          archive_present = data.pop("_ARCHIVE_PRESENT")
+          data.pop("_MIGRATION_PHASE")
+
+
+          def read_json(name):
+              completed = subprocess.run(
+                  [
+                      "gh", "variable", "get", name,
+                      "--repo", os.environ["GITHUB_REPOSITORY"],
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+              return json.loads(completed.stdout)
+
+
+          def write_json(name, value, expected_before):
+              current = read_json(name)
+              target_hash = canonical_hash(value)
+              if canonical_hash(current) == target_hash:
+                  return
+              if canonical_hash(current) != expected_before:
+                  raise SystemExit(
+                      f"{name} changed after migration validation; refusing write"
+                  )
+              subprocess.run(
+                  [
+                      "gh", "variable", "set", name,
+                      "--repo", os.environ["GITHUB_REPOSITORY"],
+                      "--body", json.dumps(value, separators=(",", ":")),
+                  ],
+                  check=True,
+              )
+              if canonical_hash(read_json(name)) != target_hash:
+                  raise SystemExit(f"{name} readback verification failed")
+
+
+          archive = data["DCA_RETIRED_TARGET_STATE"]
+          if archive_present:
+              if canonical_hash(read_json("DCA_RETIRED_TARGET_STATE")) != canonical_hash(archive):
+                  raise SystemExit("DCA_RETIRED_TARGET_STATE changed; refusing resume")
+          else:
+              subprocess.run(
+                  [
+                      "gh", "variable", "set", "DCA_RETIRED_TARGET_STATE",
+                      "--repo", os.environ["GITHUB_REPOSITORY"],
+                      "--body", json.dumps(archive, separators=(",", ":")),
+                  ],
+                  check=True,
+              )
+              if canonical_hash(read_json("DCA_RETIRED_TARGET_STATE")) != canonical_hash(archive):
+                  raise SystemExit("DCA_RETIRED_TARGET_STATE readback verification failed")
+
+          # Rules are the compatibility boundary and therefore move last.
+          for name in (
+              "DCA_ANALYSIS_STATE",
+              "DCA_EXECUTION_STATE",
+              "DCA_TARGET_MAP",
+          ):
+              write_json(name, data[name], expected[name])
+
+          for name in ("DCA_CANARY_SYMBOL", "DCA_TRADING_MODE"):
+              value = data[name]
+              subprocess.run(
+                  [
+                      "gh", "variable", "set", name,
+                      "--repo", os.environ["GITHUB_REPOSITORY"],
+                      "--body", value,
+                  ],
+                  check=True,
+              )
+              completed = subprocess.run(
+                  [
+                      "gh", "variable", "get", name,
+                      "--repo", os.environ["GITHUB_REPOSITORY"],
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+              if completed.stdout.rstrip("\r\n") != value:
+                  raise SystemExit(f"{name} readback verification failed")
+
+          for name in (
+              "DCA_ANALYSIS_STATE",
+              "DCA_EXECUTION_STATE",
+              "DCA_TARGET_MAP",
+              "DCA_RETIRED_TARGET_STATE",
+          ):
+              expected_value = archive if name == "DCA_RETIRED_TARGET_STATE" else data[name]
+              if canonical_hash(read_json(name)) != canonical_hash(expected_value):
+                  raise SystemExit(f"final {name} verification failed")
+          PY
+      - name: Release persistent target-migration lock after verified success
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current="$(gh variable get DCA_TARGET_MIGRATION_LOCK --repo "$GITHUB_REPOSITORY")"
+          case "$current" in
+            HYPE_USD_TO_ETH_GBP:*) ;;
+            *)
+              echo "Target migration lock changed; refusing to delete it." >&2
+              exit 1
+              ;;
+          esac
+          gh variable delete DCA_TARGET_MIGRATION_LOCK --repo "$GITHUB_REPOSITORY"

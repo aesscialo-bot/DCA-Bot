@@ -1,4 +1,4 @@
-# Kraken GBP-Budgeted Mixed-Market DCA Bot
+# Kraken GBP-Budgeted GBP-Market DCA Bot
 
 > [!IMPORTANT]
 > **Start here:** [DCA Bot Operating and Configuration Guide](00_START_HERE.md)
@@ -8,14 +8,13 @@
 This repository is the production source for a fail-closed Kraken spot DCA
 service. It tracks and buys exactly these markets:
 
-- `BTC/GBP` (spends GBP directly)
-- `HYPE/USD`
-- `SOL/GBP` (spends GBP directly)
+- `BTC/GBP`
+- `ETH/GBP`
+- `SOL/GBP`
 
-Budgets remain denominated in GBP. BTC and SOL spend GBP directly on `BTC/GBP`
-and `SOL/GBP`. HYPE is the sole USD route: the bot sells its exact GBP budget on
-Kraken `GBP/USD`, then spends only the confirmed net USD proceeds on `HYPE/USD`.
-There is no THB or Bitkub trading path.
+Budgets remain denominated in GBP. BTC, ETH, and SOL spend GBP directly on their
+Kraken GBP markets; no active target has a funding leg. There is no THB or
+Bitkub trading path.
 
 Kraken is the authoritative record of cash, holdings, fees, and orders. Every
 confirmed purchase is also placed in a durable, retry-safe outbox for Portfolio
@@ -34,25 +33,26 @@ mirror and can never affect analysis, budgets, scheduling, or Kraken execution.
 
 The strict production trading gate is **2026-08-07 in Asia/Bangkok**. The
 repository variable `DCA_START_DATE` contains `2026-08-07`; before that local
-date, the trader fails closed without creating either Kraken order. Check live
+date, the trader fails closed without creating a Kraken order. Check live
 operation with `show status` and `!dca health` rather than treating this static
 baseline as current runtime state.
 
-The requested enabled rules are:
+The guarded cutover carries these budget endpoints forward and leaves every
+target disabled. Re-enable desired pairs only after fresh verified analysis:
 
 ```json
 {
   "BTC_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 25},
-    "BUY_ENABLED": true
+    "BUY_ENABLED": false
   },
-  "HYPE_USD": {
+  "ETH_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 18.75},
-    "BUY_ENABLED": true
+    "BUY_ENABLED": false
   },
   "SOL_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 18.75},
-    "BUY_ENABLED": true
+    "BUY_ENABLED": false
   }
 }
 ```
@@ -61,9 +61,9 @@ The stored `LOW` and `UP` fields are the lower and upper budget endpoints; the
 `UP` field name is retained for configuration compatibility and no longer means
 "use this in an uptrend." The counter-cyclical policy is:
 
-- `DOWNTREND` → higher endpoint: BTC £25, HYPE £18.75, SOL £18.75; £62.50 aggregate.
-- `SIDEWAYS` → midpoint: BTC £18.75, HYPE £15.63, SOL £15.63; £50.01 aggregate.
-- `UPTREND` → lower endpoint: BTC £12.50, HYPE £12.50, SOL £12.50; £37.50 aggregate.
+- `DOWNTREND` → higher endpoint: BTC £25, ETH £18.75, SOL £18.75; £62.50 aggregate.
+- `SIDEWAYS` → midpoint: BTC £18.75, ETH £15.63, SOL £15.63; £50.01 aggregate.
+- `UPTREND` → lower endpoint: BTC £12.50, ETH £12.50, SOL £12.50; £37.50 aggregate.
 
 Each enabled asset can buy at most once per Bangkok calendar day.
 
@@ -80,12 +80,8 @@ flowchart TD
     G -- "No" --> H["Skip safely"]
     G -- "Yes" --> I["Revalidate live rules, decision, minimum, and daily state"]
     I --> J["Save durable pending intent"]
-    J --> K{"Configured Kraken route"}
-    K -- "BTC or SOL" --> L["Buy directly on BTC/GBP or SOL/GBP"]
-    K -- "HYPE" --> M["Sell exact GBP budget on GBP/USD; fciq"]
-    M --> N["Spend confirmed net USD on HYPE/USD; fcib"]
+    J --> L["Buy directly on BTC/GBP, ETH/GBP, or SOL/GBP"]
     L --> T["Require confirmed crypto fill"]
-    N --> T
     T --> O["Atomically save buy date and Portfolio Compass outbox row"]
     O --> P["Deliver audit + event to private repository with SHA retries"]
     P --> U["Portfolio Compass imports the Markdown record"]
@@ -94,14 +90,10 @@ flowchart TD
     Q --> R["Reporting continues independently"]
 ```
 
-For HYPE, `fciq` requests the GBP/USD fee in quote currency and `fcib` requests
-the HYPE fee in the purchased base asset. The bot uses confirmed Kraken
-fills—not an estimated conversion—to determine how much USD is available for
-that second leg. BTC and SOL have no funding leg or USD conversion fee.
-
-If either result is unknown, the durable intent remains pending and later runs
-reconcile it before considering another order. The bot never starts a second
-funding leg merely because an API response was interrupted.
+If a direct order result is unknown, the durable intent remains pending and
+later runs reconcile it before considering another order. The bot never submits
+another order merely because an API response was interrupted. The fixed
+historical HYPE/USD recovery retains its original two-leg evidence separately.
 
 ## Trend and timing decisions
 
@@ -125,7 +117,7 @@ lower endpoint cannot exceed the upper endpoint.
 
 The execution-time engine deterministically evaluates 3-, 5-, 7-, 14-, 30-,
 45-, and 60-day Bangkok-day windows at 15-minute resolution for the actual
-Kraken routes: BTC/GBP, HYPE/USD, and SOL/GBP. It minimizes median closing
+Kraken routes: BTC/GBP, ETH/GBP, and SOL/GBP. It minimizes median closing
 price miss from each day's absolute low, measures wins within 0.5%, applies the
 locked 14-day override and 30-versus-60 thresholds, and resolves close candidates
 using Top-5 appearances across all seven windows, 60-day win rate, then earlier
@@ -137,7 +129,7 @@ History is built exclusively from Kraken's first-party PostTrade API into
 append-only monthly Gist partitions. The resumable bootstrap checkpoints every
 page, globally rate-limits requests, records explicit no-trade gaps and partition
 hashes, and verifies the overlapping recent 7.5 days against Kraken OHLC. No new
-order is permitted unless BTC/GBP, HYPE/USD, and SOL/GBP all have current,
+order is permitted unless BTC/GBP, ETH/GBP, and SOL/GBP all have current,
 verified history and decisions.
 
 PostTrade pagination uses Kraken's exclusive `from_ts` cursor without subtracting
@@ -307,7 +299,7 @@ The producer refuses to infer completeness from a time-restricted API key.
 
 ## Discord controls
 
-Examples use the canonical mixed-market targets:
+Examples use the canonical GBP-market targets:
 
 ```text
 !dca set BTC amounts to 12.50 low and 25 high
@@ -341,8 +333,9 @@ or submit an order; use `help` for the exact safety-critical command.
 | --- | --- | --- |
 | `crypto_analysis.yml` | 04:07 and 04:37 Bangkok or manual | Refresh strict Kraken history and build idempotent deterministic decisions. |
 | `kraken_history_bootstrap.yml` | Manual | Resume the 65-day PostTrade history bootstrap and publish verified partitions. |
-| `daily_dca.yml` | Minutes 02/17/32/47 plus Railway | Revalidate the global history gate and execute due two-leg purchases exactly once. |
-| `portfolio_check.yml` | Monthly or manual | Read-only Kraken holdings and mixed-market history, valued in GBP with live Kraken GBP/USD where required. |
+| `daily_dca.yml` | Minutes 02/17/32/47 plus Railway | Revalidate the global history gate and execute due direct GBP purchases exactly once. |
+| `portfolio_check.yml` | Monthly or manual | Read-only active holdings plus retained historical HYPE, valued in GBP; USD values and cash use live Kraken GBP/USD. |
+| `migrate_hype_to_eth.yml` | Manual on `main` | Audit Kraken, replace HYPE/USD with disabled ETH/GBP, reset active analysis, and archive retired HYPE rule/analysis/execution state. |
 | `update_dca_config.yml` | Manual/Discord dispatch | Serialize atomic GBP budget and enable-state updates. |
 | `ci.yml` | Pull request and `main` | Compile, test, validate workflows, and build the Railway image. |
 
@@ -354,6 +347,19 @@ target disabled, Railway scheduling off, and an authenticated Kraken open/closed
 order audit confirming that no unresolved intent can be lost. Preserve valid
 buy dates and recovery records while migrating complete rules, analysis, and
 execution state.
+
+The HYPE-to-ETH cutover must use the manual `Replace HYPE/USD DCA with ETH/GBP`
+workflow on `main`, with exact confirmations `MIGRATE_HYPE_TO_ETH_GBP` and
+`RAILWAY_CRON_PAUSED`. It masks and hash-binds the source rules, analysis, and
+execution state, reruns the read-only Kraken integrity audit, starts ETH
+disabled with an empty buy date, preserves BTC/SOL buy dates, and writes HYPE's
+final rule, analysis, and buy date to the hash-bound
+`DCA_RETIRED_TARGET_STATE` repository variable. Do not delete that archive or
+copy HYPE's buy date or analysis to ETH.
+
+After migration, run `Kraken History Bootstrap` with `targets=ETH_GBP` and wait
+for verified ETH/GBP coverage. Only then run `!dca analyze all`, run Portfolio
+Balance Check, review the new market set, and deliberately enable desired pairs.
 
 The guarded maintainer procedure is in
 [Adding or permanently removing a pair](00_START_HERE.md#adding-or-permanently-removing-a-pair).
@@ -562,9 +568,10 @@ retained under the user-only `%LOCALAPPDATA%\dca-ghostfolio\retired-keys`
 directory. This prevents the desktop login from opening an empty second user
 while the sync service updates the populated portfolio.
 
-Ghostfolio 3.43.0 imports BTC and SOL through CoinGecko. Its local CoinGecko
-importer rejects Hyperliquid despite returning it in lookup results, so HYPE is
-bound explicitly to Ghostfolio's supported Yahoo profile `HYPE32196USD`.
+Ghostfolio 3.43.0 imports the active BTC, ETH, and SOL targets through
+CoinGecko. Its local CoinGecko importer rejects Hyperliquid despite returning
+it in lookup results, so the retained historical HYPE recovery remains bound
+explicitly to Ghostfolio's supported Yahoo profile `HYPE32196USD`.
 
 `ghostfolio/reconcile_legacy.py` is dry-run only. It maps recovered trades to
 fresh logical accounts and blocks migration if the hosted export is missing or

@@ -118,7 +118,18 @@ class KrakenHistoryTests(unittest.TestCase):
             kraken_history.validate_ohlc_overlap(client, "BTC/GBP", candles, cutoff)
 
     def test_target_parser_is_strict_and_deduplicated(self):
-        self.assertEqual(kraken_history._parse_targets("btc/gbp,BTC_GBP,sol_gbp"), ["BTC_GBP", "SOL_GBP"])
+        self.assertEqual(
+            kraken_history.TARGET_PAIRS,
+            {
+                "BTC_GBP": "BTC/GBP",
+                "ETH_GBP": "ETH/GBP",
+                "SOL_GBP": "SOL/GBP",
+            },
+        )
+        self.assertEqual(
+            kraken_history._parse_targets("btc/gbp,BTC_GBP,eth_gbp,sol_gbp"),
+            ["BTC_GBP", "ETH_GBP", "SOL_GBP"],
+        )
         with self.assertRaisesRegex(kraken_history.HistoryError, "unsupported"):
             kraken_history._parse_targets("ETH_USD")
 

@@ -116,21 +116,21 @@ class AnalysisSymbolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "configured Kraken markets only"):
             crypto_analysis.get_analysis_exchange("coinbase")
 
-    def test_derives_exact_three_kraken_usd_pairs_from_rules(self):
+    def test_derives_exact_three_kraken_gbp_pairs_from_rules(self):
         rules = dca_config.default_rules_map()
         self.assertEqual(
             crypto_analysis._parse_symbols("", json.dumps(rules)),
-            ["BTC/GBP", "HYPE/USD", "SOL/GBP"],
+            ["BTC/GBP", "ETH/GBP", "SOL/GBP"],
         )
         self.assertEqual(
             crypto_analysis._parse_symbols("all", json.dumps(rules)),
-            ["BTC/GBP", "HYPE/USD", "SOL/GBP"],
+            ["BTC/GBP", "ETH/GBP", "SOL/GBP"],
         )
 
     def test_explicit_supported_subset_is_normalized(self):
         self.assertEqual(
-            crypto_analysis._parse_symbols('BTC,HYPE_USD,"SOL/GBP"', "{}"),
-            ["BTC/GBP", "HYPE/USD", "SOL/GBP"],
+            crypto_analysis._parse_symbols('BTC,ETH_GBP,"SOL/GBP"', "{}"),
+            ["BTC/GBP", "ETH/GBP", "SOL/GBP"],
         )
 
     def test_nonproduction_and_legacy_quote_pairs_are_rejected(self):
@@ -367,6 +367,34 @@ class TimingPolicyTests(unittest.TestCase):
 
 
 class DecisionAndNarrationTests(unittest.TestCase):
+    def test_target_migration_lock_blocks_direct_analysis_persistence(self):
+        locked = MagicMock(status_code=200)
+        with (
+            patch.dict(
+                crypto_analysis.os.environ,
+                {"GH_PAT_FOR_VARS": "token", "GITHUB_REPOSITORY": "owner/repo"},
+            ),
+            patch.object(crypto_analysis.requests, "get", return_value=locked),
+            patch.object(crypto_analysis.requests, "patch") as write,
+            self.assertRaisesRegex(RuntimeError, "migration lock"),
+        ):
+            crypto_analysis.persist_analysis_state({"safe": "state"})
+        write.assert_not_called()
+
+    def test_uncertain_target_migration_lock_state_blocks_persistence(self):
+        uncertain = MagicMock(status_code=503)
+        with (
+            patch.dict(
+                crypto_analysis.os.environ,
+                {"GH_PAT_FOR_VARS": "token", "GITHUB_REPOSITORY": "owner/repo"},
+            ),
+            patch.object(crypto_analysis.requests, "get", return_value=uncertain),
+            patch.object(crypto_analysis.requests, "patch") as write,
+            self.assertRaisesRegex(RuntimeError, "could not be checked"),
+        ):
+            crypto_analysis.persist_analysis_state({"safe": "state"})
+        write.assert_not_called()
+
     def test_analysis_noop_is_invalidated_when_enable_state_changes(self):
         rules = dca_config.default_rules_map()
         target = "BTC_GBP"
@@ -430,10 +458,10 @@ class DecisionAndNarrationTests(unittest.TestCase):
             timedelta(minutes=60),
         )
 
-    def test_hype_analysis_uses_completed_kraken_hype_usd_history(self):
-        rule = dca_config.default_rules_map()["HYPE_USD"]
-        # HYPE/USD is newer than BTC/GBP and SOL/GBP but has more than the
-        # exact 170 candles required by SMA150's 20-day slope.
+    def test_eth_analysis_uses_completed_kraken_eth_gbp_history(self):
+        rule = dca_config.default_rules_map()["ETH_GBP"]
+        # The exact 170 candles required by SMA150's 20-day slope remain
+        # sufficient for every configured production market.
         daily, weekly = trend_rows("down", count=190)
         exchange = MagicMock()
         with (
@@ -445,10 +473,10 @@ class DecisionAndNarrationTests(unittest.TestCase):
             patch.object(crypto_analysis, "LOCAL_TZ", "Asia/Bangkok"),
         ):
             decision = crypto_analysis.analyze_asset(
-                exchange, "HYPE_USD", rule, now=NOW
+                exchange, "ETH_GBP", rule, now=NOW
             )
 
-        fetch_rows.assert_called_once_with(exchange, "HYPE/USD")
+        fetch_rows.assert_called_once_with(exchange, "ETH/GBP")
         self.assertEqual(decision["REGIME"], "DOWNTREND")
         self.assertEqual(decision["AMOUNT_TIER"], "HIGH")
         self.assertEqual(decision["TIMING"]["HISTORY_CANDLES"], 5760)
@@ -473,11 +501,11 @@ class DecisionAndNarrationTests(unittest.TestCase):
             patch.object(crypto_analysis, "LOCAL_TZ", "Asia/Bangkok"),
         ):
             decision = crypto_analysis.analyze_asset(
-                MagicMock(), "HYPE_USD", rule, now=NOW
+                MagicMock(), "ETH_GBP", rule, now=NOW
             )
 
         self.assertEqual(decision["AMOUNT_TIER"], "MID")
-        report = crypto_analysis._decision_report("HYPE_USD", decision, rule)
+        report = crypto_analysis._decision_report("ETH_GBP", decision, rule)
         self.assertIn("`MID` tier (`£12.5` configured)", report)
 
     def test_analysis_failure_creates_fresh_non_executable_error(self):

@@ -42,6 +42,7 @@ foreach ($requiredName in $requiredAccountNames) {
 $accountMap = @{
   BTC_GBP = $byName['Kraken DCA']
   HYPE_USD = $byName['Kraken DCA']
+  ETH_GBP = $byName['Kraken DCA']
   SOL_GBP = $byName['Kraken DCA']
   BITKUB_LEGACY = $byName['Bitkub Legacy']
 } | ConvertTo-Json -Compress

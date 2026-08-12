@@ -124,6 +124,20 @@ def signed_snapshot():
     return snapshot
 
 
+def current_signed_snapshot():
+    snapshot = signed_snapshot()
+    snapshot.pop("canonical_hash")
+    snapshot["version"] = 2
+    snapshot["holdings"]["ETH_GBP"] = {
+        "asset": "ETH",
+        "pair": "ETH/GBP",
+        "quantity": "0.4",
+        "quote_currency": "GBP",
+        "unit_price_quote": "2500",
+    }
+    return resign_snapshot(snapshot)
+
+
 def resign_snapshot(snapshot):
     snapshot.pop("canonical_hash", None)
     snapshot["canonical_hash"] = hashlib.sha256(
@@ -616,6 +630,7 @@ class GhostfolioSyncTests(unittest.TestCase):
         valid_map = {
             "BTC_GBP": "kraken",
             "HYPE_USD": "kraken",
+            "ETH_GBP": "kraken",
             "SOL_GBP": "kraken",
             "BITKUB_LEGACY": "bitkub",
         }
@@ -659,6 +674,7 @@ class GhostfolioSyncTests(unittest.TestCase):
                 "GHOSTFOLIO_ACCOUNT_MAP": json.dumps({
                     "BTC_GBP": "kraken",
                     "HYPE_USD": "kraken",
+                    "ETH_GBP": "kraken",
                     "SOL_GBP": "kraken",
                 })
             },
@@ -701,6 +717,7 @@ class GhostfolioSyncTests(unittest.TestCase):
             )
 
         self.assertEqual(quantities["BTC_GBP"], 0.25)
+        self.assertEqual(quantities["ETH_GBP"], 0)
         self.assertIn("accounts=kraken-account", request.call_args.args[0])
         self.assertEqual(request.call_args.kwargs["token"], "token")
 
@@ -2559,9 +2576,32 @@ class GhostfolioSyncTests(unittest.TestCase):
         )
         self.assertEqual(
             ghostfolio_sync.holdings_drift(
-                parsed, {"BTC_GBP": 0.1, "HYPE_USD": 2, "SOL_GBP": 3}
+                parsed,
+                {
+                    "BTC_GBP": 0.1,
+                    "HYPE_USD": 2,
+                    "ETH_GBP": 99,
+                    "SOL_GBP": 3,
+                },
             ),
             {"BTC_GBP": 0.1},
+        )
+        current = ghostfolio_sync.parse_holdings_snapshot(
+            ghostfolio_sync.canonical(current_signed_snapshot())
+        )
+        self.assertEqual(current["version"], 2)
+        self.assertEqual(current["holdings"]["ETH_GBP"]["pair"], "ETH/GBP")
+        self.assertEqual(
+            ghostfolio_sync.holdings_drift(
+                current,
+                {
+                    "BTC_GBP": 0.2,
+                    "HYPE_USD": 2,
+                    "ETH_GBP": 0.3,
+                    "SOL_GBP": 3,
+                },
+            ),
+            {"ETH_GBP": 0.10000000000000003},
         )
         prior = ghostfolio_sync.os.environ.get("GHOSTFOLIO_ACCOUNT_MAP")
         ghostfolio_sync.os.environ["GHOSTFOLIO_ACCOUNT_MAP"] = json.dumps(
@@ -2583,7 +2623,7 @@ class GhostfolioSyncTests(unittest.TestCase):
             "version": 1,
             "as_of": "2026-08-07T04:00:00Z",
             "holdings": {},
-            "unsupported_nonzero_assets": ["ETH"],
+            "unsupported_nonzero_assets": ["XRP"],
         }
         snapshot["canonical_hash"] = hashlib.sha256(
             ghostfolio_sync.canonical(snapshot).encode()
@@ -2700,6 +2740,28 @@ class GhostfolioSyncTests(unittest.TestCase):
                 ghostfolio_sync.os.environ["GHOSTFOLIO_ACCOUNT_MAP"] = prior
         self.assertEqual(activity["dataSource"], "YAHOO")
         self.assertEqual(activity["symbol"], "HYPE32196USD")
+
+    def test_eth_uses_direct_gbp_event_contract_and_coingecko_profile(self):
+        item = event("ORDER-ETH")
+        item.update({
+            "target": "ETH_GBP",
+            "base_currency": "ETH",
+            "crypto_quantity": "0.004",
+            "unit_price_quote": "2500",
+        })
+        item = resign_event(item)
+        self.assertEqual(
+            ghostfolio_sync.parse_events(ghostfolio_sync.canonical(item)),
+            [item],
+        )
+        with patch.dict(
+            ghostfolio_sync.os.environ,
+            {"GHOSTFOLIO_ACCOUNT_MAP": json.dumps({"ETH_GBP": "local-eth"})},
+        ):
+            activity = ghostfolio_sync.import_payload(item)["activities"][0]
+        self.assertEqual(activity["accountId"], "local-eth")
+        self.assertEqual(activity["dataSource"], "COINGECKO")
+        self.assertEqual(activity["symbol"], "ethereum")
 
 
 if __name__ == "__main__":

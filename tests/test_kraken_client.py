@@ -146,6 +146,7 @@ class KrakenClientTests(unittest.TestCase):
     def test_symbol_accepts_only_supported_gbp_and_usd_pairs(self):
         self.assertEqual(kraken_client.to_kraken_symbol("BTC_GBP"), "BTC/GBP")
         self.assertEqual(kraken_client.to_kraken_symbol("eth/gbp"), "ETH/GBP")
+        # Historical incident recovery still needs generic USD-pair support.
         self.assertEqual(kraken_client.to_kraken_symbol("HYPE_USD"), "HYPE/USD")
         self.assertEqual(kraken_client.to_kraken_symbol("sol/usd"), "SOL/USD")
 

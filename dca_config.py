@@ -1,4 +1,4 @@
-"""Shared schemas and safety checks for the mixed-market Kraken DCA service.
+"""Shared schemas and safety checks for the GBP-market Kraken DCA service.
 
 The module deliberately contains no network calls.  GitHub Actions, Railway,
 Discord, analysis, and order execution can therefore validate exactly the same
@@ -16,16 +16,16 @@ import re
 from typing import Any, Callable, Mapping
 
 
-TARGET_KEYS = ("BTC_GBP", "HYPE_USD", "SOL_GBP")
+TARGET_KEYS = ("BTC_GBP", "ETH_GBP", "SOL_GBP")
 ALLOWED_TARGETS = TARGET_KEYS
 TARGET_SYMBOLS = {
     "BTC_GBP": "BTC/GBP",
-    "HYPE_USD": "HYPE/USD",
+    "ETH_GBP": "ETH/GBP",
     "SOL_GBP": "SOL/GBP",
 }
 TARGET_ROUTES = {
     "BTC_GBP": "DIRECT_GBP",
-    "HYPE_USD": "GBP_TO_USD",
+    "ETH_GBP": "DIRECT_GBP",
     "SOL_GBP": "DIRECT_GBP",
 }
 RULE_FIELDS = frozenset({"REGIME_AMOUNTS_GBP", "BUY_ENABLED"})
@@ -197,7 +197,7 @@ def validate_target_map(
 
     Disabled targets may use zero as an explicit unconfigured placeholder.
     Enabled targets require both endpoints to be within £5–£1,000 and not below a
-        supplied live Kraken market minimum. Only the three production mixed-market
+        supplied live Kraken market minimum. Only the three production GBP-market
         keys and the final two-field rule schema are accepted. All budget values
         remain GBP-denominated.
     """
