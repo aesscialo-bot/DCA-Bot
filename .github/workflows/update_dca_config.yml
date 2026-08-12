@@ -97,7 +97,8 @@ jobs:
             if gh variable get DCA_TARGET_MIGRATION_LOCK --repo "$GITHUB_REPOSITORY" >/dev/null 2>"$lock_error"; then
               echo "A target migration is locked; refusing the update." >&2
               exit 1
-            elif ! grep -q 'HTTP 404' "$lock_error"; then
+            elif ! grep -Fq 'HTTP 404' "$lock_error" && \
+                ! grep -Fq 'variable DCA_TARGET_MIGRATION_LOCK was not found' "$lock_error"; then
               echo "Could not check the target migration lock; refusing the update." >&2
               exit 1
             fi
@@ -107,11 +108,21 @@ jobs:
             echo "Could not read DCA_TARGET_MAP; refusing the update." >&2
             exit 1
           fi
-          if ! DCA_ANALYSIS_STATE=$(gh variable get DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY" 2>/dev/null); then
-            DCA_ANALYSIS_STATE='{}'
+          analysis_error="$RUNNER_TEMP/analysis-state-error.txt"
+          if ! DCA_ANALYSIS_STATE=$(gh variable get DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY" 2>"$analysis_error"); then
+            if grep -Fq 'variable DCA_ANALYSIS_STATE was not found' "$analysis_error"; then
+              DCA_ANALYSIS_STATE='{}'
+            else
+              echo "Could not check DCA_ANALYSIS_STATE; refusing the update." >&2
+              exit 1
+            fi
           fi
-          if ! DCA_EXECUTION_STATE=$(gh variable get DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY" 2>/dev/null); then
-            if [ "$ACTION" = "set_enabled" ] && [ "$ENABLED_JSON" = "true" ]; then
+          execution_error="$RUNNER_TEMP/execution-state-error.txt"
+          if ! DCA_EXECUTION_STATE=$(gh variable get DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY" 2>"$execution_error"); then
+            if ! grep -Fq 'variable DCA_EXECUTION_STATE was not found' "$execution_error"; then
+              echo "Could not check DCA_EXECUTION_STATE; refusing the update." >&2
+              exit 1
+            elif [ "$ACTION" = "set_enabled" ] && [ "$ENABLED_JSON" = "true" ]; then
               echo "Could not read DCA_EXECUTION_STATE; refusing enable." >&2
               exit 1
             fi

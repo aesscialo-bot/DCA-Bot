@@ -50,7 +50,8 @@ jobs:
           if gh variable get DCA_TARGET_MIGRATION_LOCK --repo "$GITHUB_REPOSITORY" >/dev/null 2>"$lock_error"; then
             echo "A target migration is locked; refusing to trade." >&2
             exit 1
-          elif ! grep -q 'HTTP 404' "$lock_error"; then
+          elif ! grep -Fq 'HTTP 404' "$lock_error" && \
+              ! grep -Fq 'variable DCA_TARGET_MIGRATION_LOCK was not found' "$lock_error"; then
             echo "Could not check the target migration lock; refusing to trade." >&2
             exit 1
           fi

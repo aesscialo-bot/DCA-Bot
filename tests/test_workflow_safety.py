@@ -193,6 +193,35 @@ class WorkflowSafetyTests(unittest.TestCase):
             text = self._read(name)
             with self.subTest(workflow=name):
                 self.assertIn("DCA_TARGET_MIGRATION_LOCK", text)
+                self.assertIn(
+                    "grep -Fq 'variable DCA_TARGET_MIGRATION_LOCK was not found'",
+                    text,
+                )
+        migration = self._read("migrate_hype_to_eth.yml")
+        self.assertNotIn("variable [^ ]+ was not found", migration)
+        self.assertEqual(migration.count("grep -q 'HTTP 404'"), 2)
+        analysis_workflow = self._read("crypto_analysis.yml")
+        self.assertIn(
+            "grep -Fq 'variable DCA_ANALYSIS_STATE was not found'",
+            analysis_workflow,
+        )
+        writer_workflow = self._read("update_dca_config.yml")
+        self.assertIn(
+            "grep -Fq 'variable DCA_ANALYSIS_STATE was not found'",
+            writer_workflow,
+        )
+        self.assertIn(
+            "grep -Fq 'variable DCA_EXECUTION_STATE was not found'",
+            writer_workflow,
+        )
+        self.assertNotIn(
+            "gh variable get DCA_ANALYSIS_STATE --repo \"$GITHUB_REPOSITORY\" 2>/dev/null",
+            analysis_workflow + writer_workflow,
+        )
+        self.assertNotIn(
+            "gh variable get DCA_EXECUTION_STATE --repo \"$GITHUB_REPOSITORY\" 2>/dev/null",
+            writer_workflow,
+        )
         analysis_module = (ROOT / "crypto_analysis.py").read_text(encoding="utf-8")
         self.assertIn("TARGET_MIGRATION_LOCK_VARIABLE", analysis_module)
         self.assertIn("blocks analysis persistence", analysis_module)
