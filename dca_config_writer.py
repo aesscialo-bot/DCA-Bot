@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -13,9 +12,7 @@ from dca_config import (
     ALLOWED_TARGETS,
     ConfigError,
     global_rules_hash,
-    parse_utc_iso,
     rules_hash,
-    validate_analysis_state,
     validate_enabled_market_minimums,
     validate_execution_state,
     validate_rules_map,
@@ -110,16 +107,9 @@ def apply_change(
     if not enabled:
         return validate_rules_map(candidate), True
 
-    reference = now or datetime.now(timezone.utc)
-    if reference.tzinfo is None or reference.utcoffset() is None:
-        raise ConfigError("now must include a timezone")
-    if (
-        not expected_rules_hash
-        or not expected_decision_id
-        or not expected_global_rules_hash
-    ):
+    if not expected_rules_hash or not expected_global_rules_hash:
         raise ConfigError(
-            "Enabling requires the exact reviewed rules, global state, and decision"
+            "Enabling requires the exact reviewed rules and global state"
         )
     if expected_global_rules_hash != global_rules_pre_state_hash(rules):
         raise ConfigError("Global DCA rules changed after the enable review")
@@ -134,20 +124,9 @@ def apply_change(
             "Cannot enable while Kraken order reconciliation is pending for "
             + ", ".join(pending_symbols)
         )
-    # Validate the document globally, then bind only the target being enabled.
-    # A disabled asset whose budgets were edited and not yet re-analyzed must
-    # not prevent an unrelated asset with a current decision from being enabled.
-    state = validate_analysis_state(analysis_state, now=reference)
-    decision = state["TARGETS"][symbol]
     live_hash = rules_hash(symbol, rules[symbol])
-    if decision["ANALYSIS_STATUS"] != "READY":
-        raise ConfigError(f"{symbol} does not have a READY analysis decision")
-    if expected_rules_hash != live_hash or decision["RULES_HASH"] != live_hash:
+    if expected_rules_hash != live_hash:
         raise ConfigError("Budgets changed after the enable review")
-    if expected_decision_id != decision["DECISION_ID"]:
-        raise ConfigError("Analysis changed after the enable review")
-    if reference.astimezone(timezone.utc) > parse_utc_iso(decision["VALID_UNTIL"]):
-        raise ConfigError("The reviewed analysis decision is stale")
     if market_minimum_provider is None:
         raise ConfigError("A fresh Kraken market-minimum check is required")
     minimum = _minimum_value(market_minimum_provider, symbol)

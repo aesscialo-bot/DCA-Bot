@@ -449,15 +449,13 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("UPTREND/lower: £10", reply)
         self.assertIn("SIDEWAYS/midpoint: £15", reply)
         self.assertIn("DOWNTREND/higher: £20", reply)
-        self.assertIn("Latest regime", reply)
-        self.assertIn("Effective amount: £10", reply)
-        self.assertIn("Next execution", reply)
-        self.assertIn("Decision age", reply)
         self.assertIn("Maximum aggregate daily exposure", reply)
         self.assertIn("Kraken's current market minimum", reply)
+        self.assertIn("next successful analysis", reply)
+        self.assertIn("Existing or stale decisions cannot trade", reply)
         self.assertIn("!dca confirm enable BTC_GBP", reply)
 
-    def test_enable_requires_nonzero_budgets_and_fresh_matching_decision(self):
+    def test_enable_requires_nonzero_budgets_but_allows_stale_analysis(self):
         zero_rules = rules(low=0, up=0)
         message = MessageStub()
         with patch.object(
@@ -481,7 +479,8 @@ class DiscordBotControlTests(unittest.TestCase):
             patch.object(discord_bot, "datetime", FrozenDateTime),
         ):
             asyncio.run(discord_bot.handle_enable("BTC", stale))
-        self.assertIn("stale", stale.replies[-1])
+        self.assertIn("Enable review for BTC_GBP", stale.replies[-1])
+        self.assertIn("next successful analysis", stale.replies[-1])
 
     def test_exact_enable_confirmation_binds_decision_and_dispatches_live_check(self):
         message = MessageStub()
@@ -505,13 +504,12 @@ class DiscordBotControlTests(unittest.TestCase):
                 "symbol": "BTC_GBP",
                 "enabled_json": "true",
                 "expected_rules_hash": rules_hash("BTC_GBP", self.rules["BTC_GBP"]),
-                "expected_decision_id": "decision-btc_gbp",
                 "expected_global_rules_hash": discord_bot.global_rules_pre_state_hash(
                     self.rules
                 ),
             },
         )
-        self.assertIn("Kraken minimum", message.replies[-1])
+        self.assertIn("next successful analysis", message.replies[-1])
         self.assertNotIn("123", discord_bot._pending_enable_confirmations)
 
     def test_enable_review_rejects_pending_order_for_any_asset(self):
@@ -555,14 +553,12 @@ class DiscordBotControlTests(unittest.TestCase):
         review = discord_bot._enable_review(
             "BTC_GBP",
             self.rules,
-            self.analysis,
             execution,
-            now=NOW,
         )
 
         self.assertEqual(review["symbol"], "BTC_GBP")
 
-    def test_confirmation_fails_if_live_decision_changes(self):
+    def test_confirmation_allows_live_decision_to_change(self):
         message = MessageStub()
         first_reader = variable_reader(self.rules, self.analysis)
         with (
@@ -587,8 +583,8 @@ class DiscordBotControlTests(unittest.TestCase):
                     message, "!dca confirm enable BTC_GBP"
                 )
             )
-        dispatch.assert_not_called()
-        self.assertIn("decision", message.replies[-1])
+        dispatch.assert_called_once()
+        self.assertIn("next successful analysis", message.replies[-1])
 
     def test_confirmation_rejects_global_rule_change_with_same_target_exposure(self):
         analysis = deepcopy(self.analysis)

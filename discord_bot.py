@@ -826,10 +826,7 @@ async def handle_disable(symbol_value: str, message: discord.Message) -> None:
 def _enable_review(
     symbol: str,
     rules: Mapping[str, Any],
-    analysis: Mapping[str, Any],
     execution: Mapping[str, Any],
-    *,
-    now: datetime,
 ) -> dict[str, Any]:
     pending_symbols = [
         target
@@ -853,20 +850,7 @@ def _enable_review(
                 f"and £{DCA_AMOUNT_MAX_GBP:,.0f} before enabling"
             )
 
-    decision = analysis["TARGETS"][symbol]
-    if decision["ANALYSIS_STATUS"] != "READY":
-        raise ConfigError(
-            f"{symbol} analysis is {decision['ANALYSIS_STATUS']}; run a fresh analysis"
-        )
     expected_hash = rules_hash(symbol, rule)
-    if decision["RULES_HASH"] != expected_hash:
-        raise ConfigError(f"{symbol} analysis does not match the live budgets")
-    if parse_utc_iso(decision["VALID_UNTIL"]) < now.astimezone(timezone.utc):
-        raise ConfigError(f"{symbol} analysis is stale; run a fresh analysis")
-    age = decision_age_minutes(decision, now=now)
-    if age < 0:
-        raise ConfigError(f"{symbol} analysis timestamp is in the future")
-
     exposure_rules = deepcopy(dict(rules))
     exposure_rules[symbol]["BUY_ENABLED"] = True
     maximum_exposure = float(maximum_daily_exposure_gbp(exposure_rules))
@@ -875,14 +859,8 @@ def _enable_review(
         "low": float(amounts["LOW"]),
         "mid": float(amount_for_tier_gbp(rule, "MID")),
         "high": float(amounts["UP"]),
-        "regime": decision["REGIME"],
-        "effective_amount": float(effective_amount(rule, decision)),
-        "execute_at": decision["EXECUTE_AT"],
-        "valid_until": decision["VALID_UNTIL"],
-        "decision_id": decision["DECISION_ID"],
         "rules_hash": expected_hash,
         "global_rules_hash": global_rules_pre_state_hash(rules),
-        "decision_age_minutes": age,
         "maximum_exposure": maximum_exposure,
     }
 
@@ -893,13 +871,18 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
         return
     try:
         symbol = _normalise_usd_key(symbol_value)
-        rules, analysis, execution = await asyncio.to_thread(_load_live_state)
+        raw_rules, raw_execution = await asyncio.gather(
+            asyncio.to_thread(get_repo_variable, RULES_VARIABLE),
+            asyncio.to_thread(get_repo_variable, EXECUTION_STATE_VARIABLE),
+        )
+        if raw_rules is None or raw_execution is None:
+            raise ConfigError("GitHub did not return rules and execution state")
+        rules = validate_rules_map(raw_rules)
+        execution = validate_execution_state(raw_execution)
         review = _enable_review(
             symbol,
             rules,
-            analysis,
             execution,
-            now=datetime.now(timezone.utc),
         )
     except (ValueError, ConfigError) as exc:
         await message.reply(f"Blocked: {exc}.")
@@ -917,14 +900,11 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
         f"UPTREND/lower: {_display_amount(review['low'])} | "
         f"SIDEWAYS/midpoint: {_display_amount(review['mid'])} | "
         f"DOWNTREND/higher: {_display_amount(review['high'])}\n"
-        f"Latest regime: `{review['regime']}` | Effective amount: "
-        f"{_display_amount(review['effective_amount'])}\n"
-        f"Next execution: `{_local_timestamp(review['execute_at'])}` | "
-        f"Decision age: `{review['decision_age_minutes']:.0f} min`\n"
         f"Maximum aggregate daily exposure after enable: "
         f"**{_display_amount(review['maximum_exposure'])}**\n"
-        "The serialized workflow will re-read this decision and check Kraken's "
-        "current market minimum before enabling.\n"
+        "Activation starts with the next successful analysis. Existing or stale "
+        "decisions cannot trade after this enable. The serialized workflow will "
+        "re-read the rules and check Kraken's current market minimum.\n"
         f"Send exactly `{command}` within {ENABLE_CONFIRMATION_TTL_SECONDS // 60} minutes."
     )
 
@@ -948,13 +928,18 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
 
     expected = pending["review"]
     try:
-        rules, analysis, execution = await asyncio.to_thread(_load_live_state)
+        raw_rules, raw_execution = await asyncio.gather(
+            asyncio.to_thread(get_repo_variable, RULES_VARIABLE),
+            asyncio.to_thread(get_repo_variable, EXECUTION_STATE_VARIABLE),
+        )
+        if raw_rules is None or raw_execution is None:
+            raise ConfigError("GitHub did not return rules and execution state")
+        rules = validate_rules_map(raw_rules)
+        execution = validate_execution_state(raw_execution)
         current = _enable_review(
             expected["symbol"],
             rules,
-            analysis,
             execution,
-            now=datetime.now(timezone.utc),
         )
     except ConfigError as exc:
         _pending_enable_confirmations.pop(author_id, None)
@@ -973,16 +958,13 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
         "low",
         "mid",
         "high",
-        "effective_amount",
-        "execute_at",
-        "decision_id",
         "rules_hash",
         "maximum_exposure",
     )
     if any(current[field] != expected[field] for field in bound_fields):
         _pending_enable_confirmations.pop(author_id, None)
         await message.reply(
-            "Blocked: budgets, decision, execution time, or aggregate exposure changed. "
+            "Blocked: budgets or aggregate exposure changed. "
             "Run the enable command again to review the live state."
         )
         return
@@ -992,14 +974,14 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
         "symbol": expected["symbol"],
         "enabled_json": "true",
         "expected_rules_hash": expected["rules_hash"],
-        "expected_decision_id": expected["decision_id"],
         "expected_global_rules_hash": expected["global_rules_hash"],
     }
     _pending_enable_confirmations.pop(author_id, None)
     if await asyncio.to_thread(trigger_workflow, "update_dca_config.yml", inputs):
         await message.reply(
             f"Enable validation queued for **{expected['symbol']}**. It remains disabled "
-            "unless the workflow confirms the same live rules, decision, and Kraken minimum."
+            "unless the workflow confirms the same live rules and Kraken minimum. "
+            "Once enabled, it waits for the next successful analysis before trading."
         )
     else:
         await message.reply("Failed to queue enable validation. The target remains disabled.")
