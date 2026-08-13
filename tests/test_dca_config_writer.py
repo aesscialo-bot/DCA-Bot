@@ -121,6 +121,30 @@ class DcaConfigWriterTests(unittest.TestCase):
         self.assertTrue(should_write)
         self.assertTrue(updated["BTC_GBP"]["BUY_ENABLED"])
 
+    def test_enable_accepts_missing_or_stale_analysis_for_next_cycle(self):
+        self.rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
+        expected_hash = rules_hash("BTC_GBP", self.rules["BTC_GBP"])
+        for analysis in (None, {}, self._ready_state()):
+            if analysis:
+                analysis["TARGETS"]["BTC_GBP"]["VALID_UNTIL"] = (
+                    self.now - timedelta(days=1)
+                ).isoformat()
+            with self.subTest(analysis=analysis is not None):
+                updated, should_write = apply_change(
+                    self.rules,
+                    analysis,
+                    {},
+                    action="set_enabled",
+                    symbol="BTC_GBP",
+                    enabled_json="true",
+                    expected_rules_hash=expected_hash,
+                    expected_global_rules_hash=global_rules_pre_state_hash(self.rules),
+                    market_minimum_provider=lambda _symbol: 5,
+                    now=self.now,
+                )
+                self.assertTrue(should_write)
+                self.assertTrue(updated["BTC_GBP"]["BUY_ENABLED"])
+
     def test_enable_fails_when_minimum_or_confirmation_changed(self):
         self.rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
         state = self._ready_state()

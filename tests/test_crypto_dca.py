@@ -219,6 +219,22 @@ class DecisionGateTests(unittest.TestCase):
         self.assertIn("GBP budget changed", reason)
         self.assertIsNone(amount)
 
+    def test_enable_change_requires_next_analysis_before_execution(self):
+        live_rules = rules_with("BTC_GBP", low=10, up=20)
+        disabled_rule = {
+            "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 20},
+            "BUY_ENABLED": False,
+        }
+        decision = ready_decision("BTC_GBP", disabled_rule)
+
+        status, reason, amount = crypto_dca._decision_gate(
+            "BTC_GBP", live_rules["BTC_GBP"], decision, NOW
+        )
+
+        self.assertEqual(status, "REFRESH_REQUIRED")
+        self.assertIn("enable state changed", reason)
+        self.assertIsNone(amount)
+
     def test_start_date_requires_same_local_day_analysis(self):
         rules = rules_with("BTC_GBP", low=10, up=20)
         execute_at = datetime(2026, 8, 6, 21, 30, tzinfo=timezone.utc)

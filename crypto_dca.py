@@ -627,6 +627,12 @@ def _decision_gate(symbol, rule, decision, now):
             "the GBP budget changed after this analysis was calculated",
             None,
         )
+    if decision["ENABLED"] is not bool(rule["BUY_ENABLED"]):
+        return (
+            "REFRESH_REQUIRED",
+            "the enable state changed after this analysis was calculated",
+            None,
+        )
     try:
         execute_at = parse_utc_iso(decision["EXECUTE_AT"])
         valid_until = parse_utc_iso(decision["VALID_UNTIL"])
