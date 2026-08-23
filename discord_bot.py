@@ -561,9 +561,11 @@ CHAT_TOPIC_REPLIES = {
         "budget tier; DCA reduces timing concentration but cannot remove crypto risk."
     ),
     "regimes": (
-        "🧭 Completed Kraken candles determine UPTREND, SIDEWAYS, or DOWNTREND. "
-        "Those labels select the configured lower, midpoint, or higher spend; "
-        "Gemini can explain the result but cannot choose or change it."
+        "🧭 UPTREND requires the latest 10 consecutive completed daily Kraken "
+        "closes to be above each candle’s own SMA150. DOWNTREND keeps the "
+        "two-day EMA, weekly EMA, and falling-SMA confirmation; every other "
+        "valid result is SIDEWAYS. An emergency per-target override is visibly "
+        "labelled in status until the 10-close rule confirms naturally."
     ),
     "timing": (
         "⏰ Daily analysis compares 3/5/7/14/30/45/60-day windows in 15-minute "
@@ -1183,6 +1185,46 @@ def _trading_mode_summary() -> str:
     return f"🔴 Trading mode: **{DCA_TRADING_MODE.upper()} — INVALID; ORDERS BLOCKED**"
 
 
+def _uptrend_override_summary(decision: Mapping[str, Any]) -> str:
+    """Render an active emergency override from persisted analysis evidence."""
+
+    signals = decision.get("SIGNALS")
+    if not isinstance(signals, Mapping):
+        return ""
+    if signals.get("UPTREND_OVERRIDE_ACTIVE") is not True:
+        return ""
+
+    count = signals.get("UPTREND_CONFIRMATION_COUNT")
+    required = signals.get("UPTREND_CONFIRMATION_REQUIRED")
+    progress = (
+        f"{count}/{required}"
+        if type(count) is int and type(required) is int
+        else "unknown"
+    )
+    natural = signals.get("REGIME_WITHOUT_OVERRIDE")
+    if not isinstance(natural, str) or natural not in {
+        "UPTREND",
+        "DOWNTREND",
+        "SIDEWAYS",
+    }:
+        natural = "unknown"
+    activated_raw = signals.get("UPTREND_OVERRIDE_ACTIVATED_AT")
+    activated = (
+        _local_timestamp(activated_raw)
+        if isinstance(activated_raw, str)
+        else "unknown"
+    )
+    reason = signals.get("UPTREND_OVERRIDE_REASON")
+    reason_text = "not recorded"
+    if isinstance(reason, str) and reason.strip():
+        reason_text = " ".join(reason.split())[:160]
+    return (
+        "  🚨 **EMERGENCY UPTREND OVERRIDE ACTIVE** | "
+        f"Rule result: `{natural}` | Confirmation: `{progress}` | "
+        f"Activated: `{activated}` | Reason: {reason_text}"
+    )
+
+
 def _order_permission(
     symbol: str,
     *,
@@ -1293,6 +1335,8 @@ def _decision_summary(
         age = _decision_age(decision, now)
         selected_time = "none"
         decision_status = f"❌ {decision['ANALYSIS_STATUS']}"
+    override_summary = _uptrend_override_summary(decision)
+    override_suffix = f"{override_summary}\n" if override_summary else ""
     return (
         f"{configured_icon} **{_pair_label(symbol)}** (`{symbol}`) | Configured: "
         f"**{configured_status}** | Orders: **{permission}**\n"
@@ -1302,6 +1346,7 @@ def _decision_summary(
         f"{_display_amount(amounts['UP'])}\n"
         f"  📊 Analysis: {decision_status} | Regime: `{regime}` | Spend: {amount} | "
         f"Selected: `{selected_time}` | Effective: `{next_time}` | Age: `{age}`\n"
+        f"{override_suffix}"
         f"  🧾 Analysis date: `{decision['ANALYSIS_DATE']}` | Data through: `{history_data_through}` | "
         f"Last buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}` | "
         f"Decision: `{decision['DECISION_ID']}`"

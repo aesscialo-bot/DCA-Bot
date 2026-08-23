@@ -17,6 +17,8 @@ from dca_config import (
     ConfigError,
     MAX_PENDING_GIST_DELIVERIES,
     TIMING_POLICY_VERSION,
+    UPTREND_OVERRIDE_STATE_VERSION,
+    analysis_decision_matches_uptrend_override,
     awaiting_daily_analysis_refresh,
     decision_analyzed_on_or_after,
     decision_age_minutes,
@@ -29,6 +31,7 @@ from dca_config import (
     validate_execution_state,
     validate_gist_delivery,
     validate_rules_map,
+    validate_uptrend_override_state,
 )
 from gist_logger import build_gist_delivery, update_gist_log
 from kraken_client import (
@@ -61,6 +64,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 RULES_VARIABLE = "DCA_TARGET_MAP"
 ANALYSIS_STATE_VARIABLE = "DCA_ANALYSIS_STATE"
 EXECUTION_STATE_VARIABLE = "DCA_EXECUTION_STATE"
+UPTREND_OVERRIDE_VARIABLE = "DCA_UPTREND_OVERRIDE_STATE"
 TARGET_MIGRATION_LOCK_VARIABLE = "DCA_TARGET_MIGRATION_LOCK"
 PENDING_ORDER_FIELD = "PENDING_ORDER"
 PENDING_GIST_DELIVERIES_FIELD = "PENDING_GIST_DELIVERIES"
@@ -377,6 +381,36 @@ def fetch_live_execution_state():
         EXECUTION_STATE_VARIABLE, required=False
     )
     return validate_execution_state(state)
+
+
+def fetch_live_uptrend_override_state():
+    """Read the optional live override directly before a new Kraken order."""
+
+    url, _collection_url, headers = _github_variable_context(
+        UPTREND_OVERRIDE_VARIABLE
+    )
+    response = requests.get(url, headers=headers, timeout=15)
+    if response.status_code == 404:
+        return {"VERSION": UPTREND_OVERRIDE_STATE_VERSION, "TARGETS": {}}
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Live DCA_UPTREND_OVERRIDE_STATE read failed with HTTP "
+            f"{response.status_code}"
+        )
+    try:
+        value = response.json()["value"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "Live DCA_UPTREND_OVERRIDE_STATE response is invalid"
+        ) from error
+    if isinstance(value, str) and not value.strip():
+        return {"VERSION": UPTREND_OVERRIDE_STATE_VERSION, "TARGETS": {}}
+    try:
+        return validate_uptrend_override_state(value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "Live DCA_UPTREND_OVERRIDE_STATE is invalid"
+        ) from error
 
 
 def _initial_rules_map():
@@ -720,7 +754,6 @@ def _revalidate_trade_intent(
     globally_ready, global_reason = _global_history_gate(live_analysis, current_time)
     if not globally_ready:
         raise RuntimeError(f"global Kraken history gate blocked execution: {global_reason}")
-
     if not rule["BUY_ENABLED"]:
         raise RuntimeError(f"{symbol} was disabled before order submission")
     if execution.get("LAST_BUY_DATE", "") == today:
@@ -750,6 +783,17 @@ def _revalidate_trade_intent(
             raise RuntimeError(f"{symbol} durable intent amount changed during this run")
     if reserve_gist_delivery:
         ensure_gist_delivery_capacity(live_execution, symbol)
+    # Read the override last so the spend-affecting decision is bound as close
+    # as possible to Kraken's immediate pre-submit callback.
+    live_override_state = fetch_live_uptrend_override_state()
+    if not analysis_decision_matches_uptrend_override(
+        symbol,
+        decision,
+        live_override_state,
+    ):
+        raise RuntimeError(
+            f"{symbol} UPTREND override changed after its analysis decision"
+        )
     return live_rules, live_analysis, live_execution, amount_gbp
 
 

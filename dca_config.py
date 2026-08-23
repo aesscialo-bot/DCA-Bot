@@ -30,7 +30,64 @@ TARGET_ROUTES = {
 }
 RULE_FIELDS = frozenset({"REGIME_AMOUNTS_GBP", "BUY_ENABLED"})
 REGIME_AMOUNT_FIELDS = frozenset({"LOW", "UP"})
-TIMING_POLICY_VERSION = "multi-window-3-5-7-14-30-45-60-v2"
+TIMING_POLICY_VERSION = (
+    "sma150-10-consecutive-closes-v1+multi-window-3-5-7-14-30-45-60-v2"
+)
+UPTREND_OVERRIDE_STATE_VERSION = 1
+UPTREND_OVERRIDE_STATE_FIELDS = frozenset({"VERSION", "TARGETS"})
+UPTREND_OVERRIDE_ENTRY_FIELDS = frozenset(
+    {"ACTIVE", "ACTIVATED_AT", "RELEASED_AT", "REASON"}
+)
+MAX_UPTREND_OVERRIDE_REASON_CHARS = 200
+UPTREND_CONFIRMATION_CANDLES = 10
+# Classifier metrics are persisted after round(..., 8), while their booleans
+# are computed from full-precision values. A pair of rounded metrics can move
+# their difference by at most 1e-8, so only larger contradictions are invalid.
+ANALYSIS_SIGNAL_ROUNDING_TOLERANCE = 1e-8
+ANALYSIS_READY_SIGNAL_FIELDS = frozenset(
+    {
+        "DAILY_LAST_COMPLETE",
+        "DAILY_CLOSE",
+        "DAILY_PREVIOUS_CLOSE",
+        "DAILY_SMA150",
+        "DAILY_PREVIOUS_SMA150",
+        "DAILY_EMA20",
+        "DAILY_EMA50",
+        "DAILY_PREVIOUS_EMA20",
+        "DAILY_PREVIOUS_EMA50",
+        "WEEKLY_LAST_COMPLETE",
+        "WEEKLY_CLOSE",
+        "WEEKLY_EMA20",
+        "SMA150_SLOPE_20D",
+        "TWO_DAY_ABOVE",
+        "TWO_DAY_BELOW",
+        "WEEKLY_ABOVE",
+        "WEEKLY_BELOW",
+        "SLOPE_POSITIVE",
+        "SLOPE_NEGATIVE",
+        "UPTREND_CONFIRMATION_REQUIRED",
+        "UPTREND_CONFIRMATION_COUNT",
+        "UPTREND_CONFIRMED",
+        "REGIME_WITHOUT_OVERRIDE",
+        "UPTREND_OVERRIDE_ACTIVE",
+        "UPTREND_OVERRIDE_APPLIED",
+        "UPTREND_OVERRIDE_REASON",
+        "UPTREND_OVERRIDE_ACTIVATED_AT",
+        "UPTREND_OVERRIDE_RELEASED_AT",
+        "UPTREND_OVERRIDE_AUTO_RELEASED",
+    }
+)
+UPTREND_OVERRIDE_AUDIT_SIGNAL_FIELDS = frozenset(
+    {
+        "REGIME_WITHOUT_OVERRIDE",
+        "UPTREND_OVERRIDE_ACTIVE",
+        "UPTREND_OVERRIDE_APPLIED",
+        "UPTREND_OVERRIDE_REASON",
+        "UPTREND_OVERRIDE_ACTIVATED_AT",
+        "UPTREND_OVERRIDE_RELEASED_AT",
+        "UPTREND_OVERRIDE_AUTO_RELEASED",
+    }
+)
 DAILY_ANALYSIS_EXPECTED_BY = time(4, 20)
 ANALYSIS_STATE_FIELDS = frozenset(
     {"VERSION", "GENERATED_AT", "POLICY_VERSION", "ANALYSIS_DATE", "TARGETS"}
@@ -404,6 +461,139 @@ def parse_utc_iso(value: Any) -> datetime:
     return parse_iso_datetime(value, "timestamp")
 
 
+def _canonical_utc_timestamp(value: Any, label: str) -> str:
+    parsed = parse_iso_datetime(value, label)
+    normalized = parsed.isoformat().replace("+00:00", "Z")
+    if value != normalized:
+        raise ConfigError(f"{label} must be a canonical UTC ISO timestamp")
+    return normalized
+
+
+def _valid_override_reason(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+        or len(value) > MAX_UPTREND_OVERRIDE_REASON_CHARS
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ConfigError(
+            f"{label} must be a trimmed, non-empty string of at most "
+            f"{MAX_UPTREND_OVERRIDE_REASON_CHARS} characters without controls"
+        )
+    return value
+
+
+def validate_uptrend_override_state(
+    value: str | Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the optional, per-target emergency UPTREND override state."""
+
+    state = _json_object(value, "DCA_UPTREND_OVERRIDE_STATE")
+    _unexpected_fields(
+        state, UPTREND_OVERRIDE_STATE_FIELDS, "DCA_UPTREND_OVERRIDE_STATE"
+    )
+    if (
+        type(state["VERSION"]) is not int
+        or state["VERSION"] != UPTREND_OVERRIDE_STATE_VERSION
+    ):
+        raise ConfigError(
+            "DCA_UPTREND_OVERRIDE_STATE.VERSION must be "
+            f"{UPTREND_OVERRIDE_STATE_VERSION}"
+        )
+    targets = state["TARGETS"]
+    if not isinstance(targets, Mapping):
+        raise ConfigError("DCA_UPTREND_OVERRIDE_STATE.TARGETS must be an object")
+    unsupported = set(targets) - set(TARGET_KEYS)
+    if unsupported:
+        raise ConfigError(
+            "DCA_UPTREND_OVERRIDE_STATE contains unsupported targets: "
+            + ", ".join(sorted(unsupported))
+        )
+
+    normalized_targets: dict[str, dict[str, Any]] = {}
+    for target in TARGET_KEYS:
+        if target not in targets:
+            continue
+        label = f"DCA_UPTREND_OVERRIDE_STATE.TARGETS.{target}"
+        raw_entry = targets[target]
+        if not isinstance(raw_entry, Mapping):
+            raise ConfigError(f"{label} must be an object")
+        entry = dict(raw_entry)
+        _unexpected_fields(entry, UPTREND_OVERRIDE_ENTRY_FIELDS, label)
+        if type(entry["ACTIVE"]) is not bool:
+            raise ConfigError(f"{label}.ACTIVE must be a boolean")
+        activated_at = _canonical_utc_timestamp(
+            entry["ACTIVATED_AT"], f"{label}.ACTIVATED_AT"
+        )
+        reason = _valid_override_reason(entry["REASON"], f"{label}.REASON")
+
+        released_value = entry["RELEASED_AT"]
+        if entry["ACTIVE"]:
+            if released_value is not None:
+                raise ConfigError(f"{label}.RELEASED_AT must be null while active")
+            released_at = None
+        else:
+            if released_value is None:
+                raise ConfigError(f"{label}.RELEASED_AT is required when inactive")
+            released_at = _canonical_utc_timestamp(
+                released_value, f"{label}.RELEASED_AT"
+            )
+            if parse_iso_datetime(released_at, f"{label}.RELEASED_AT") < parse_iso_datetime(
+                activated_at, f"{label}.ACTIVATED_AT"
+            ):
+                raise ConfigError(
+                    f"{label}.RELEASED_AT must not precede ACTIVATED_AT"
+                )
+        normalized_targets[target] = {
+            "ACTIVE": entry["ACTIVE"],
+            "ACTIVATED_AT": activated_at,
+            "RELEASED_AT": released_at,
+            "REASON": reason,
+        }
+
+    return {
+        "VERSION": UPTREND_OVERRIDE_STATE_VERSION,
+        "TARGETS": normalized_targets,
+    }
+
+
+def analysis_decision_matches_uptrend_override(
+    target: str,
+    decision: Mapping[str, Any],
+    override_state: str | Mapping[str, Any],
+) -> bool:
+    """Bind a persisted decision to the exact live per-target override entry."""
+
+    if target not in TARGET_KEYS:
+        raise ConfigError(f"Unsupported production target: {target}")
+    if not isinstance(decision, Mapping):
+        return False
+    signals = decision.get("SIGNALS")
+    if not isinstance(signals, Mapping):
+        return False
+    normalized = validate_uptrend_override_state(override_state)
+    entry = normalized["TARGETS"].get(target)
+    if entry is None:
+        return (
+            signals.get("UPTREND_OVERRIDE_ACTIVE") is False
+            and signals.get("UPTREND_OVERRIDE_APPLIED") is False
+            and signals.get("UPTREND_OVERRIDE_REASON") is None
+            and signals.get("UPTREND_OVERRIDE_ACTIVATED_AT") is None
+            and signals.get("UPTREND_OVERRIDE_RELEASED_AT") is None
+            and signals.get("UPTREND_OVERRIDE_AUTO_RELEASED") is False
+        )
+    return (
+        signals.get("UPTREND_OVERRIDE_ACTIVE") is entry["ACTIVE"]
+        and signals.get("UPTREND_OVERRIDE_REASON") == entry["REASON"]
+        and signals.get("UPTREND_OVERRIDE_ACTIVATED_AT")
+        == entry["ACTIVATED_AT"]
+        and signals.get("UPTREND_OVERRIDE_RELEASED_AT")
+        == entry["RELEASED_AT"]
+        and (entry["ACTIVE"] is not True or decision.get("REGIME") == "UPTREND")
+    )
+
+
 def _split_markdown_row(line: str) -> list[str] | None:
     """Split one Markdown row without treating escaped pipes as separators."""
 
@@ -607,6 +797,386 @@ def validate_gist_delivery(value: Mapping[str, Any], target: str) -> dict[str, A
     return delivery
 
 
+def _analysis_signal_number(
+    signals: Mapping[str, Any],
+    field: str,
+    label: str,
+    *,
+    positive: bool = False,
+) -> float:
+    raw = signals[field]
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ConfigError(f"{label}.{field} must be a finite number")
+    number = float(raw)
+    if not math.isfinite(number):
+        raise ConfigError(f"{label}.{field} must be a finite number")
+    if positive and number <= 0:
+        raise ConfigError(f"{label}.{field} must be greater than zero")
+    return number
+
+
+def _validate_override_signal_audit(
+    signals: Mapping[str, Any],
+    label: str,
+    *,
+    analyzed_at: datetime,
+    require_all: bool,
+) -> dict[str, Any] | None:
+    """Validate override audit metadata shared by ready and error decisions."""
+
+    present = set(signals) & set(UPTREND_OVERRIDE_AUDIT_SIGNAL_FIELDS)
+    if not present:
+        return None
+    if not require_all and "UPTREND_OVERRIDE_ACTIVE" not in signals:
+        raise ConfigError(
+            f"{label}.UPTREND_OVERRIDE_ACTIVE is required with override audit fields"
+        )
+
+    boolean_fields = (
+        "UPTREND_OVERRIDE_ACTIVE",
+        "UPTREND_OVERRIDE_APPLIED",
+        "UPTREND_OVERRIDE_AUTO_RELEASED",
+    )
+    for field in boolean_fields:
+        if field in signals and type(signals[field]) is not bool:
+            raise ConfigError(f"{label}.{field} must be a boolean")
+
+    active = signals.get("UPTREND_OVERRIDE_ACTIVE")
+    applied = signals.get("UPTREND_OVERRIDE_APPLIED", False)
+    auto_released = signals.get("UPTREND_OVERRIDE_AUTO_RELEASED", False)
+    normal_regime = signals.get("REGIME_WITHOUT_OVERRIDE")
+    if normal_regime is not None and normal_regime not in REGIMES:
+        raise ConfigError(f"{label}.REGIME_WITHOUT_OVERRIDE is invalid")
+
+    reason = signals.get("UPTREND_OVERRIDE_REASON")
+    activated_value = signals.get("UPTREND_OVERRIDE_ACTIVATED_AT")
+    released_value = signals.get("UPTREND_OVERRIDE_RELEASED_AT")
+    if reason is not None:
+        reason = _valid_override_reason(
+            reason, f"{label}.UPTREND_OVERRIDE_REASON"
+        )
+    activated_at = (
+        _canonical_utc_timestamp(
+            activated_value, f"{label}.UPTREND_OVERRIDE_ACTIVATED_AT"
+        )
+        if activated_value is not None
+        else None
+    )
+    released_at = (
+        _canonical_utc_timestamp(
+            released_value, f"{label}.UPTREND_OVERRIDE_RELEASED_AT"
+        )
+        if released_value is not None
+        else None
+    )
+
+    if (reason is None) != (activated_at is None):
+        raise ConfigError(
+            f"{label} override REASON and ACTIVATED_AT must both be null or populated"
+        )
+    if active is True:
+        if reason is None:
+            raise ConfigError(
+                f"{label} active override requires REASON and ACTIVATED_AT"
+            )
+        if released_at is not None:
+            raise ConfigError(
+                f"{label}.UPTREND_OVERRIDE_RELEASED_AT must be null while active"
+            )
+        if auto_released:
+            raise ConfigError(
+                f"{label} active override cannot be marked auto-released"
+            )
+    elif active is False:
+        if applied:
+            raise ConfigError(
+                f"{label}.UPTREND_OVERRIDE_APPLIED requires an active override"
+            )
+        if reason is None and released_at is not None:
+            raise ConfigError(
+                f"{label} released override requires REASON and ACTIVATED_AT"
+            )
+        if reason is not None and released_at is None:
+            raise ConfigError(
+                f"{label} inactive override with lifecycle metadata requires RELEASED_AT"
+            )
+    else:
+        raise ConfigError(f"{label}.UPTREND_OVERRIDE_ACTIVE must be a boolean")
+
+    if applied:
+        if normal_regime is None:
+            raise ConfigError(
+                f"{label}.UPTREND_OVERRIDE_APPLIED requires REGIME_WITHOUT_OVERRIDE"
+            )
+        if normal_regime == "UPTREND":
+            raise ConfigError(
+                f"{label}.UPTREND_OVERRIDE_APPLIED must be false for natural UPTREND"
+            )
+    if auto_released and released_at is None:
+        raise ConfigError(
+            f"{label}.UPTREND_OVERRIDE_AUTO_RELEASED requires RELEASED_AT"
+        )
+
+    activated_dt = (
+        parse_iso_datetime(activated_at, f"{label}.UPTREND_OVERRIDE_ACTIVATED_AT")
+        if activated_at is not None
+        else None
+    )
+    released_dt = (
+        parse_iso_datetime(released_at, f"{label}.UPTREND_OVERRIDE_RELEASED_AT")
+        if released_at is not None
+        else None
+    )
+    if activated_dt is not None and activated_dt > analyzed_at:
+        raise ConfigError(
+            f"{label}.UPTREND_OVERRIDE_ACTIVATED_AT cannot follow ANALYZED_AT"
+        )
+    if released_dt is not None:
+        if activated_dt is None or released_dt < activated_dt:
+            raise ConfigError(
+                f"{label}.UPTREND_OVERRIDE_RELEASED_AT cannot precede ACTIVATED_AT"
+            )
+        if released_dt > analyzed_at:
+            raise ConfigError(
+                f"{label}.UPTREND_OVERRIDE_RELEASED_AT cannot follow ANALYZED_AT"
+            )
+
+    return {
+        "active": active,
+        "applied": applied,
+        "auto_released": auto_released,
+        "normal_regime": normal_regime,
+        "activated_at": activated_dt,
+        "released_at": released_dt,
+    }
+
+
+def _validate_ready_analysis_signals(
+    decision: Mapping[str, Any],
+    analyzed_at: datetime,
+    label: str,
+) -> None:
+    signals = dict(decision["SIGNALS"])
+    signal_label = f"{label}.SIGNALS"
+    _unexpected_fields(signals, ANALYSIS_READY_SIGNAL_FIELDS, signal_label)
+
+    completed_at = _canonical_utc_timestamp(
+        signals["DAILY_LAST_COMPLETE"], f"{signal_label}.DAILY_LAST_COMPLETE"
+    )
+    weekly_completed_at = _canonical_utc_timestamp(
+        signals["WEEKLY_LAST_COMPLETE"], f"{signal_label}.WEEKLY_LAST_COMPLETE"
+    )
+    daily_open = parse_iso_datetime(
+        completed_at, f"{signal_label}.DAILY_LAST_COMPLETE"
+    )
+    weekly_open = parse_iso_datetime(
+        weekly_completed_at, f"{signal_label}.WEEKLY_LAST_COMPLETE"
+    )
+    if daily_open + timedelta(days=1) > analyzed_at:
+        raise ConfigError(
+            f"{signal_label}.DAILY_LAST_COMPLETE must identify a completed candle"
+        )
+    if weekly_open + timedelta(days=7) > analyzed_at:
+        raise ConfigError(
+            f"{signal_label}.WEEKLY_LAST_COMPLETE must identify a completed candle"
+        )
+
+    positive_fields = (
+        "DAILY_CLOSE",
+        "DAILY_PREVIOUS_CLOSE",
+        "DAILY_SMA150",
+        "DAILY_PREVIOUS_SMA150",
+        "DAILY_EMA20",
+        "DAILY_EMA50",
+        "DAILY_PREVIOUS_EMA20",
+        "DAILY_PREVIOUS_EMA50",
+        "WEEKLY_CLOSE",
+        "WEEKLY_EMA20",
+    )
+    numbers = {
+        field: _analysis_signal_number(
+            signals, field, signal_label, positive=True
+        )
+        for field in positive_fields
+    }
+    numbers["SMA150_SLOPE_20D"] = _analysis_signal_number(
+        signals, "SMA150_SLOPE_20D", signal_label
+    )
+
+    classifier_boolean_fields = (
+        "TWO_DAY_ABOVE",
+        "TWO_DAY_BELOW",
+        "WEEKLY_ABOVE",
+        "WEEKLY_BELOW",
+        "SLOPE_POSITIVE",
+        "SLOPE_NEGATIVE",
+        "UPTREND_CONFIRMED",
+    )
+    for field in classifier_boolean_fields:
+        if type(signals[field]) is not bool:
+            raise ConfigError(f"{signal_label}.{field} must be a boolean")
+
+    required = signals["UPTREND_CONFIRMATION_REQUIRED"]
+    if type(required) is not int or required != UPTREND_CONFIRMATION_CANDLES:
+        raise ConfigError(
+            f"{signal_label}.UPTREND_CONFIRMATION_REQUIRED must be "
+            f"{UPTREND_CONFIRMATION_CANDLES}"
+        )
+    count = signals["UPTREND_CONFIRMATION_COUNT"]
+    if type(count) is not int or not 0 <= count <= required:
+        raise ConfigError(
+            f"{signal_label}.UPTREND_CONFIRMATION_COUNT must be an integer "
+            f"between 0 and {required}"
+        )
+    confirmed = signals["UPTREND_CONFIRMED"]
+    if confirmed is not (count == required):
+        raise ConfigError(
+            f"{signal_label}.UPTREND_CONFIRMED must match confirmation count"
+        )
+
+    mutually_exclusive_pairs = (
+        ("TWO_DAY_ABOVE", "TWO_DAY_BELOW"),
+        ("WEEKLY_ABOVE", "WEEKLY_BELOW"),
+        ("SLOPE_POSITIVE", "SLOPE_NEGATIVE"),
+    )
+    for first, second in mutually_exclusive_pairs:
+        if signals[first] and signals[second]:
+            raise ConfigError(
+                f"{signal_label}.{first} and {second} cannot both be true"
+            )
+
+    tolerance = ANALYSIS_SIGNAL_ROUNDING_TOLERANCE
+    two_day_deltas = (
+        numbers["DAILY_CLOSE"] - numbers["DAILY_SMA150"],
+        numbers["DAILY_EMA20"] - numbers["DAILY_EMA50"],
+        numbers["DAILY_PREVIOUS_CLOSE"]
+        - numbers["DAILY_PREVIOUS_SMA150"],
+        numbers["DAILY_PREVIOUS_EMA20"]
+        - numbers["DAILY_PREVIOUS_EMA50"],
+    )
+    if signals["TWO_DAY_ABOVE"] and any(
+        delta < -tolerance for delta in two_day_deltas
+    ):
+        raise ConfigError(
+            f"{signal_label}.TWO_DAY_ABOVE contradicts the persisted daily metrics"
+        )
+    if not signals["TWO_DAY_ABOVE"] and all(
+        delta > tolerance for delta in two_day_deltas
+    ):
+        raise ConfigError(
+            f"{signal_label}.TWO_DAY_ABOVE must be true for the persisted daily metrics"
+        )
+    if signals["TWO_DAY_BELOW"] and any(
+        delta > tolerance for delta in two_day_deltas
+    ):
+        raise ConfigError(
+            f"{signal_label}.TWO_DAY_BELOW contradicts the persisted daily metrics"
+        )
+    if not signals["TWO_DAY_BELOW"] and all(
+        delta < -tolerance for delta in two_day_deltas
+    ):
+        raise ConfigError(
+            f"{signal_label}.TWO_DAY_BELOW must be true for the persisted daily metrics"
+        )
+
+    weekly_delta = numbers["WEEKLY_CLOSE"] - numbers["WEEKLY_EMA20"]
+    if weekly_delta > tolerance and not signals["WEEKLY_ABOVE"]:
+        raise ConfigError(
+            f"{signal_label}.WEEKLY_ABOVE contradicts the persisted weekly metrics"
+        )
+    if weekly_delta < -tolerance and not signals["WEEKLY_BELOW"]:
+        raise ConfigError(
+            f"{signal_label}.WEEKLY_BELOW contradicts the persisted weekly metrics"
+        )
+    if signals["WEEKLY_ABOVE"] and weekly_delta < -tolerance:
+        raise ConfigError(
+            f"{signal_label}.WEEKLY_ABOVE contradicts the persisted weekly metrics"
+        )
+    if signals["WEEKLY_BELOW"] and weekly_delta > tolerance:
+        raise ConfigError(
+            f"{signal_label}.WEEKLY_BELOW contradicts the persisted weekly metrics"
+        )
+
+    slope = numbers["SMA150_SLOPE_20D"]
+    if slope > tolerance and not signals["SLOPE_POSITIVE"]:
+        raise ConfigError(
+            f"{signal_label}.SLOPE_POSITIVE contradicts SMA150_SLOPE_20D"
+        )
+    if slope < -tolerance and not signals["SLOPE_NEGATIVE"]:
+        raise ConfigError(
+            f"{signal_label}.SLOPE_NEGATIVE contradicts SMA150_SLOPE_20D"
+        )
+    if signals["SLOPE_POSITIVE"] and slope < -tolerance:
+        raise ConfigError(
+            f"{signal_label}.SLOPE_POSITIVE contradicts SMA150_SLOPE_20D"
+        )
+    if signals["SLOPE_NEGATIVE"] and slope > tolerance:
+        raise ConfigError(
+            f"{signal_label}.SLOPE_NEGATIVE contradicts SMA150_SLOPE_20D"
+        )
+
+    if signals["TWO_DAY_ABOVE"] and count < 2:
+        raise ConfigError(
+            f"{signal_label}.TWO_DAY_ABOVE requires at least two confirming closes"
+        )
+    if signals["TWO_DAY_BELOW"] and count > 0:
+        raise ConfigError(
+            f"{signal_label}.TWO_DAY_BELOW requires zero confirming closes"
+        )
+
+    audit = _validate_override_signal_audit(
+        signals,
+        signal_label,
+        analyzed_at=analyzed_at,
+        require_all=True,
+    )
+    if audit is None:
+        raise ConfigError(f"{signal_label} override audit fields are required")
+    normal_regime = audit["normal_regime"]
+    downtrend_confirmed = bool(
+        signals["TWO_DAY_BELOW"]
+        and signals["WEEKLY_BELOW"]
+        and signals["SLOPE_NEGATIVE"]
+    )
+    expected_normal_regime = (
+        "UPTREND"
+        if confirmed
+        else "DOWNTREND"
+        if downtrend_confirmed
+        else "SIDEWAYS"
+    )
+    if normal_regime != expected_normal_regime:
+        raise ConfigError(
+            f"{signal_label}.REGIME_WITHOUT_OVERRIDE does not match classifier signals"
+        )
+
+    active = audit["active"]
+    expected_regime = "UPTREND" if active else normal_regime
+    if decision["REGIME"] != expected_regime:
+        raise ConfigError(
+            f"{label}.REGIME does not match classifier and override signals"
+        )
+    expected_applied = active and normal_regime != "UPTREND"
+    if audit["applied"] is not expected_applied:
+        raise ConfigError(
+            f"{signal_label}.UPTREND_OVERRIDE_APPLIED does not match override state"
+        )
+    if active and confirmed:
+        raise ConfigError(
+            f"{signal_label} confirmed UPTREND override must be auto-released"
+        )
+    if audit["auto_released"]:
+        if not confirmed or normal_regime != "UPTREND":
+            raise ConfigError(
+                f"{signal_label} auto-release requires a naturally confirmed UPTREND"
+            )
+        if audit["released_at"] != analyzed_at:
+            raise ConfigError(
+                f"{signal_label}.UPTREND_OVERRIDE_RELEASED_AT must match ANALYZED_AT "
+                "when auto-released"
+            )
+
+
 def validate_analysis_decision(target: str, value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate one deterministic per-target v3 analysis result."""
 
@@ -679,6 +1249,7 @@ def validate_analysis_decision(target: str, value: Mapping[str, Any]) -> dict[st
             raise ConfigError(f"{label}.HISTORY.HASH must be a lowercase SHA-256 hash")
         if decision["ERROR"] is not None:
             raise ConfigError(f"{label}.ERROR must be null for READY analysis")
+        _validate_ready_analysis_signals(decision, analyzed_at, label)
     else:
         if decision["REGIME"] is not None or decision["AMOUNT_TIER"] is not None:
             raise ConfigError(f"{label} non-ready decisions cannot select a regime or amount")
@@ -688,6 +1259,12 @@ def validate_analysis_decision(target: str, value: Mapping[str, Any]) -> dict[st
             raise ConfigError(f"{label}.CATCHUP_APPLIED must be false when not ready")
         if not isinstance(decision["ERROR"], str) or not decision["ERROR"].strip():
             raise ConfigError(f"{label}.ERROR must describe why analysis is not ready")
+        _validate_override_signal_audit(
+            decision["SIGNALS"],
+            f"{label}.SIGNALS",
+            analyzed_at=analyzed_at,
+            require_all=False,
+        )
 
     return {
         **decision,
@@ -1186,6 +1763,7 @@ __all__ = [
     "ALLOWED_TARGETS",
     "AMOUNT_POLICY_VERSION",
     "AMOUNT_TIERS",
+    "ANALYSIS_READY_SIGNAL_FIELDS",
     "ANALYSIS_STATE_VERSION",
     "ANALYSIS_STATUSES",
     "ConfigError",
@@ -1199,6 +1777,7 @@ __all__ = [
     "MAX_EXECUTION_STATE_JSON_BYTES",
     "MAX_GIST_DELIVERY_ROW_BYTES",
     "MAX_PENDING_GIST_DELIVERIES",
+    "MAX_UPTREND_OVERRIDE_REASON_CHARS",
     "MIN_ENABLED_AMOUNT_GBP",
     "PORTFOLIO_EVENT_FIELDS",
     "READY_STATUS",
@@ -1206,6 +1785,12 @@ __all__ = [
     "TARGET_KEYS",
     "TARGET_SYMBOLS",
     "TIMING_POLICY_VERSION",
+    "UPTREND_OVERRIDE_ENTRY_FIELDS",
+    "UPTREND_CONFIRMATION_CANDLES",
+    "UPTREND_OVERRIDE_AUDIT_SIGNAL_FIELDS",
+    "UPTREND_OVERRIDE_STATE_FIELDS",
+    "UPTREND_OVERRIDE_STATE_VERSION",
+    "analysis_decision_matches_uptrend_override",
     "amount_for_tier_gbp",
     "amount_tier_for_regime",
     "awaiting_daily_analysis_refresh",
@@ -1231,4 +1816,5 @@ __all__ = [
     "validate_enabled_market_minimums",
     "validate_rules_map",
     "validate_target_map",
+    "validate_uptrend_override_state",
 ]

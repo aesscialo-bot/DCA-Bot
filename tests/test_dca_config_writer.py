@@ -5,6 +5,40 @@ from dca_config import default_rules_map, empty_analysis_state, rules_hash
 from dca_config_writer import apply_change, global_rules_pre_state_hash
 
 
+def ready_signals():
+    return {
+        "DAILY_LAST_COMPLETE": "2026-08-04T00:00:00Z",
+        "DAILY_CLOSE": 105.0,
+        "DAILY_PREVIOUS_CLOSE": 104.0,
+        "DAILY_SMA150": 100.0,
+        "DAILY_PREVIOUS_SMA150": 99.0,
+        "DAILY_EMA20": 90.0,
+        "DAILY_EMA50": 95.0,
+        "DAILY_PREVIOUS_EMA20": 89.0,
+        "DAILY_PREVIOUS_EMA50": 94.0,
+        "WEEKLY_LAST_COMPLETE": "2026-07-27T00:00:00Z",
+        "WEEKLY_CLOSE": 105.0,
+        "WEEKLY_EMA20": 100.0,
+        "SMA150_SLOPE_20D": -1.0,
+        "TWO_DAY_ABOVE": False,
+        "TWO_DAY_BELOW": False,
+        "WEEKLY_ABOVE": True,
+        "WEEKLY_BELOW": False,
+        "SLOPE_POSITIVE": False,
+        "SLOPE_NEGATIVE": True,
+        "UPTREND_CONFIRMATION_REQUIRED": 10,
+        "UPTREND_CONFIRMATION_COUNT": 3,
+        "UPTREND_CONFIRMED": False,
+        "REGIME_WITHOUT_OVERRIDE": "SIDEWAYS",
+        "UPTREND_OVERRIDE_ACTIVE": False,
+        "UPTREND_OVERRIDE_APPLIED": False,
+        "UPTREND_OVERRIDE_REASON": None,
+        "UPTREND_OVERRIDE_ACTIVATED_AT": None,
+        "UPTREND_OVERRIDE_RELEASED_AT": None,
+        "UPTREND_OVERRIDE_AUTO_RELEASED": False,
+    }
+
+
 class DcaConfigWriterTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 8, 5, 4, 0, tzinfo=timezone.utc)
@@ -22,7 +56,7 @@ class DcaConfigWriterTests(unittest.TestCase):
                 "SELECTED_AT": (self.now + timedelta(hours=1)).isoformat(),
                 "EXECUTE_AT": (self.now + timedelta(hours=1)).isoformat(),
                 "VALID_UNTIL": (self.now + timedelta(hours=2)).isoformat(),
-                "SIGNALS": {"source": "test"},
+                "SIGNALS": ready_signals(),
                 "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
                 "ERROR": None,
             }
@@ -100,7 +134,7 @@ class DcaConfigWriterTests(unittest.TestCase):
                 "EXECUTE_AT": (self.now + timedelta(hours=1)).isoformat(),
                 "VALID_UNTIL": (self.now + timedelta(hours=2)).isoformat(),
                 "RULES_HASH": "0" * 64,
-                "SIGNALS": {"source": "stale-test"},
+                "SIGNALS": ready_signals(),
                 "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
                 "ERROR": None,
             }
@@ -194,7 +228,7 @@ class DcaConfigWriterTests(unittest.TestCase):
                     "EXECUTE_AT": (self.now + timedelta(hours=1)).isoformat(),
                     "VALID_UNTIL": (self.now + timedelta(hours=2)).isoformat(),
                     "RULES_HASH": rules_hash(symbol, self.rules[symbol]),
-                    "SIGNALS": {"source": "test"},
+                    "SIGNALS": ready_signals(),
                     "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
                     "ERROR": None,
                 }

@@ -81,6 +81,20 @@ jobs:
             echo "Could not check DCA_ANALYSIS_STATE; refusing analysis." >&2
             exit 1
           fi
+          override_error="$RUNNER_TEMP/uptrend-override-state-error.txt"
+          if override="$(gh variable get DCA_UPTREND_OVERRIDE_STATE --repo "$GITHUB_REPOSITORY" 2>"$override_error")"; then
+            while IFS= read -r line; do
+              [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+            done <<< "$override"
+            delimiter="DCA_${GITHUB_RUN_ID}_${RANDOM}"
+            printf 'DCA_UPTREND_OVERRIDE_STATE<<%s\n%s\n%s\n' "$delimiter" "$override" "$delimiter" >> "$GITHUB_ENV"
+          elif grep -Fq 'variable DCA_UPTREND_OVERRIDE_STATE was not found' "$override_error" || \
+              grep -Fq 'HTTP 404' "$override_error"; then
+            printf 'DCA_UPTREND_OVERRIDE_STATE=\n' >> "$GITHUB_ENV"
+          else
+            echo "Could not check DCA_UPTREND_OVERRIDE_STATE; refusing analysis." >&2
+            exit 1
+          fi
 
       - name: Validate dedicated history storage
         env:

@@ -78,6 +78,7 @@ class WorkflowSafetyTests(unittest.TestCase):
             "DCA_TARGET_MAP: ${{ vars.DCA_TARGET_MAP }}",
             "DCA_ANALYSIS_STATE: ${{ vars.DCA_ANALYSIS_STATE",
             "DCA_EXECUTION_STATE: ${{ vars.DCA_EXECUTION_STATE",
+            "DCA_UPTREND_OVERRIDE_STATE: ${{ vars.DCA_UPTREND_OVERRIDE_STATE",
         )
         for path in WORKFLOWS.glob("*.yml"):
             text = path.read_text(encoding="utf-8")
@@ -87,7 +88,11 @@ class WorkflowSafetyTests(unittest.TestCase):
 
     def test_production_json_is_loaded_and_masked_inside_workflows(self):
         required_variables = {
-            "crypto_analysis.yml": ("DCA_TARGET_MAP", "DCA_ANALYSIS_STATE"),
+            "crypto_analysis.yml": (
+                "DCA_TARGET_MAP",
+                "DCA_ANALYSIS_STATE",
+                "DCA_UPTREND_OVERRIDE_STATE",
+            ),
             "daily_dca.yml": (
                 "DCA_TARGET_MAP",
                 "DCA_ANALYSIS_STATE",
