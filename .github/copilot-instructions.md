@@ -19,8 +19,14 @@ schemas, workflows, or deployment configuration.
   `UPTREND`→`LOW`. `MID` is `(LOW + UP) / 2`, rounded to the nearest penny with
   `ROUND_HALF_UP`; `HIGH` reads the stored `UP` endpoint. Never infer spend from
   the similarity between the `UP` endpoint name and `UPTREND`.
+- Normal `UPTREND` requires the latest 10 consecutive completed daily closes to
+  be strictly above each candle's own SMA150. Keep the deployed `DOWNTREND`
+  predicate: two daily close/SMA150 and EMA20/EMA50 confirmations, weekly
+  close/EMA20 confirmation, and negative 20-day SMA150 slope. Every other valid
+  normal result is `SIDEWAYS`; retain the 170-daily/20-weekly minimum.
 - Deterministic Python chooses regime, tier, and execution time from completed
-  Kraken candles. Gemini Flash-Lite may explain but never choose or override.
+  Kraken candles. Gemini Flash-Lite may explain but never choose a regime or
+  create, change, or release an emergency override.
 - `DCA_START_DATE` is a strict Asia/Bangkok release gate. One purchase per
   enabled target per Bangkok calendar day is permitted.
 
@@ -29,6 +35,14 @@ schemas, workflows, or deployment configuration.
 - Analysis owns `DCA_ANALYSIS_STATE`, including `STATUS`, `REGIME`,
   `AMOUNT_TIER`, `EXECUTE_AT`, `VALID_UNTIL`, `DECISION_ID`, `RULES_HASH`,
   signals, and timing metrics.
+- `DCA_UPTREND_OVERRIDE_STATE` is optional strict versioned maintainer state.
+  Missing/blank means no override; malformed present state fails closed. An
+  active per-target entry has absolute precedence and forces effective
+  `UPTREND`, even over a normal `DOWNTREND`, while analysis signals retain the
+  normal result, confirmation progress, reason, and activation/release audit.
+  Analysis automatically releases it only on natural 10-close confirmation and
+  must persist that release before the matching `DCA_ANALYSIS_STATE`. Routine
+  Discord controls and Gemini cannot write this state.
 - READY `AMOUNT_TIER` is exactly `LOW`, `MID`, or `HIGH` and must match the
   counter-cyclical regime mapping. Policy-version changes invalidate old
   decisions and require fresh analysis.
@@ -45,6 +59,9 @@ schemas, workflows, or deployment configuration.
   outcome.
 - Re-fetch and compare live rules and decision state before intent creation and
   immediately before Kraken submission.
+- Re-fetch the live optional uptrend-override document as the final validation
+  at both boundaries and require an exact match with the analysis decision.
+  Do not apply this new-order gate to reconciliation of a durable pending intent.
 - Missing, stale, insufficient, mismatched, or failed analysis always skips the
   purchase. Never reuse an old decision.
 - Keep requested GBP, quote-currency cost, fees, gross quantity, and net
@@ -64,6 +81,8 @@ schemas, workflows, or deployment configuration.
   exact second confirmation bound to the global rules snapshot.
 - Analysis writes the complete `DCA_ANALYSIS_STATE`; it never merges timing
   fields into `DCA_TARGET_MAP`.
+- Discord status must visibly label each active emergency override and show its
+  normal rule result, confirmation count, activation time, and audit reason.
 - Rule writers use `dca-rule-writers`; analysis writers use
   `dca-analysis-state-writers`; the trader uses its own serialized execution
   group. Preserve `queue: max` and `cancel-in-progress: false`.
@@ -111,6 +130,12 @@ schemas, workflows, or deployment configuration.
 - Repository variables are global across branches; scheduled workflows use the
   default branch. Do not mutate production state during a branch-only code
   change unless the migration is explicitly authorized.
+- Override activation is a deliberate maintainer repository-variable edit and
+  requires the canonical target, canonical UTC `ACTIVATED_AT`, null
+  `RELEASED_AT`, and a nonempty `REASON`. The analysis-driven automatic release
+  is gated on confirmation. Validator acceptance of an inactive entry is not
+  proof that analysis wrote it; manual deactivation or removal is break-glass
+  only.
 - Kraken keys require query/order permissions and must never allow withdrawals.
 - `DCA_OUTBOX_REPOSITORY_TOKEN` must be rotated after launch to Contents
   read/write on the dedicated private outbox repository only. The cutover's
@@ -136,4 +161,7 @@ schemas, workflows, or deployment configuration.
 - Cover all three exact regime/tier mappings, ordered endpoints, equal
   endpoints, half-penny midpoint rounding, and rejection of obsolete analysis
   state versions/tier pairs.
+- Cover 9-versus-10 close uptrend boundaries, preserved downtrend confirmation,
+  override precedence over sideways/downtrend, automatic release ordering,
+  malformed override rejection, and visible active-override status labelling.
 - Run tests with UTF-8 enabled on Windows.

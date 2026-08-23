@@ -38,6 +38,40 @@ def source_analysis(rules=None):
     return state
 
 
+def ready_sideways_signals():
+    return {
+        "DAILY_LAST_COMPLETE": "2026-08-11T00:00:00Z",
+        "DAILY_CLOSE": 105.0,
+        "DAILY_PREVIOUS_CLOSE": 104.0,
+        "DAILY_SMA150": 100.0,
+        "DAILY_PREVIOUS_SMA150": 99.0,
+        "DAILY_EMA20": 90.0,
+        "DAILY_EMA50": 95.0,
+        "DAILY_PREVIOUS_EMA20": 89.0,
+        "DAILY_PREVIOUS_EMA50": 94.0,
+        "WEEKLY_LAST_COMPLETE": "2026-08-03T00:00:00Z",
+        "WEEKLY_CLOSE": 105.0,
+        "WEEKLY_EMA20": 100.0,
+        "SMA150_SLOPE_20D": -1.0,
+        "TWO_DAY_ABOVE": False,
+        "TWO_DAY_BELOW": False,
+        "WEEKLY_ABOVE": True,
+        "WEEKLY_BELOW": False,
+        "SLOPE_POSITIVE": False,
+        "SLOPE_NEGATIVE": True,
+        "UPTREND_CONFIRMATION_REQUIRED": 10,
+        "UPTREND_CONFIRMATION_COUNT": 3,
+        "UPTREND_CONFIRMED": False,
+        "REGIME_WITHOUT_OVERRIDE": "SIDEWAYS",
+        "UPTREND_OVERRIDE_ACTIVE": False,
+        "UPTREND_OVERRIDE_APPLIED": False,
+        "UPTREND_OVERRIDE_REASON": None,
+        "UPTREND_OVERRIDE_ACTIVATED_AT": None,
+        "UPTREND_OVERRIDE_RELEASED_AT": None,
+        "UPTREND_OVERRIDE_AUTO_RELEASED": False,
+    }
+
+
 class TargetMigrationTests(unittest.TestCase):
     def test_replaces_hype_with_disabled_eth_and_resets_analysis(self):
         execution = {
@@ -357,6 +391,7 @@ class TargetMigrationTests(unittest.TestCase):
             "EXECUTE_AT": "2026-08-12T04:00:00Z",
             "VALID_UNTIL": "2026-08-12T05:00:00Z",
             "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
+            "SIGNALS": ready_sideways_signals(),
             "ERROR": None,
         })
         decision["RULES_HASH"] = "b" * 64

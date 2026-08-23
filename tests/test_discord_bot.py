@@ -48,6 +48,47 @@ def rules(*, enabled=(), low=10, up=20):
     }
 
 
+def ready_signals(analyzed_at):
+    daily_open = (analyzed_at - timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    current_week_open = analyzed_at.replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - timedelta(days=analyzed_at.weekday())
+    weekly_open = current_week_open - timedelta(days=7)
+    return {
+        "DAILY_LAST_COMPLETE": daily_open.isoformat().replace("+00:00", "Z"),
+        "DAILY_CLOSE": 105.0,
+        "DAILY_PREVIOUS_CLOSE": 104.0,
+        "DAILY_SMA150": 100.0,
+        "DAILY_PREVIOUS_SMA150": 99.0,
+        "DAILY_EMA20": 102.0,
+        "DAILY_EMA50": 100.0,
+        "DAILY_PREVIOUS_EMA20": 101.0,
+        "DAILY_PREVIOUS_EMA50": 99.0,
+        "WEEKLY_LAST_COMPLETE": weekly_open.isoformat().replace("+00:00", "Z"),
+        "WEEKLY_CLOSE": 105.0,
+        "WEEKLY_EMA20": 100.0,
+        "SMA150_SLOPE_20D": 1.0,
+        "TWO_DAY_ABOVE": True,
+        "TWO_DAY_BELOW": False,
+        "WEEKLY_ABOVE": True,
+        "WEEKLY_BELOW": False,
+        "SLOPE_POSITIVE": True,
+        "SLOPE_NEGATIVE": False,
+        "UPTREND_CONFIRMATION_REQUIRED": 10,
+        "UPTREND_CONFIRMATION_COUNT": 10,
+        "UPTREND_CONFIRMED": True,
+        "REGIME_WITHOUT_OVERRIDE": "UPTREND",
+        "UPTREND_OVERRIDE_ACTIVE": False,
+        "UPTREND_OVERRIDE_APPLIED": False,
+        "UPTREND_OVERRIDE_REASON": None,
+        "UPTREND_OVERRIDE_ACTIVATED_AT": None,
+        "UPTREND_OVERRIDE_RELEASED_AT": None,
+        "UPTREND_OVERRIDE_AUTO_RELEASED": False,
+    }
+
+
 def analysis_state(
     live_rules,
     *,
@@ -99,7 +140,7 @@ def analysis_state(
                 }
                 if status == "READY" else {"STATUS": "ERROR"}
             ),
-            "SIGNALS": {},
+            "SIGNALS": ready_signals(generated_at) if status == "READY" else {},
             "TIMING": {
                 "ANALYZED_AT": generated_at.isoformat().replace("+00:00", "Z")
             },
@@ -739,6 +780,49 @@ class DiscordBotControlTests(unittest.TestCase):
         )
 
         self.assertIn("Data through: `unknown`", summary)
+
+    def test_status_summary_visibly_labels_active_uptrend_override(self):
+        decision = deepcopy(self.analysis["TARGETS"]["BTC_GBP"])
+        decision["SIGNALS"] = {
+            "UPTREND_CONFIRMATION_REQUIRED": 10,
+            "UPTREND_CONFIRMATION_COUNT": 3,
+            "UPTREND_CONFIRMED": False,
+            "REGIME_WITHOUT_OVERRIDE": "SIDEWAYS",
+            "UPTREND_OVERRIDE_ACTIVE": True,
+            "UPTREND_OVERRIDE_APPLIED": True,
+            "UPTREND_OVERRIDE_REASON": "Reviewed emergency allocation",
+            "UPTREND_OVERRIDE_ACTIVATED_AT": "2026-08-23T02:30:00Z",
+            "UPTREND_OVERRIDE_RELEASED_AT": None,
+            "UPTREND_OVERRIDE_AUTO_RELEASED": False,
+        }
+
+        summary = discord_bot._decision_summary(
+            "BTC_GBP",
+            self.rules["BTC_GBP"],
+            decision,
+            {},
+            now=NOW,
+        )
+
+        self.assertIn("EMERGENCY UPTREND OVERRIDE ACTIVE", summary)
+        self.assertIn("Rule result: `SIDEWAYS`", summary)
+        self.assertIn("Confirmation: `3/10`", summary)
+        self.assertIn("2026-08-23 09:30", summary)
+        self.assertIn("Reviewed emergency allocation", summary)
+
+    def test_status_summary_omits_inactive_uptrend_override_label(self):
+        decision = deepcopy(self.analysis["TARGETS"]["BTC_GBP"])
+        decision["SIGNALS"] = {"UPTREND_OVERRIDE_ACTIVE": False}
+
+        summary = discord_bot._decision_summary(
+            "BTC_GBP",
+            self.rules["BTC_GBP"],
+            decision,
+            {},
+            now=NOW,
+        )
+
+        self.assertNotIn("EMERGENCY UPTREND OVERRIDE ACTIVE", summary)
 
     def test_status_distinguishes_enabled_shadow_disabled_and_budget_refresh(self):
         live_rules = rules(enabled={"BTC_GBP", "SOL_GBP"}, low=10, up=20)
@@ -1590,6 +1674,15 @@ class DiscordBotSchedulerTests(unittest.TestCase):
 
 
 class DiscordBotWorkflowAndGeminiTests(unittest.TestCase):
+    def test_regime_explanation_describes_confirmation_and_visible_override(self):
+        reply = discord_bot.CHAT_TOPIC_REPLIES["regimes"]
+
+        self.assertIn("10 consecutive completed daily", reply)
+        self.assertIn("each candle’s own SMA150", reply)
+        self.assertIn("DOWNTREND keeps", reply)
+        self.assertIn("emergency per-target override", reply)
+        self.assertIn("visibly labelled", reply)
+
     @patch.object(discord_bot.requests, "get")
     def test_analysis_workflow_health_reports_actual_successful_ref(self, get):
         get.return_value.status_code = 200

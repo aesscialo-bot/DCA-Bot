@@ -67,6 +67,40 @@ def sized_gist_row(delivery_id, size):
     return row
 
 
+def ready_signals():
+    return {
+        "DAILY_LAST_COMPLETE": "2026-08-04T00:00:00Z",
+        "DAILY_CLOSE": 105.0,
+        "DAILY_PREVIOUS_CLOSE": 104.0,
+        "DAILY_SMA150": 100.0,
+        "DAILY_PREVIOUS_SMA150": 99.0,
+        "DAILY_EMA20": 90.0,
+        "DAILY_EMA50": 95.0,
+        "DAILY_PREVIOUS_EMA20": 89.0,
+        "DAILY_PREVIOUS_EMA50": 94.0,
+        "WEEKLY_LAST_COMPLETE": "2026-07-27T00:00:00Z",
+        "WEEKLY_CLOSE": 105.0,
+        "WEEKLY_EMA20": 100.0,
+        "SMA150_SLOPE_20D": -1.0,
+        "TWO_DAY_ABOVE": False,
+        "TWO_DAY_BELOW": False,
+        "WEEKLY_ABOVE": True,
+        "WEEKLY_BELOW": False,
+        "SLOPE_POSITIVE": False,
+        "SLOPE_NEGATIVE": True,
+        "UPTREND_CONFIRMATION_REQUIRED": 10,
+        "UPTREND_CONFIRMATION_COUNT": 3,
+        "UPTREND_CONFIRMED": False,
+        "REGIME_WITHOUT_OVERRIDE": "SIDEWAYS",
+        "UPTREND_OVERRIDE_ACTIVE": False,
+        "UPTREND_OVERRIDE_APPLIED": False,
+        "UPTREND_OVERRIDE_REASON": None,
+        "UPTREND_OVERRIDE_ACTIVATED_AT": None,
+        "UPTREND_OVERRIDE_RELEASED_AT": None,
+        "UPTREND_OVERRIDE_AUTO_RELEASED": False,
+    }
+
+
 def ready_state(rules=None):
     rules = rules or dca_config.default_rules_map()
     state = dca_config.empty_analysis_state(rules, now=NOW)
@@ -86,7 +120,7 @@ def ready_state(rules=None):
             "POLICY_VERSION": dca_config.TIMING_POLICY_VERSION,
             "ANALYSIS_DATE": "2026-08-06",
             "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
-            "SIGNALS": {"SMA150_SLOPE_20D": 1.2},
+            "SIGNALS": ready_signals(),
             "TIMING": {
                 "ANALYZED_AT": "2026-08-05T21:00:00Z",
                 "SELECTED_LOCAL_TIME": "08:00",

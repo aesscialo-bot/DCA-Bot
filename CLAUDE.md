@@ -13,6 +13,17 @@ workflows, or release configuration.
   strict `YYYY-MM-DD` date in `Asia/Bangkok`; all earlier trading fails closed.
 - Counter-cyclical spend mapping is downtrend=`HIGH`, sideways=`MID`, and
   uptrend=`LOW`. `MID` is the half-up penny-rounded arithmetic midpoint.
+- Normal `UPTREND` requires the latest 10 consecutive completed daily closes to
+  be strictly above each candle's own SMA150. `DOWNTREND` retains the two-day
+  close/SMA150 and EMA20/EMA50 checks, weekly close/EMA20 check, and negative
+  20-day SMA150 slope; every other valid normal result is `SIDEWAYS`. Preserve
+  the 170-daily/20-weekly minimum because the downtrend inputs still require it.
+- `DCA_UPTREND_OVERRIDE_STATE` is an optional, strict, versioned per-target
+  emergency state. An active override has absolute precedence, is surfaced in
+  analysis signals and Discord status, and forces effective `UPTREND` while
+  `ACTIVE=true`. The analysis-driven automatic release path is gated on normal
+  10-close confirmation and must persist the release before the matching
+  analysis state. Gemini and routine Discord commands cannot write an override.
 - The current lower/higher endpoints are BTC £12.50/£25, ETH £12.50/£18.75,
   and SOL £12.50/£18.75, producing sideways amounts £18.75/£15.63/£15.63.
   Budget changes must use
@@ -22,6 +33,9 @@ workflows, or release configuration.
   No active target has a funding leg.
 - One purchase per enabled asset per Bangkok calendar day is permitted.
 - Stale, missing, insufficient, or inconsistent state always skips trading.
+- Before intent creation and immediately before Kraken submission, re-read the
+  live override document and require an exact match with the analysis decision.
+  Preserve reconciliation-only recovery for an existing durable pending intent.
 - A pending funding or crypto order must be reconciled before any new order.
 - Kraken is the portfolio and execution source of truth.
 - The private repository outbox and Ghostfolio are post-fill mirrors and never
@@ -45,6 +59,11 @@ workflows, or release configuration.
   restricted to the separate market-history Gist during its transition.
 - Never log tokens, API responses containing credentials, complete production
   rules, complete analysis state, or complete execution state.
+- Treat every override activation as an auditable maintainer production-state
+  change: canonical target, activation timestamp, and nonempty reason are
+  required. Missing/blank means no override; malformed present state fails
+  closed. Validator acceptance of an inactive entry is not proof that analysis
+  wrote it; manual deactivation or removal is break-glass only.
 - Workflows load production JSON inside a step, mask every nonempty line, and
   pass it through `$GITHUB_ENV`; do not restore direct `${{ vars.DCA_* }}` JSON
   interpolation in a public workflow log path.
@@ -53,7 +72,8 @@ workflows, or release configuration.
 
 - Compile Python, run the complete unit suite, validate every workflow YAML,
   and build the Docker image before merging.
-- Preserve deterministic regime/timing behavior and final live-state checks.
+- Preserve deterministic regime/timing behavior, override audit/release
+  ordering, visible active-override warnings, and final live-state checks.
 - Test direct fills, partial/unknown responses, durable recovery, duplicate
   suppression, start-date boundaries, live minimums, and GBP budget ceilings.
   Preserve the fixed historical HYPE two-leg recovery tests unchanged.

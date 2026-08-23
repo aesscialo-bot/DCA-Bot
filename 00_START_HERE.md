@@ -67,7 +67,10 @@ rules, decisions, pending state, and scheduler posture.
    posture: no old decision can trade, pending recovery remains active, and no
    stale-date incident is sent unless the state is otherwise unhealthy.
 2. Deterministic Python classifies each pair as `UPTREND`, `DOWNTREND`, or
-   `SIDEWAYS`.
+   `SIDEWAYS`. Uptrend requires the latest 10 consecutive completed daily closes
+   to be strictly above each candle's own SMA150. Downtrend keeps the existing
+   two-day daily EMA, weekly EMA, and negative SMA150-slope confirmation; every
+   other valid normal result is sideways.
 3. Python selects the higher / midpoint / lower GBP spend for downtrend /
    sideways / uptrend respectively, plus the best 15-minute execution time from
    deterministic 3-, 5-, 7-, 14-, 30-, 45-, and 60-day timing windows on
@@ -76,8 +79,10 @@ rules, decisions, pending state, and scheduler posture.
    to Discord.
 5. Railway checks the absolute execution times every five minutes and dispatches
    the trader when a pair is due.
-6. The trader rechecks the live rule, decision, date, window, Kraken minimum,
-   pending-order state, and once-per-day guard.
+6. The trader rechecks the live rule, decision, uptrend-override document, date,
+   window, Kraken minimum, pending-order state, and once-per-day guard. Override
+   state must match the analysis before intent creation and immediately before
+   Kraken submission.
 7. BTC, ETH, and SOL spend GBP directly on `BTC/GBP`, `ETH/GBP`, and `SOL/GBP`.
    No active target has a funding leg.
 8. Kraken remains the authoritative record and Discord receives the result.
@@ -94,8 +99,10 @@ passes through the same durable intent and once-per-day lock.
 
 Status reports the analysis date, decision ID, selected optimal time, effective
 catch-up time, execution status, workflow ref, pending Kraken intent, Portfolio
-Compass delivery, and local Ghostfolio receipt completion. A stale decision is
-never shown as `READY` or `Next`.
+Compass delivery, and local Ghostfolio receipt completion. It prominently labels
+any active emergency uptrend override with the normal rule result, confirmation
+progress, activation time, and reason. A stale decision is never shown as
+`READY` or `Next`.
 
 ## Everyday Discord controls
 
@@ -201,6 +208,30 @@ pair remains visible and can still be analyzed. Do not delete its JSON key.
 
 Manual analysis refreshes decisions. It does not bypass the start date,
 execution window, minimum-order check, or once-per-day restriction.
+
+### Emergency uptrend override (maintainers only)
+
+`DCA_UPTREND_OVERRIDE_STATE` is an optional repository variable. Missing or blank
+means no override. An active per-target entry forces the effective regime to
+`UPTREND` even if the normal classifier returns `SIDEWAYS` or `DOWNTREND`, so it
+is an exceptional production-state change rather than a routine Discord control.
+
+The strict version-1 document contains canonical target keys and, for each
+included target, only `ACTIVE`, `ACTIVATED_AT`, `RELEASED_AT`, and `REASON`.
+Activation requires a deliberate maintainer edit with `ACTIVE=true`, a canonical
+UTC activation timestamp, `RELEASED_AT=null`, and a nonempty audit reason. A
+present malformed document fails analysis closed. Never put override fields in
+`DCA_TARGET_MAP`, and never activate one through natural-language chat.
+
+The analysis decision records the normal regime, the effective regime, the
+trailing confirmation count out of 10, and the active/applied override audit
+fields. `show status` displays a prominent warning for the affected target.
+During normal operation, leave an active entry unchanged. The analysis workflow
+automatically persists an inactive release immediately before the matching
+analysis state when the latest 10 completed daily closes confirm `UPTREND`.
+Repository-variable maintainers can technically deactivate or remove an
+override; treat that as a break-glass production change, and do not treat an
+inactive record alone as evidence of natural confirmation.
 
 ## Rules JSON and state ownership
 
@@ -324,6 +355,9 @@ These changes require a tested pull request and cannot be made through Discord:
 - Daily analysis time: [`.github/workflows/crypto_analysis.yml`](.github/workflows/crypto_analysis.yml#L3-L7).
   GitHub cron uses UTC; `7,37 21 * * *` is 04:07 and 04:37 Asia/Bangkok.
 - Trend policy: [`crypto_analysis.py`](crypto_analysis.py#L229-L321).
+- Emergency uptrend override state is maintainer-only, remains auditable in
+  `DCA_UPTREND_OVERRIDE_STATE` and `DCA_ANALYSIS_STATE`, and its analysis-driven
+  automatic release is gated on natural 10-close confirmation.
 - Regime-to-budget policy and midpoint rounding: [`dca_config.py`](dca_config.py).
 - Best-time policy: [`crypto_analysis.py`](crypto_analysis.py#L423-L500).
 - Gemini explanation contract and model fallback:

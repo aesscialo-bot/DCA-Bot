@@ -72,7 +72,7 @@ Each enabled asset can buy at most once per Bangkok calendar day.
 ```mermaid
 flowchart TD
     A["04:07 primary / 04:37 recovery"] --> B["Refresh first-party Kraken trade history"]
-    B --> C["Classify each target: up, down, or sideways"]
+    B --> C["Confirm 10-close uptrend or multi-factor downtrend"]
     C --> D["Select GBP budget and best 15-minute execution time"]
     D --> E["Write fresh DCA_ANALYSIS_STATE"]
     E --> F["Railway scheduler watches absolute execution times"]
@@ -104,12 +104,40 @@ Between local midnight and 04:20, one complete prior-day state is reported as
 awaiting the scheduled analysis: old decisions stay blocked, pending orders
 still reconcile, and the normal rollover does not raise an incident alert.
 
-- `UPTREND`: two consecutive daily closes above SMA150, EMA20 above EMA50,
-  completed weekly close above weekly EMA20, and a positive 20-day SMA150 slope.
-- `DOWNTREND`: the inverse conditions.
-- `SIDEWAYS`: every other valid result.
+- `UPTREND`: each of the latest 10 consecutive completed daily closes is
+  strictly above the SMA150 calculated for that same candle. A close is not
+  compared with today's SMA150 retroactively.
+- `DOWNTREND`: the latest two completed daily closes are below their respective
+  SMA150 values with EMA20 below EMA50 on both days, the latest completed weekly
+  close is below weekly EMA20, and the 20-day SMA150 slope is negative.
+- `SIDEWAYS`: every other valid normal result, including an above-SMA150 streak
+  shorter than 10 closes.
 - `DOWNTREND` selects `HIGH`, `SIDEWAYS` selects `MID`, and `UPTREND`
   selects `LOW`.
+
+The normal classifier still requires at least 170 consecutive completed daily
+candles and 20 completed weekly candles. Those bounds support the existing
+downtrend slope and weekly confirmation as well as the new 10-close uptrend
+confirmation.
+
+An active entry in the optional `DCA_UPTREND_OVERRIDE_STATE` repository variable
+has absolute precedence and temporarily makes that target's effective regime
+`UPTREND`, even when the normal result is `SIDEWAYS` or `DOWNTREND`. This is an
+audited emergency control, not another market signal. Every decision records
+the normal result, confirmation progress, active/applied override flags, reason,
+and activation/release timestamps. Discord status visibly labels an active
+override. While `ACTIVE=true`, the override has absolute precedence. The
+analysis workflow's automatic release path runs only after the normal 10-close
+rule confirms. Maintainers with repository-variable write access can technically
+deactivate or remove an override; that is an out-of-band break-glass production
+change, not proof of natural confirmation. Gemini and routine Discord commands
+cannot write this state.
+
+Before creating an order intent and again immediately before Kraken submission,
+the trader re-reads the live override document and requires it to match the
+analysis decision exactly. A changed, removed, malformed, or unavailable
+override blocks new orders. Existing durable pending intents remain
+reconciliation-only so recovery never creates a replacement order.
 
 `MID` is derived from the two configured endpoints as `(LOW + UP) / 2` and is
 rounded to the nearest penny using half-up currency rounding. The configured
@@ -177,9 +205,11 @@ and upper `UP` GBP endpoints, and `BUY_ENABLED` flags. Budget edits are atomic
 and permitted only while the selected asset is disabled. `MID` and `HIGH` are
 derived analysis tiers, not extra fields in this user-owned JSON.
 
-`DCA_ANALYSIS_STATE` stores each asset's status, regime, selected tier,
+`DCA_ANALYSIS_STATE` stores each asset's status, effective regime, selected tier,
 `EXECUTE_AT`, `VALID_UNTIL`, `DECISION_ID`, `RULES_HASH`, signal metrics, and
-timing metrics.
+timing metrics. Its signals preserve the regime without override, the trailing
+uptrend-confirmation count, override metadata, and whether that specific
+analysis run performed an automatic release.
 
 `DCA_EXECUTION_STATE` stores `LAST_BUY_DATE`, durable `PENDING_ORDER` state, and
 FIFO `PENDING_GIST_DELIVERIES`. Completion atomically moves confirmed fill
@@ -214,6 +244,17 @@ Required repository variables:
   `kraken_account_activity_source_v1.json`)
 - `DCA_OUTBOX_ACCOUNT_RECOVERY_PATH` (must end in
   `kraken_account_recovery_v1.json`)
+
+`DCA_UPTREND_OVERRIDE_STATE` is optional; missing or blank means no override.
+When present it is a strict versioned document with per-target entries containing
+only `ACTIVE`, canonical UTC `ACTIVATED_AT` / `RELEASED_AT`, and a nonempty
+`REASON`. A malformed document fails analysis closed. Activation is a deliberate
+maintainer repository-variable edit and must name the exact canonical target,
+time, and reason. The analysis workflow is the only automatic writer: once the
+target naturally reaches 10 qualifying closes, it persists the inactive release
+record before publishing the matching `DCA_ANALYSIS_STATE`. The schema accepts
+inactive entries so released history can be loaded; schema validation does not
+authenticate which actor wrote the repository variable.
 
 `DCA_OPENING_BASIS_FUNDING_LINKS_JSON` is optional. The producer normally
 infers each historical GBP/USD leg from the target/date deterministic Kraken
@@ -319,7 +360,9 @@ help
 Budget changes require the target to be disabled. Enabling requires exact
 confirmation and displays the lower, midpoint, and higher amounts, the latest
 regime, effective amount, next execution time, decision age, and aggregate
-maximum daily exposure.
+maximum daily exposure. `show status` also displays a prominent per-target
+warning, normal rule result, confirmation count, activation time, and reason
+whenever an emergency uptrend override is active.
 
 Messages that are not exact commands can be phrased naturally. Gemini routes
 them only to read-only handlers or reviewed emoji-labelled explanations about

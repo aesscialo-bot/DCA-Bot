@@ -29,6 +29,67 @@ def rules_with(*enabled_targets, low=10, up=20):
     return rules
 
 
+def ready_signals(regime, analyzed_at):
+    daily_open = (analyzed_at - timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    current_week_open = analyzed_at.replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - timedelta(days=analyzed_at.weekday())
+    weekly_open = current_week_open - timedelta(days=7)
+    signals = {
+        "DAILY_LAST_COMPLETE": daily_open.isoformat().replace("+00:00", "Z"),
+        "DAILY_CLOSE": 105.0,
+        "DAILY_PREVIOUS_CLOSE": 104.0,
+        "DAILY_SMA150": 100.0,
+        "DAILY_PREVIOUS_SMA150": 99.0,
+        "DAILY_EMA20": 90.0,
+        "DAILY_EMA50": 95.0,
+        "DAILY_PREVIOUS_EMA20": 89.0,
+        "DAILY_PREVIOUS_EMA50": 94.0,
+        "WEEKLY_LAST_COMPLETE": weekly_open.isoformat().replace("+00:00", "Z"),
+        "WEEKLY_CLOSE": 105.0,
+        "WEEKLY_EMA20": 100.0,
+        "SMA150_SLOPE_20D": -1.0,
+        "TWO_DAY_ABOVE": False,
+        "TWO_DAY_BELOW": False,
+        "WEEKLY_ABOVE": True,
+        "WEEKLY_BELOW": False,
+        "SLOPE_POSITIVE": False,
+        "SLOPE_NEGATIVE": True,
+        "UPTREND_CONFIRMATION_REQUIRED": 10,
+        "UPTREND_CONFIRMATION_COUNT": 3,
+        "UPTREND_CONFIRMED": False,
+        "REGIME_WITHOUT_OVERRIDE": regime,
+        "UPTREND_OVERRIDE_ACTIVE": False,
+        "UPTREND_OVERRIDE_APPLIED": False,
+        "UPTREND_OVERRIDE_REASON": None,
+        "UPTREND_OVERRIDE_ACTIVATED_AT": None,
+        "UPTREND_OVERRIDE_RELEASED_AT": None,
+        "UPTREND_OVERRIDE_AUTO_RELEASED": False,
+    }
+    if regime == "UPTREND":
+        signals.update(
+            {
+                "UPTREND_CONFIRMATION_COUNT": 10,
+                "UPTREND_CONFIRMED": True,
+            }
+        )
+    elif regime == "DOWNTREND":
+        signals.update(
+            {
+                "DAILY_CLOSE": 90.0,
+                "DAILY_PREVIOUS_CLOSE": 89.0,
+                "TWO_DAY_BELOW": True,
+                "WEEKLY_CLOSE": 90.0,
+                "WEEKLY_ABOVE": False,
+                "WEEKLY_BELOW": True,
+                "UPTREND_CONFIRMATION_COUNT": 0,
+            }
+        )
+    return signals
+
+
 def ready_decision(target, rule, *, now=NOW, regime="UPTREND", offset=0):
     execute_at = now + timedelta(minutes=offset)
     analyzed_at = min(now, execute_at - timedelta(minutes=30))
@@ -50,7 +111,7 @@ def ready_decision(target, rule, *, now=NOW, regime="UPTREND", offset=0):
         "ANALYSIS_DATE": now.astimezone(crypto_dca.SELECTED_TZ).date().isoformat(),
         "CATCHUP_APPLIED": False,
         "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
-        "SIGNALS": {"SOURCE": "completed Kraken candles"},
+        "SIGNALS": ready_signals(regime, analyzed_at),
         "TIMING": {
             "ANALYZED_AT": analyzed_at.isoformat().replace("+00:00", "Z")
         },
@@ -616,6 +677,48 @@ class LiveRevalidationTests(unittest.TestCase):
         self.rules = rules_with("BTC_GBP")
         self.decision = ready_decision("BTC_GBP", self.rules["BTC_GBP"])
         self.analysis = analysis_for(self.rules, {"BTC_GBP": self.decision})
+        override_patch = patch.object(
+            crypto_dca,
+            "fetch_live_uptrend_override_state",
+            return_value={"VERSION": 1, "TARGETS": {}},
+        )
+        override_patch.start()
+        self.addCleanup(override_patch.stop)
+
+    def test_revalidation_rejects_override_activated_after_analysis(self):
+        active_override = {
+            "VERSION": 1,
+            "TARGETS": {
+                "BTC_GBP": {
+                    "ACTIVE": True,
+                    "ACTIVATED_AT": "2026-08-05T04:30:00Z",
+                    "RELEASED_AT": None,
+                    "REASON": "Operator-requested transition",
+                }
+            },
+        }
+        with (
+            patch.object(crypto_dca, "fetch_live_target_map", return_value=self.rules),
+            patch.object(
+                crypto_dca,
+                "fetch_live_analysis_state",
+                return_value=self.analysis,
+            ),
+            patch.object(
+                crypto_dca,
+                "fetch_live_uptrend_override_state",
+                return_value=active_override,
+            ),
+            patch.object(crypto_dca, "fetch_live_execution_state", return_value={}),
+            self.assertRaisesRegex(RuntimeError, "override changed"),
+        ):
+            crypto_dca._revalidate_trade_intent(
+                "BTC_GBP",
+                self.rules["BTC_GBP"],
+                self.decision,
+                "2026-08-05",
+                now=NOW,
+            )
 
     def test_revalidation_rejects_live_budget_change(self):
         changed = rules_with("BTC_GBP", low=11, up=21)
@@ -780,6 +883,56 @@ class LiveRevalidationTests(unittest.TestCase):
             )
 
 
+class LiveOverrideStateTests(unittest.TestCase):
+    def test_optional_override_reader_accepts_missing_and_present_blank(self):
+        for label, response in (
+            ("missing", MagicMock(status_code=404)),
+            ("present blank", MagicMock(status_code=200)),
+        ):
+            if response.status_code == 200:
+                response.json.return_value = {"value": ""}
+            with (
+                self.subTest(label=label),
+                patch.object(
+                    crypto_dca,
+                    "_github_variable_context",
+                    return_value=("override-url", "collection-url", {}),
+                ),
+                patch.object(crypto_dca.requests, "get", return_value=response),
+            ):
+                self.assertEqual(
+                    crypto_dca.fetch_live_uptrend_override_state(),
+                    {"VERSION": 1, "TARGETS": {}},
+                )
+
+    def test_optional_override_reader_rejects_invalid_present_state(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"value": "{}"}
+        with (
+            patch.object(
+                crypto_dca,
+                "_github_variable_context",
+                return_value=("override-url", "collection-url", {}),
+            ),
+            patch.object(crypto_dca.requests, "get", return_value=response),
+            self.assertRaisesRegex(RuntimeError, "UPTREND_OVERRIDE_STATE is invalid"),
+        ):
+            crypto_dca.fetch_live_uptrend_override_state()
+
+    def test_optional_override_reader_fails_closed_on_http_error(self):
+        response = MagicMock(status_code=503)
+        with (
+            patch.object(
+                crypto_dca,
+                "_github_variable_context",
+                return_value=("override-url", "collection-url", {}),
+            ),
+            patch.object(crypto_dca.requests, "get", return_value=response),
+            self.assertRaisesRegex(RuntimeError, "HTTP 503"),
+        ):
+            crypto_dca.fetch_live_uptrend_override_state()
+
+
 class TradeExecutionTests(unittest.TestCase):
     def setUp(self):
         self.rules = rules_with("BTC_GBP")
@@ -812,6 +965,13 @@ class TradeExecutionTests(unittest.TestCase):
             "effective_quote_price_per_unit": 50_000.0,
             "timestamp": int(NOW.timestamp()),
         }
+        override_patch = patch.object(
+            crypto_dca,
+            "fetch_live_uptrend_override_state",
+            return_value={"VERSION": 1, "TARGETS": {}},
+        )
+        override_patch.start()
+        self.addCleanup(override_patch.stop)
 
     def _new_intent_context(self):
         return (
