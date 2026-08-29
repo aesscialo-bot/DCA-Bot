@@ -41,15 +41,15 @@ zero Kraken `AddOrder` calls.
 
 The configured target set is exactly:
 
-| Pair | `UPTREND` lower | `SIDEWAYS` midpoint | `DOWNTREND` higher | Intended state |
+| Pair | `UPTREND` lower | `SIDEWAYS` | `DOWNTREND` higher | Intended state |
 | --- | ---: | ---: | ---: | --- |
-| `BTC/GBP` | £12.50 | £18.75 | £25 | Disabled at cutover; re-enable deliberately |
-| `ETH/GBP` | £12.50 | £15.63 | £18.75 | Disabled at cutover; enable after fresh analysis |
-| `SOL/GBP` | £12.50 | £15.63 | £18.75 | Disabled at cutover; re-enable deliberately |
+| `BTC/GBP` | £5 | £10 | £20 | Enabled |
+| `ETH/GBP` | £5 | £10 | £15 | Enabled |
+| `SOL/GBP` | £5 | £10 | £15 | Enabled |
 
-- The bot deliberately buys more in a `DOWNTREND`, the midpoint in a
+- The bot deliberately buys more in a `DOWNTREND`, the explicit middle amount in a
   `SIDEWAYS` market, and less in an `UPTREND`.
-- Aggregate daily exposure is £62.50 / £50.01 / £37.50 when every pair is
+- Aggregate daily exposure is £50 / £30 / £15 when every pair is
   downtrend / sideways / uptrend respectively.
 - Each enabled pair can buy at most once per Asia/Bangkok calendar day.
 - The strict trading start gate is `DCA_START_DATE=2026-08-07` in
@@ -67,11 +67,11 @@ rules, decisions, pending state, and scheduler posture.
    posture: no old decision can trade, pending recovery remains active, and no
    stale-date incident is sent unless the state is otherwise unhealthy.
 2. Deterministic Python classifies each pair as `UPTREND`, `DOWNTREND`, or
-   `SIDEWAYS`. Uptrend requires the latest 10 consecutive completed daily closes
-   to be strictly above each candle's own SMA150. Downtrend keeps the existing
-   two-day daily EMA, weekly EMA, and negative SMA150-slope confirmation; every
-   other valid normal result is sideways.
-3. Python selects the higher / midpoint / lower GBP spend for downtrend /
+   `SIDEWAYS`. Uptrend requires the latest 3 consecutive completed daily closes
+   above each candle's own SMA150. The first break returns sideways. Downtrend
+   requires 3 completed closes below their own SMA150 values and a bearish latest
+   EMA20/EMA50. Weekly EMA and SMA150 slope remain informational.
+3. Python selects the higher / explicit middle / lower GBP spend for downtrend /
    sideways / uptrend respectively, plus the best 15-minute execution time from
    deterministic 3-, 5-, 7-, 14-, 30-, 45-, and 60-day timing windows on
    BTC/GBP, ETH/GBP, and SOL/GBP.
@@ -138,10 +138,9 @@ show an `ERROR` placeholder while overall health correctly reports `ARMED`.
 After a successful daily analysis, enabled pairs should show fresh `READY`
 decisions, regimes, and execution times.
 
-### Change both budgets for an existing pair
+### Change all three budgets for an existing pair
 
-Example: change BTC to a £12 lower endpoint and £25 higher endpoint. Sideways
-will then use the derived £18.50 midpoint.
+Example: set BTC to £5 in uptrend, £10 sideways, and £20 in downtrend.
 
 ```text
 !dca disable BTC
@@ -150,7 +149,7 @@ will then use the derived £18.50 midpoint.
 Wait for the first **Update DCA Configuration** run to succeed, then send:
 
 ```text
-!dca set BTC amounts to 12 low and 25 high
+!dca set BTC amounts to 5 low, 10 sideways, and 20 high
 ```
 
 Wait for the second **Update DCA Configuration** run to succeed. Only then send:
@@ -183,11 +182,11 @@ show status
 ```
 
 Replace `BTC` with `ETH` or `SOL` as needed. Enter numbers without a `£` sign
-and with no more than two decimal places. The lower amount cannot exceed the
-higher amount. Both endpoints must be between £5 and £1,000 and at or above
-Kraken's current market minimum before enabling. Zero is permitted only as a
-disabled placeholder. Sideways uses `(lower + higher) / 2`, rounded to the
-nearest penny with half-up currency rounding.
+and with no more than two decimal places. Amounts must satisfy
+`low <= sideways <= high`. All three must be between £5 and £1,000 and at or
+above Kraken's current market minimum before enabling. Zero is permitted only
+as a disabled placeholder. The old two-amount command remains a rollout
+compatibility alias that derives its midpoint; use the explicit form above.
 
 ### Stop buying a pair
 
@@ -224,11 +223,11 @@ present malformed document fails analysis closed. Never put override fields in
 `DCA_TARGET_MAP`, and never activate one through natural-language chat.
 
 The analysis decision records the normal regime, the effective regime, the
-trailing confirmation count out of 10, and the active/applied override audit
+trailing confirmation count out of 3, and the active/applied override audit
 fields. `show status` displays a prominent warning for the affected target.
 During normal operation, leave an active entry unchanged. The analysis workflow
 automatically persists an inactive release immediately before the matching
-analysis state when the latest 10 completed daily closes confirm `UPTREND`.
+analysis state when the latest 3 completed daily closes confirm `UPTREND`.
 Repository-variable maintainers can technically deactivate or remove an
 override; treat that as a break-glass production change, and do not treat an
 inactive record alone as evidence of natural confirmation.
@@ -240,24 +239,23 @@ The user-owned repository variable is `DCA_TARGET_MAP`. Its approved shape is:
 ```json
 {
   "BTC_GBP": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 25},
-    "BUY_ENABLED": false
+    "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 20},
+    "BUY_ENABLED": true
   },
   "ETH_GBP": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 18.75},
-    "BUY_ENABLED": false
+    "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
+    "BUY_ENABLED": true
   },
   "SOL_GBP": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 18.75},
-    "BUY_ENABLED": false
+    "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
+    "BUY_ENABLED": true
   }
 }
 ```
 
-For compatibility, the JSON field `LOW` stores the lower endpoint and `UP`
-stores the upper/higher endpoint. `UP` does **not** mean the amount used in an
-uptrend. Analysis records the derived tiers `LOW`, `MID`, or `HIGH` according to
-the counter-cyclical policy.
+`LOW`, `MID`, and compatibility-named `UP` store the uptrend, sideways, and
+downtrend amounts. `UP` does **not** mean the amount used in an uptrend. Analysis
+records tiers `LOW`, `MID`, or `HIGH` according to the counter-cyclical policy.
 
 Use Discord for routine changes. It validates and serializes the write, checks
 fresh analysis before enabling, and checks Kraken's current market minimum.
@@ -268,9 +266,10 @@ can safely perform these limited operations:
 
 - Disable: `action=set_enabled`, canonical `symbol`, `enabled_json=false`.
 - Change budgets while disabled: `action=set_amounts`, canonical `symbol`, and
-  numeric `low_amount_gbp_json` / `up_amount_gbp_json` values.
-- Validate without writing: `action=dry_run`, canonical `symbol`, both numeric
-  LOW/UP inputs, and a target that is already disabled.
+  numeric `low_amount_gbp_json`, `mid_amount_gbp_json`, and
+  `up_amount_gbp_json` values.
+- Validate without writing: `action=dry_run`, canonical `symbol`, all three
+  numeric amount inputs, and a target that is already disabled.
 
 The workflow input `up_amount_gbp_json` is a compatibility name for the
 upper/higher endpoint.
@@ -285,9 +284,8 @@ Do not manually edit:
   and the durable Portfolio Compass ledger-delivery queue.
 - API keys or tokens in JSON, Discord, source files, or public logs.
 
-Changing either endpoint changes its mapped regime amount and can change the
-derived midpoint; every endpoint change invalidates that target's old decision
-fingerprint. Enabling or disabling changes the globally reviewed rules state.
+Changing any regime amount invalidates that target's old decision fingerprint.
+Enabling or disabling changes the globally reviewed rules state.
 Run fresh analysis after a budget change before trying to re-enable or trade.
 
 ## Adding or permanently removing a pair
@@ -357,8 +355,8 @@ These changes require a tested pull request and cannot be made through Discord:
 - Trend policy: [`crypto_analysis.py`](crypto_analysis.py#L229-L321).
 - Emergency uptrend override state is maintainer-only, remains auditable in
   `DCA_UPTREND_OVERRIDE_STATE` and `DCA_ANALYSIS_STATE`, and its analysis-driven
-  automatic release is gated on natural 10-close confirmation.
-- Regime-to-budget policy and midpoint rounding: [`dca_config.py`](dca_config.py).
+  automatic release is gated on natural 3-close confirmation.
+- Regime-to-budget policy: [`dca_config.py`](dca_config.py).
 - Best-time policy: [`crypto_analysis.py`](crypto_analysis.py#L423-L500).
 - Gemini explanation contract and model fallback:
   [`crypto_analysis.py`](crypto_analysis.py#L665-L688).

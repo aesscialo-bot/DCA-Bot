@@ -60,8 +60,10 @@ def ready_signals(analyzed_at):
         "DAILY_LAST_COMPLETE": daily_open.isoformat().replace("+00:00", "Z"),
         "DAILY_CLOSE": 105.0,
         "DAILY_PREVIOUS_CLOSE": 104.0,
+        "DAILY_TWO_DAYS_AGO_CLOSE": 103.0,
         "DAILY_SMA150": 100.0,
         "DAILY_PREVIOUS_SMA150": 99.0,
+        "DAILY_TWO_DAYS_AGO_SMA150": 98.0,
         "DAILY_EMA20": 102.0,
         "DAILY_EMA50": 100.0,
         "DAILY_PREVIOUS_EMA20": 101.0,
@@ -72,12 +74,13 @@ def ready_signals(analyzed_at):
         "SMA150_SLOPE_20D": 1.0,
         "TWO_DAY_ABOVE": True,
         "TWO_DAY_BELOW": False,
+        "THREE_DAY_BELOW": False,
         "WEEKLY_ABOVE": True,
         "WEEKLY_BELOW": False,
         "SLOPE_POSITIVE": True,
         "SLOPE_NEGATIVE": False,
-        "UPTREND_CONFIRMATION_REQUIRED": 10,
-        "UPTREND_CONFIRMATION_COUNT": 10,
+        "UPTREND_CONFIRMATION_REQUIRED": 3,
+        "UPTREND_CONFIRMATION_COUNT": 3,
         "UPTREND_CONFIRMED": True,
         "REGIME_WITHOUT_OVERRIDE": "UPTREND",
         "UPTREND_OVERRIDE_ACTIVE": False,
@@ -382,11 +385,12 @@ class DiscordBotControlTests(unittest.TestCase):
                 "action": "set_amounts",
                 "symbol": "ETH_GBP",
                 "low_amount_gbp_json": "10.0",
+                "mid_amount_gbp_json": "15",
                 "up_amount_gbp_json": "20.0",
             },
         )
         self.assertIn("atomic budgets", message.replies[-1])
-        self.assertIn("sideways midpoint £15", message.replies[-1])
+        self.assertIn("sideways £15", message.replies[-1])
         self.assertIn("`!dca analyze ETH`", message.replies[-1])
 
         enabled_rules = rules(enabled={"ETH_GBP"})
@@ -465,6 +469,15 @@ class DiscordBotControlTests(unittest.TestCase):
             )
         )
 
+    def test_budget_command_accepts_explicit_sideways_amount(self):
+        command = "!dca set BTC amounts to 5 low, 10 sideways, and 20 high"
+        self.assertIsNotNone(discord_bot._SET_EXPLICIT_AMOUNTS_RE.fullmatch(command))
+        message = MessageStub()
+        with patch.object(discord_bot, "handle_set_amounts") as handler:
+            handled = asyncio.run(discord_bot._handle_exact_dca_command(command, message))
+        self.assertTrue(handled)
+        handler.assert_called_once_with("BTC", "5", "20", message, mid_value="10")
+
     def test_disable_uses_serialized_writer_without_confirmation(self):
         message = MessageStub()
         with patch.object(discord_bot, "trigger_workflow", return_value=True) as dispatch:
@@ -488,7 +501,7 @@ class DiscordBotControlTests(unittest.TestCase):
             asyncio.run(discord_bot.handle_enable("BTC", message))
         reply = message.replies[-1]
         self.assertIn("UPTREND/lower: £10", reply)
-        self.assertIn("SIDEWAYS/midpoint: £15", reply)
+        self.assertIn("SIDEWAYS: £15", reply)
         self.assertIn("DOWNTREND/higher: £20", reply)
         self.assertIn("Maximum aggregate daily exposure", reply)
         self.assertIn("Kraken's current market minimum", reply)
@@ -703,7 +716,7 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("Kraken GBP-market DCA status", status_message.replies[-1])
         self.assertIn("BTC_GBP", status_message.replies[-1])
         self.assertIn("UPTREND/lower £10", status_message.replies[-1])
-        self.assertIn("SIDEWAYS/midpoint £15", status_message.replies[-1])
+        self.assertIn("SIDEWAYS £15", status_message.replies[-1])
         self.assertIn("DOWNTREND/higher £20", status_message.replies[-1])
         self.assertEqual(status_message.replies[-1].count("Data through:"), 3)
         self.assertIn("2026-08-05 10:45 +07", status_message.replies[-1])
@@ -784,8 +797,8 @@ class DiscordBotControlTests(unittest.TestCase):
     def test_status_summary_visibly_labels_active_uptrend_override(self):
         decision = deepcopy(self.analysis["TARGETS"]["BTC_GBP"])
         decision["SIGNALS"] = {
-            "UPTREND_CONFIRMATION_REQUIRED": 10,
-            "UPTREND_CONFIRMATION_COUNT": 3,
+            "UPTREND_CONFIRMATION_REQUIRED": 3,
+            "UPTREND_CONFIRMATION_COUNT": 2,
             "UPTREND_CONFIRMED": False,
             "REGIME_WITHOUT_OVERRIDE": "SIDEWAYS",
             "UPTREND_OVERRIDE_ACTIVE": True,
@@ -806,7 +819,7 @@ class DiscordBotControlTests(unittest.TestCase):
 
         self.assertIn("EMERGENCY UPTREND OVERRIDE ACTIVE", summary)
         self.assertIn("Rule result: `SIDEWAYS`", summary)
-        self.assertIn("Confirmation: `3/10`", summary)
+        self.assertIn("Confirmation: `2/3`", summary)
         self.assertIn("2026-08-23 09:30", summary)
         self.assertIn("Reviewed emergency allocation", summary)
 
@@ -1677,7 +1690,9 @@ class DiscordBotWorkflowAndGeminiTests(unittest.TestCase):
     def test_regime_explanation_describes_confirmation_and_visible_override(self):
         reply = discord_bot.CHAT_TOPIC_REPLIES["regimes"]
 
-        self.assertIn("10 consecutive completed daily", reply)
+        self.assertIn("3 consecutive completed daily", reply)
+        self.assertIn("first break returns SIDEWAYS", reply)
+        self.assertIn("Weekly EMA and SMA150 slope remain informational", reply)
         self.assertIn("each candle’s own SMA150", reply)
         self.assertIn("DOWNTREND keeps", reply)
         self.assertIn("emergency per-target override", reply)

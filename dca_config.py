@@ -29,9 +29,10 @@ TARGET_ROUTES = {
     "SOL_GBP": "DIRECT_GBP",
 }
 RULE_FIELDS = frozenset({"REGIME_AMOUNTS_GBP", "BUY_ENABLED"})
-REGIME_AMOUNT_FIELDS = frozenset({"LOW", "UP"})
+REGIME_AMOUNT_FIELDS = frozenset({"LOW", "MID", "UP"})
+LEGACY_REGIME_AMOUNT_FIELDS = frozenset({"LOW", "UP"})
 TIMING_POLICY_VERSION = (
-    "sma150-10-consecutive-closes-v1+multi-window-3-5-7-14-30-45-60-v2"
+    "sma150-3-close-responsive-v2+multi-window-3-5-7-14-30-45-60-v2"
 )
 UPTREND_OVERRIDE_STATE_VERSION = 1
 UPTREND_OVERRIDE_STATE_FIELDS = frozenset({"VERSION", "TARGETS"})
@@ -39,7 +40,7 @@ UPTREND_OVERRIDE_ENTRY_FIELDS = frozenset(
     {"ACTIVE", "ACTIVATED_AT", "RELEASED_AT", "REASON"}
 )
 MAX_UPTREND_OVERRIDE_REASON_CHARS = 200
-UPTREND_CONFIRMATION_CANDLES = 10
+UPTREND_CONFIRMATION_CANDLES = 3
 # Classifier metrics are persisted after round(..., 8), while their booleans
 # are computed from full-precision values. A pair of rounded metrics can move
 # their difference by at most 1e-8, so only larger contradictions are invalid.
@@ -49,8 +50,10 @@ ANALYSIS_READY_SIGNAL_FIELDS = frozenset(
         "DAILY_LAST_COMPLETE",
         "DAILY_CLOSE",
         "DAILY_PREVIOUS_CLOSE",
+        "DAILY_TWO_DAYS_AGO_CLOSE",
         "DAILY_SMA150",
         "DAILY_PREVIOUS_SMA150",
+        "DAILY_TWO_DAYS_AGO_SMA150",
         "DAILY_EMA20",
         "DAILY_EMA50",
         "DAILY_PREVIOUS_EMA20",
@@ -61,6 +64,7 @@ ANALYSIS_READY_SIGNAL_FIELDS = frozenset(
         "SMA150_SLOPE_20D",
         "TWO_DAY_ABOVE",
         "TWO_DAY_BELOW",
+        "THREE_DAY_BELOW",
         "WEEKLY_ABOVE",
         "WEEKLY_BELOW",
         "SLOPE_POSITIVE",
@@ -114,7 +118,7 @@ ANALYSIS_DECISION_FIELDS = frozenset(
     }
 )
 ANALYSIS_STATE_VERSION = 3
-AMOUNT_POLICY_VERSION = 2
+AMOUNT_POLICY_VERSION = 3
 GIST_DELIVERY_VERSION = 3
 MAX_PENDING_GIST_DELIVERIES = 16
 MAX_GIST_DELIVERY_ROW_BYTES = 2_048
@@ -244,6 +248,14 @@ def _minimum_for_target(
     return float(raw)
 
 
+def _derived_midpoint(low: int | float, up: int | float) -> int | float:
+    midpoint = (
+        (Decimal(str(low)) + Decimal(str(up))) / Decimal("2")
+    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    number = float(midpoint)
+    return int(number) if number.is_integer() else number
+
+
 def validate_target_map(
     value: str | Mapping[str, Any],
     market_minimums_gbp: Mapping[str, float] | Callable[[str], float | None] | None = None,
@@ -253,10 +265,11 @@ def validate_target_map(
     """Validate and normalize user-owned DCA rules.
 
     Disabled targets may use zero as an explicit unconfigured placeholder.
-    Enabled targets require both endpoints to be within £5–£1,000 and not below a
-        supplied live Kraken market minimum. Only the three production GBP-market
-        keys and the final two-field rule schema are accepted. All budget values
-        remain GBP-denominated.
+    Enabled targets require all three regime amounts to be within £5–£1,000 and
+    not below a supplied live Kraken market minimum. The explicit three-field
+    amount schema is canonical. The deployed two-field LOW/UP schema remains
+    readable during migration and is normalized with its former derived midpoint.
+    All budget values remain GBP-denominated.
     """
 
     raw_map = _json_object(value, "DCA_TARGET_MAP")
@@ -292,40 +305,45 @@ def validate_target_map(
                 f"DCA_TARGET_MAP.{target}.REGIME_AMOUNTS_GBP must be an object"
             )
         amounts = dict(amounts)
-        _unexpected_fields(
-            amounts,
-            REGIME_AMOUNT_FIELDS,
-            f"DCA_TARGET_MAP.{target}.REGIME_AMOUNTS_GBP",
-        )
+        amount_fields = frozenset(amounts)
+        if amount_fields not in {REGIME_AMOUNT_FIELDS, LEGACY_REGIME_AMOUNT_FIELDS}:
+            expected = "LOW, MID, and UP (or legacy LOW and UP during migration)"
+            raise ConfigError(
+                f"DCA_TARGET_MAP.{target}.REGIME_AMOUNTS_GBP must contain exactly {expected}"
+            )
         low = _amount(amounts["LOW"], f"{target}.REGIME_AMOUNTS_GBP.LOW")
         up = _amount(amounts["UP"], f"{target}.REGIME_AMOUNTS_GBP.UP")
-        if low > up:
+        mid = (
+            _amount(amounts["MID"], f"{target}.REGIME_AMOUNTS_GBP.MID")
+            if "MID" in amounts
+            else _derived_midpoint(low, up)
+        )
+        if low > mid or mid > up:
             raise ConfigError(
-                f"{target}.REGIME_AMOUNTS_GBP.LOW must not exceed UP; "
-                "LOW is the lower endpoint and UP is the upper endpoint"
+                f"{target}.REGIME_AMOUNTS_GBP must satisfy LOW <= MID <= UP"
             )
-        for tier, amount in (("LOW", low), ("UP", up)):
+        for tier, amount in (("LOW", low), ("MID", mid), ("UP", up)):
             if 0 < amount < MIN_ENABLED_AMOUNT_GBP:
                 raise ConfigError(
                     f"{target}.{tier} must be £0 while unconfigured or at least "
                     f"£{MIN_ENABLED_AMOUNT_GBP:.0f}"
                 )
         if enabled:
-            for tier, amount in (("LOW", low), ("UP", up)):
+            for tier, amount in (("LOW", low), ("MID", mid), ("UP", up)):
                 if amount < MIN_ENABLED_AMOUNT_GBP:
                     raise ConfigError(
                         f"{target}.{tier} must be at least £{MIN_ENABLED_AMOUNT_GBP:.0f} before enabling"
                     )
             market_minimum = _minimum_for_target(target, market_minimums_gbp)
             if market_minimum is not None:
-                for tier, amount in (("LOW", low), ("UP", up)):
+                for tier, amount in (("LOW", low), ("MID", mid), ("UP", up)):
                     if amount < market_minimum:
                         raise ConfigError(
                             f"{target}.{tier} £{amount:g} is below Kraken's current "
                             f"£{market_minimum:g} market minimum"
                         )
         normalized[target] = {
-            "REGIME_AMOUNTS_GBP": {"LOW": low, "UP": up},
+            "REGIME_AMOUNTS_GBP": {"LOW": low, "MID": mid, "UP": up},
             "BUY_ENABLED": enabled,
         }
     return normalized
@@ -381,13 +399,7 @@ def amount_tier_for_regime(regime: str) -> str:
 
 
 def amount_for_tier_gbp(rule: Mapping[str, Any], tier: str) -> int | float:
-    """Return a lower, midpoint, or higher GBP budget.
-
-    The persisted ``UP`` field is retained as the upper configured endpoint for
-    backwards compatibility; it no longer means that an uptrend selects it.
-    ``MID`` is the arithmetic midpoint rounded to the nearest penny with
-    conventional half-up currency rounding.
-    """
+    """Return the explicit lower, sideways, or higher GBP budget."""
 
     if tier not in AMOUNT_TIERS:
         raise ConfigError(f"Unsupported amount tier: {tier}")
@@ -400,12 +412,7 @@ def amount_for_tier_gbp(rule: Mapping[str, Any], tier: str) -> int | float:
         return amounts["LOW"]
     if tier == "HIGH":
         return amounts["UP"]
-    midpoint = (
-        (Decimal(str(amounts["LOW"])) + Decimal(str(amounts["UP"])))
-        / Decimal("2")
-    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    number = float(midpoint)
-    return int(number) if number.is_integer() else number
+    return amounts["MID"]
 
 
 def effective_amount_gbp(rule: Mapping[str, Any], regime: str) -> int | float:
@@ -984,8 +991,10 @@ def _validate_ready_analysis_signals(
     positive_fields = (
         "DAILY_CLOSE",
         "DAILY_PREVIOUS_CLOSE",
+        "DAILY_TWO_DAYS_AGO_CLOSE",
         "DAILY_SMA150",
         "DAILY_PREVIOUS_SMA150",
+        "DAILY_TWO_DAYS_AGO_SMA150",
         "DAILY_EMA20",
         "DAILY_EMA50",
         "DAILY_PREVIOUS_EMA20",
@@ -1006,6 +1015,7 @@ def _validate_ready_analysis_signals(
     classifier_boolean_fields = (
         "TWO_DAY_ABOVE",
         "TWO_DAY_BELOW",
+        "THREE_DAY_BELOW",
         "WEEKLY_ABOVE",
         "WEEKLY_BELOW",
         "SLOPE_POSITIVE",
@@ -1036,6 +1046,7 @@ def _validate_ready_analysis_signals(
 
     mutually_exclusive_pairs = (
         ("TWO_DAY_ABOVE", "TWO_DAY_BELOW"),
+        ("TWO_DAY_ABOVE", "THREE_DAY_BELOW"),
         ("WEEKLY_ABOVE", "WEEKLY_BELOW"),
         ("SLOPE_POSITIVE", "SLOPE_NEGATIVE"),
     )
@@ -1077,6 +1088,26 @@ def _validate_ready_analysis_signals(
     ):
         raise ConfigError(
             f"{signal_label}.TWO_DAY_BELOW must be true for the persisted daily metrics"
+        )
+
+    three_day_price_deltas = (
+        numbers["DAILY_CLOSE"] - numbers["DAILY_SMA150"],
+        numbers["DAILY_PREVIOUS_CLOSE"]
+        - numbers["DAILY_PREVIOUS_SMA150"],
+        numbers["DAILY_TWO_DAYS_AGO_CLOSE"]
+        - numbers["DAILY_TWO_DAYS_AGO_SMA150"],
+    )
+    if signals["THREE_DAY_BELOW"] and any(
+        delta > tolerance for delta in three_day_price_deltas
+    ):
+        raise ConfigError(
+            f"{signal_label}.THREE_DAY_BELOW contradicts the persisted daily metrics"
+        )
+    if not signals["THREE_DAY_BELOW"] and all(
+        delta < -tolerance for delta in three_day_price_deltas
+    ):
+        raise ConfigError(
+            f"{signal_label}.THREE_DAY_BELOW must be true for the persisted daily metrics"
         )
 
     weekly_delta = numbers["WEEKLY_CLOSE"] - numbers["WEEKLY_EMA20"]
@@ -1123,6 +1154,10 @@ def _validate_ready_analysis_signals(
         raise ConfigError(
             f"{signal_label}.TWO_DAY_BELOW requires zero confirming closes"
         )
+    if signals["THREE_DAY_BELOW"] and count > 0:
+        raise ConfigError(
+            f"{signal_label}.THREE_DAY_BELOW requires zero confirming closes"
+        )
 
     audit = _validate_override_signal_audit(
         signals,
@@ -1134,9 +1169,8 @@ def _validate_ready_analysis_signals(
         raise ConfigError(f"{signal_label} override audit fields are required")
     normal_regime = audit["normal_regime"]
     downtrend_confirmed = bool(
-        signals["TWO_DAY_BELOW"]
-        and signals["WEEKLY_BELOW"]
-        and signals["SLOPE_NEGATIVE"]
+        signals["THREE_DAY_BELOW"]
+        and numbers["DAILY_EMA20"] < numbers["DAILY_EMA50"]
     )
     expected_normal_regime = (
         "UPTREND"
@@ -1706,7 +1740,7 @@ def default_rules_map() -> dict[str, dict[str, Any]]:
 
     return {
         target: {
-            "REGIME_AMOUNTS_GBP": {"LOW": 0, "UP": 0},
+            "REGIME_AMOUNTS_GBP": {"LOW": 0, "MID": 0, "UP": 0},
             "BUY_ENABLED": False,
         }
         for target in TARGET_KEYS

@@ -271,7 +271,7 @@ def classify_trend(
             f"Weekly market data is insufficient: {len(weekly)} completed candles; "
             f"need {MIN_WEEKLY_CANDLES}"
         )
-    # Indicators and the two-candle confirmation must never bridge a missing
+    # Indicators and the three-candle confirmation must never bridge a missing
     # Kraken period. Only the latest data that participates in the decision is
     # required, preserving harmless older history while failing closed on a
     # recent daily or weekly gap.
@@ -311,6 +311,7 @@ def classify_trend(
 
     current = daily.iloc[-1]
     previous = daily.iloc[-2]
+    two_days_ago = daily.iloc[-3]
     slope_start = daily.iloc[-21]["sma150"]
     slope_end = current["sma150"]
     if pd.isna(slope_start) or pd.isna(slope_end):
@@ -329,6 +330,11 @@ def classify_trend(
         and previous["close"] < previous["sma150"]
         and previous["ema20"] < previous["ema50"]
     )
+    three_day_below = bool(
+        current["close"] < current["sma150"]
+        and previous["close"] < previous["sma150"]
+        and two_days_ago["close"] < two_days_ago["sma150"]
+    )
     weekly_above = bool(weekly_current["close"] > weekly_current["ema20"])
     weekly_below = bool(weekly_current["close"] < weekly_current["ema20"])
     slope = float(slope_end - slope_start)
@@ -345,7 +351,7 @@ def classify_trend(
 
     if uptrend_confirmed:
         regime = "UPTREND"
-    elif two_day_below and weekly_below and slope_negative:
+    elif three_day_below and current["ema20"] < current["ema50"]:
         regime = "DOWNTREND"
     else:
         regime = "SIDEWAYS"
@@ -354,8 +360,12 @@ def classify_trend(
         "DAILY_LAST_COMPLETE": _iso_utc(current["ts"].to_pydatetime()),
         "DAILY_CLOSE": round(float(current["close"]), 8),
         "DAILY_PREVIOUS_CLOSE": round(float(previous["close"]), 8),
+        "DAILY_TWO_DAYS_AGO_CLOSE": round(float(two_days_ago["close"]), 8),
         "DAILY_SMA150": round(float(current["sma150"]), 8),
         "DAILY_PREVIOUS_SMA150": round(float(previous["sma150"]), 8),
+        "DAILY_TWO_DAYS_AGO_SMA150": round(
+            float(two_days_ago["sma150"]), 8
+        ),
         "DAILY_EMA20": round(float(current["ema20"]), 8),
         "DAILY_EMA50": round(float(current["ema50"]), 8),
         "DAILY_PREVIOUS_EMA20": round(float(previous["ema20"]), 8),
@@ -366,6 +376,7 @@ def classify_trend(
         "SMA150_SLOPE_20D": round(slope, 8),
         "TWO_DAY_ABOVE": two_day_above,
         "TWO_DAY_BELOW": two_day_below,
+        "THREE_DAY_BELOW": three_day_below,
         "WEEKLY_ABOVE": weekly_above,
         "WEEKLY_BELOW": weekly_below,
         "SLOPE_POSITIVE": slope_positive,
@@ -928,8 +939,8 @@ def _decision_report(target: str, decision: Mapping[str, Any], rule: Mapping[str
             )
         elif signals.get("UPTREND_OVERRIDE_AUTO_RELEASED") is True:
             override_line = (
-                "Emergency override: `AUTO-RELEASED`; natural 10-close "
-                "UPTREND confirmed\n"
+                "Emergency override: `AUTO-RELEASED`; natural "
+                f"{UPTREND_CONFIRMATION_CANDLES}-close UPTREND confirmed\n"
             )
     return (
         f"📊 **{target} daily decision**\n"

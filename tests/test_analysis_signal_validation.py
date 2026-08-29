@@ -13,8 +13,10 @@ def ready_signals(regime="SIDEWAYS", override="none"):
         "DAILY_LAST_COMPLETE": "2026-08-22T00:00:00Z",
         "DAILY_CLOSE": 105.0,
         "DAILY_PREVIOUS_CLOSE": 104.0,
+        "DAILY_TWO_DAYS_AGO_CLOSE": 97.0,
         "DAILY_SMA150": 100.0,
         "DAILY_PREVIOUS_SMA150": 99.0,
+        "DAILY_TWO_DAYS_AGO_SMA150": 98.0,
         "DAILY_EMA20": 90.0,
         "DAILY_EMA50": 95.0,
         "DAILY_PREVIOUS_EMA20": 89.0,
@@ -25,12 +27,13 @@ def ready_signals(regime="SIDEWAYS", override="none"):
         "SMA150_SLOPE_20D": -1.0,
         "TWO_DAY_ABOVE": False,
         "TWO_DAY_BELOW": False,
+        "THREE_DAY_BELOW": False,
         "WEEKLY_ABOVE": True,
         "WEEKLY_BELOW": False,
         "SLOPE_POSITIVE": False,
         "SLOPE_NEGATIVE": True,
-        "UPTREND_CONFIRMATION_REQUIRED": 10,
-        "UPTREND_CONFIRMATION_COUNT": 3,
+        "UPTREND_CONFIRMATION_REQUIRED": 3,
+        "UPTREND_CONFIRMATION_COUNT": 2,
         "UPTREND_CONFIRMED": False,
         "REGIME_WITHOUT_OVERRIDE": regime,
         "UPTREND_OVERRIDE_ACTIVE": False,
@@ -45,7 +48,9 @@ def ready_signals(regime="SIDEWAYS", override="none"):
             {
                 "DAILY_CLOSE": 90.0,
                 "DAILY_PREVIOUS_CLOSE": 89.0,
+                "DAILY_TWO_DAYS_AGO_CLOSE": 88.0,
                 "TWO_DAY_BELOW": True,
+                "THREE_DAY_BELOW": True,
                 "WEEKLY_CLOSE": 90.0,
                 "WEEKLY_ABOVE": False,
                 "WEEKLY_BELOW": True,
@@ -55,7 +60,8 @@ def ready_signals(regime="SIDEWAYS", override="none"):
     elif regime == "UPTREND":
         signals.update(
             {
-                "UPTREND_CONFIRMATION_COUNT": 10,
+                "DAILY_TWO_DAYS_AGO_CLOSE": 103.0,
+                "UPTREND_CONFIRMATION_COUNT": 3,
                 "UPTREND_CONFIRMED": True,
             }
         )
@@ -146,10 +152,10 @@ class ReadyAnalysisSignalValidationTests(unittest.TestCase):
             ("DAILY_CLOSE", float("inf"), "finite number"),
             ("DAILY_SMA150", 0, "greater than zero"),
             ("TWO_DAY_ABOVE", 1, "must be a boolean"),
-            ("UPTREND_CONFIRMATION_REQUIRED", True, "must be 10"),
+            ("UPTREND_CONFIRMATION_REQUIRED", True, "must be 3"),
             ("UPTREND_CONFIRMATION_COUNT", True, "must be an integer"),
-            ("UPTREND_CONFIRMATION_COUNT", -1, "between 0 and 10"),
-            ("UPTREND_CONFIRMATION_COUNT", 11, "between 0 and 10"),
+            ("UPTREND_CONFIRMATION_COUNT", -1, "between 0 and 3"),
+            ("UPTREND_CONFIRMATION_COUNT", 4, "between 0 and 3"),
         )
         for field, value, error in mutations:
             with self.subTest(field=field, value=value):
@@ -206,11 +212,24 @@ class ReadyAnalysisSignalValidationTests(unittest.TestCase):
             self.validate(decision)
 
         decision = ready_decision("DOWNTREND")
-        decision["SIGNALS"]["WEEKLY_CLOSE"] = 110.0
-        decision["SIGNALS"]["WEEKLY_ABOVE"] = True
-        decision["SIGNALS"]["WEEKLY_BELOW"] = False
+        decision["SIGNALS"]["DAILY_EMA20"] = 110.0
+        decision["SIGNALS"]["TWO_DAY_BELOW"] = False
         with self.assertRaisesRegex(ValueError, "does not match classifier signals"):
             self.validate(decision)
+
+    def test_weekly_and_slope_signals_are_informational_for_downtrend(self):
+        decision = ready_decision("DOWNTREND")
+        decision["SIGNALS"].update(
+            {
+                "WEEKLY_CLOSE": 110.0,
+                "WEEKLY_ABOVE": True,
+                "WEEKLY_BELOW": False,
+                "SMA150_SLOPE_20D": 1.0,
+                "SLOPE_POSITIVE": True,
+                "SLOPE_NEGATIVE": False,
+            }
+        )
+        self.validate(decision)
 
     def test_classifier_booleans_cannot_contradict_rounded_metrics(self):
         mutations = (
