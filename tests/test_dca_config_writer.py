@@ -10,8 +10,10 @@ def ready_signals():
         "DAILY_LAST_COMPLETE": "2026-08-04T00:00:00Z",
         "DAILY_CLOSE": 105.0,
         "DAILY_PREVIOUS_CLOSE": 104.0,
+        "DAILY_TWO_DAYS_AGO_CLOSE": 97.0,
         "DAILY_SMA150": 100.0,
         "DAILY_PREVIOUS_SMA150": 99.0,
+        "DAILY_TWO_DAYS_AGO_SMA150": 98.0,
         "DAILY_EMA20": 90.0,
         "DAILY_EMA50": 95.0,
         "DAILY_PREVIOUS_EMA20": 89.0,
@@ -22,12 +24,13 @@ def ready_signals():
         "SMA150_SLOPE_20D": -1.0,
         "TWO_DAY_ABOVE": False,
         "TWO_DAY_BELOW": False,
+        "THREE_DAY_BELOW": False,
         "WEEKLY_ABOVE": True,
         "WEEKLY_BELOW": False,
         "SLOPE_POSITIVE": False,
         "SLOPE_NEGATIVE": True,
-        "UPTREND_CONFIRMATION_REQUIRED": 10,
-        "UPTREND_CONFIRMATION_COUNT": 3,
+        "UPTREND_CONFIRMATION_REQUIRED": 3,
+        "UPTREND_CONFIRMATION_COUNT": 2,
         "UPTREND_CONFIRMED": False,
         "REGIME_WITHOUT_OVERRIDE": "SIDEWAYS",
         "UPTREND_OVERRIDE_ACTIVE": False,
@@ -63,16 +66,20 @@ class DcaConfigWriterTests(unittest.TestCase):
         )
         return state
 
-    def test_budget_update_changes_both_tiers_atomically(self):
+    def test_budget_update_changes_all_tiers_atomically(self):
         updated, should_write = apply_change(
             self.rules,
             action="set_amounts",
             symbol="BTC_GBP",
             low_amount_gbp_json="10",
+            mid_amount_gbp_json="12",
             up_amount_gbp_json="20",
         )
         self.assertTrue(should_write)
-        self.assertEqual(updated["BTC_GBP"]["REGIME_AMOUNTS_GBP"], {"LOW": 10, "UP": 20})
+        self.assertEqual(
+            updated["BTC_GBP"]["REGIME_AMOUNTS_GBP"],
+            {"LOW": 10, "MID": 12, "UP": 20},
+        )
 
     def test_budget_update_rejects_enabled_target(self):
         self.rules["BTC_GBP"] = {
@@ -89,12 +96,13 @@ class DcaConfigWriterTests(unittest.TestCase):
             )
 
     def test_budget_update_rejects_inverted_or_overprecise_endpoints(self):
-        with self.assertRaisesRegex(ValueError, "LOW must not exceed UP"):
+        with self.assertRaisesRegex(ValueError, "LOW <= MID <= UP"):
             apply_change(
                 self.rules,
                 action="set_amounts",
                 symbol="BTC_GBP",
                 low_amount_gbp_json="20",
+                mid_amount_gbp_json="15",
                 up_amount_gbp_json="10",
             )
         with self.assertRaisesRegex(ValueError, "no more than two decimal places"):

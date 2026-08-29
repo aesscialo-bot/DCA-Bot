@@ -41,8 +41,10 @@ def ready_signals(regime, analyzed_at):
         "DAILY_LAST_COMPLETE": daily_open.isoformat().replace("+00:00", "Z"),
         "DAILY_CLOSE": 105.0,
         "DAILY_PREVIOUS_CLOSE": 104.0,
+        "DAILY_TWO_DAYS_AGO_CLOSE": 97.0,
         "DAILY_SMA150": 100.0,
         "DAILY_PREVIOUS_SMA150": 99.0,
+        "DAILY_TWO_DAYS_AGO_SMA150": 98.0,
         "DAILY_EMA20": 90.0,
         "DAILY_EMA50": 95.0,
         "DAILY_PREVIOUS_EMA20": 89.0,
@@ -53,12 +55,13 @@ def ready_signals(regime, analyzed_at):
         "SMA150_SLOPE_20D": -1.0,
         "TWO_DAY_ABOVE": False,
         "TWO_DAY_BELOW": False,
+        "THREE_DAY_BELOW": False,
         "WEEKLY_ABOVE": True,
         "WEEKLY_BELOW": False,
         "SLOPE_POSITIVE": False,
         "SLOPE_NEGATIVE": True,
-        "UPTREND_CONFIRMATION_REQUIRED": 10,
-        "UPTREND_CONFIRMATION_COUNT": 3,
+        "UPTREND_CONFIRMATION_REQUIRED": 3,
+        "UPTREND_CONFIRMATION_COUNT": 2,
         "UPTREND_CONFIRMED": False,
         "REGIME_WITHOUT_OVERRIDE": regime,
         "UPTREND_OVERRIDE_ACTIVE": False,
@@ -71,7 +74,8 @@ def ready_signals(regime, analyzed_at):
     if regime == "UPTREND":
         signals.update(
             {
-                "UPTREND_CONFIRMATION_COUNT": 10,
+                "DAILY_TWO_DAYS_AGO_CLOSE": 103.0,
+                "UPTREND_CONFIRMATION_COUNT": 3,
                 "UPTREND_CONFIRMED": True,
             }
         )
@@ -80,7 +84,9 @@ def ready_signals(regime, analyzed_at):
             {
                 "DAILY_CLOSE": 90.0,
                 "DAILY_PREVIOUS_CLOSE": 89.0,
+                "DAILY_TWO_DAYS_AGO_CLOSE": 88.0,
                 "TWO_DAY_BELOW": True,
+                "THREE_DAY_BELOW": True,
                 "WEEKLY_CLOSE": 90.0,
                 "WEEKLY_ABOVE": False,
                 "WEEKLY_BELOW": True,
@@ -180,7 +186,10 @@ class DcaConfigurationTests(unittest.TestCase):
 
         config = crypto_dca.get_config_for_symbol("BTC_GBP", rules, state)
 
-        self.assertEqual(config["REGIME_AMOUNTS_GBP"], {"LOW": 10, "UP": 20})
+        self.assertEqual(
+            config["REGIME_AMOUNTS_GBP"],
+            {"LOW": 10, "MID": 15, "UP": 20},
+        )
         self.assertEqual(config["LAST_BUY_DATE"], "2026-08-04")
         self.assertTrue(config["BUY_ENABLED"])
 

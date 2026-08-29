@@ -43,8 +43,10 @@ def ready_sideways_signals():
         "DAILY_LAST_COMPLETE": "2026-08-11T00:00:00Z",
         "DAILY_CLOSE": 105.0,
         "DAILY_PREVIOUS_CLOSE": 104.0,
+        "DAILY_TWO_DAYS_AGO_CLOSE": 97.0,
         "DAILY_SMA150": 100.0,
         "DAILY_PREVIOUS_SMA150": 99.0,
+        "DAILY_TWO_DAYS_AGO_SMA150": 98.0,
         "DAILY_EMA20": 90.0,
         "DAILY_EMA50": 95.0,
         "DAILY_PREVIOUS_EMA20": 89.0,
@@ -55,12 +57,13 @@ def ready_sideways_signals():
         "SMA150_SLOPE_20D": -1.0,
         "TWO_DAY_ABOVE": False,
         "TWO_DAY_BELOW": False,
+        "THREE_DAY_BELOW": False,
         "WEEKLY_ABOVE": True,
         "WEEKLY_BELOW": False,
         "SLOPE_POSITIVE": False,
         "SLOPE_NEGATIVE": True,
-        "UPTREND_CONFIRMATION_REQUIRED": 10,
-        "UPTREND_CONFIRMATION_COUNT": 3,
+        "UPTREND_CONFIRMATION_REQUIRED": 3,
+        "UPTREND_CONFIRMATION_COUNT": 2,
         "UPTREND_CONFIRMED": False,
         "REGIME_WITHOUT_OVERRIDE": "SIDEWAYS",
         "UPTREND_OVERRIDE_ACTIVE": False,
@@ -88,7 +91,7 @@ class TargetMigrationTests(unittest.TestCase):
         )
         self.assertEqual(
             result["DCA_TARGET_MAP"]["ETH_GBP"]["REGIME_AMOUNTS_GBP"],
-            {"LOW": 12.5, "UP": 18.75},
+            {"LOW": 12.5, "MID": 15.63, "UP": 18.75},
         )
         self.assertFalse(result["DCA_TARGET_MAP"]["ETH_GBP"]["BUY_ENABLED"])
         self.assertEqual(

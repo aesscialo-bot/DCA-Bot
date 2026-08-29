@@ -561,11 +561,12 @@ CHAT_TOPIC_REPLIES = {
         "budget tier; DCA reduces timing concentration but cannot remove crypto risk."
     ),
     "regimes": (
-        "🧭 UPTREND requires the latest 10 consecutive completed daily Kraken "
-        "closes to be above each candle’s own SMA150. DOWNTREND keeps the "
-        "two-day EMA, weekly EMA, and falling-SMA confirmation; every other "
-        "valid result is SIDEWAYS. An emergency per-target override is visibly "
-        "labelled in status until the 10-close rule confirms naturally."
+        "🧭 UPTREND requires the latest 3 consecutive completed daily Kraken "
+        "closes above each candle’s own SMA150. The first break returns SIDEWAYS; "
+        "DOWNTREND requires 3 closes below their SMA150 values plus a bearish "
+        "latest EMA20/EMA50, and DOWNTREND keeps the configured higher purchase "
+        "tier. Weekly EMA and SMA150 slope remain informational. An emergency "
+        "per-target override remains visibly labelled until the 3-close rule confirms."
     ),
     "timing": (
         "⏰ Daily analysis compares 3/5/7/14/30/45/60-day windows in 15-minute "
@@ -746,8 +747,10 @@ async def handle_set_amounts(
     low_value: Any,
     high_value: Any,
     message: discord.Message,
+    *,
+    mid_value: Any | None = None,
 ) -> None:
-    """Atomically queue both user budgets; edits require a disabled target."""
+    """Atomically queue all regime budgets; edits require a disabled target."""
 
     if not _is_authorized_config_writer(message):
         await message.reply("Blocked: this write requires an allowlisted Discord user.")
@@ -758,6 +761,18 @@ async def handle_set_amounts(
         high = _parse_amount(high_value, "higher amount")
         if low > high:
             raise ValueError("the lower amount must not exceed the higher amount")
+        if mid_value is None:
+            mid = amount_for_tier_gbp(
+                {
+                    "REGIME_AMOUNTS_GBP": {"LOW": low, "UP": high},
+                    "BUY_ENABLED": False,
+                },
+                "MID",
+            )
+        else:
+            mid = _parse_amount(mid_value, "sideways amount")
+        if low > mid or mid > high:
+            raise ValueError("the amounts must satisfy low <= sideways <= high")
     except ValueError as exc:
         await message.reply(f"Invalid request: {exc}")
         return
@@ -778,21 +793,15 @@ async def handle_set_amounts(
         "action": "set_amounts",
         "symbol": symbol,
         "low_amount_gbp_json": json.dumps(low, separators=(",", ":")),
+        "mid_amount_gbp_json": json.dumps(mid, separators=(",", ":")),
         # This compatibility-named workflow input stores the upper endpoint;
         # it no longer means that an uptrend selects the amount.
         "up_amount_gbp_json": json.dumps(high, separators=(",", ":")),
     }
     if await asyncio.to_thread(trigger_workflow, "update_dca_config.yml", inputs):
-        midpoint = amount_for_tier_gbp(
-            {
-                "REGIME_AMOUNTS_GBP": {"LOW": low, "UP": high},
-                "BUY_ENABLED": False,
-            },
-            "MID",
-        )
         await message.reply(
             f"Queued atomic budgets for **{symbol}**: lower {_display_amount(low)}, "
-            f"sideways midpoint {_display_amount(midpoint)}, higher "
+            f"sideways {_display_amount(mid)}, higher "
             f"{_display_amount(high)}. Run `!dca analyze {symbol.split('_', 1)[0]}` "
             "after the workflow completes."
         )
@@ -844,8 +853,13 @@ def _enable_review(
     if rule["BUY_ENABLED"]:
         raise ConfigError(f"{symbol} is already enabled")
     amounts = rule["REGIME_AMOUNTS_GBP"]
-    for tier in ("LOW", "UP"):
-        amount = float(amounts[tier])
+    tier_amounts = {
+        "LOW": amount_for_tier_gbp(rule, "LOW"),
+        "MID": amount_for_tier_gbp(rule, "MID"),
+        "UP": amount_for_tier_gbp(rule, "HIGH"),
+    }
+    for tier, configured_amount in tier_amounts.items():
+        amount = float(configured_amount)
         if not DCA_AMOUNT_MIN_GBP <= amount <= DCA_AMOUNT_MAX_GBP:
             raise ConfigError(
                 f"{symbol} {tier} must be between £{DCA_AMOUNT_MIN_GBP:g} "
@@ -900,7 +914,7 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
     await message.reply(
         f"**Enable review for {symbol}**\n"
         f"UPTREND/lower: {_display_amount(review['low'])} | "
-        f"SIDEWAYS/midpoint: {_display_amount(review['mid'])} | "
+        f"SIDEWAYS: {_display_amount(review['mid'])} | "
         f"DOWNTREND/higher: {_display_amount(review['high'])}\n"
         f"Maximum aggregate daily exposure after enable: "
         f"**{_display_amount(review['maximum_exposure'])}**\n"
@@ -1341,7 +1355,7 @@ def _decision_summary(
         f"{configured_icon} **{_pair_label(symbol)}** (`{symbol}`) | Configured: "
         f"**{configured_status}** | Orders: **{permission}**\n"
         f"  💷 UPTREND/lower "
-        f"{_display_amount(amounts['LOW'])} | SIDEWAYS/midpoint "
+        f"{_display_amount(amounts['LOW'])} | SIDEWAYS "
         f"{_display_amount(amount_for_tier_gbp(rule, 'MID'))} | DOWNTREND/higher "
         f"{_display_amount(amounts['UP'])}\n"
         f"  📊 Analysis: {decision_status} | Regime: `{regime}` | Spend: {amount} | "
@@ -1743,7 +1757,7 @@ Markets: **BTC/GBP**, **ETH/GBP**, and **SOL/GBP**. Budgets are in GBP.
 `!dca analyze all` — analyze all three pairs
 
 💷 **Change a budget** *(disable the pair first)*
-`!dca set BTC amounts to 12.50 low and 25 high`
+`!dca set BTC amounts to 5 low, 10 sideways, and 20 high`
 
 ⏸️ **Disable or review-enable a pair**
 `!dca disable BTC`
@@ -2227,6 +2241,12 @@ _SET_AMOUNTS_RE = re.compile(
     r"([0-9]+(?:\.[0-9]{1,2})?) low and "
     r"([0-9]+(?:\.[0-9]{1,2})?) (?:high|up)$"
 )
+_SET_EXPLICIT_AMOUNTS_RE = re.compile(
+    r"^!dca set ([A-Za-z]+) amounts to "
+    r"([0-9]+(?:\.[0-9]{1,2})?) low, "
+    r"([0-9]+(?:\.[0-9]{1,2})?) sideways, and "
+    r"([0-9]+(?:\.[0-9]{1,2})?) (?:high|up)$"
+)
 _DISABLE_RE = re.compile(r"^!dca disable ([A-Za-z]+)$")
 _ENABLE_RE = re.compile(r"^!dca enable ([A-Za-z]+)$")
 _ANALYZE_RE = re.compile(r"^!dca analyze (all|[A-Za-z]+)$")
@@ -2247,6 +2267,16 @@ async def _handle_exact_dca_command(text: str, message: discord.Message) -> bool
         return True
     if text.startswith("!dca confirm"):
         await _handle_enable_confirmation(message, text)
+        return True
+    match = _SET_EXPLICIT_AMOUNTS_RE.fullmatch(text)
+    if match:
+        await handle_set_amounts(
+            match.group(1),
+            match.group(2),
+            match.group(4),
+            message,
+            mid_value=match.group(3),
+        )
         return True
     match = _SET_AMOUNTS_RE.fullmatch(text)
     if match:

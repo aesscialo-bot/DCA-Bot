@@ -37,33 +37,32 @@ date, the trader fails closed without creating a Kraken order. Check live
 operation with `show status` and `!dca health` rather than treating this static
 baseline as current runtime state.
 
-The guarded cutover carries these budget endpoints forward and leaves every
-target disabled. Re-enable desired pairs only after fresh verified analysis:
+The approved counter-cyclical budgets are explicit for every regime:
 
 ```json
 {
   "BTC_GBP": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 25},
-    "BUY_ENABLED": false
+    "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 20},
+    "BUY_ENABLED": true
   },
   "ETH_GBP": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 18.75},
-    "BUY_ENABLED": false
+    "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
+    "BUY_ENABLED": true
   },
   "SOL_GBP": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 12.5, "UP": 18.75},
-    "BUY_ENABLED": false
+    "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
+    "BUY_ENABLED": true
   }
 }
 ```
 
-The stored `LOW` and `UP` fields are the lower and upper budget endpoints; the
-`UP` field name is retained for configuration compatibility and no longer means
-"use this in an uptrend." The counter-cyclical policy is:
+`LOW`, `MID`, and compatibility-named `UP` store the uptrend, sideways, and
+downtrend budgets respectively. `UP` does not mean "use this in an uptrend."
+The counter-cyclical policy is:
 
-- `DOWNTREND` → higher endpoint: BTC £25, ETH £18.75, SOL £18.75; £62.50 aggregate.
-- `SIDEWAYS` → midpoint: BTC £18.75, ETH £15.63, SOL £15.63; £50.01 aggregate.
-- `UPTREND` → lower endpoint: BTC £12.50, ETH £12.50, SOL £12.50; £37.50 aggregate.
+- `DOWNTREND` → higher amount: BTC £20, ETH £15, SOL £15; £50 aggregate.
+- `SIDEWAYS` → explicit middle amount: £10 each; £30 aggregate.
+- `UPTREND` → lower amount: £5 each; £15 aggregate.
 
 Each enabled asset can buy at most once per Bangkok calendar day.
 
@@ -72,7 +71,7 @@ Each enabled asset can buy at most once per Bangkok calendar day.
 ```mermaid
 flowchart TD
     A["04:07 primary / 04:37 recovery"] --> B["Refresh first-party Kraken trade history"]
-    B --> C["Confirm 10-close uptrend or multi-factor downtrend"]
+    B --> C["Classify from responsive 3-close SMA150 rules"]
     C --> D["Select GBP budget and best 15-minute execution time"]
     D --> E["Write fresh DCA_ANALYSIS_STATE"]
     E --> F["Railway scheduler watches absolute execution times"]
@@ -104,21 +103,20 @@ Between local midnight and 04:20, one complete prior-day state is reported as
 awaiting the scheduled analysis: old decisions stay blocked, pending orders
 still reconcile, and the normal rollover does not raise an incident alert.
 
-- `UPTREND`: each of the latest 10 consecutive completed daily closes is
+- `UPTREND`: each of the latest 3 consecutive completed daily closes is
   strictly above the SMA150 calculated for that same candle. A close is not
   compared with today's SMA150 retroactively.
-- `DOWNTREND`: the latest two completed daily closes are below their respective
-  SMA150 values with EMA20 below EMA50 on both days, the latest completed weekly
-  close is below weekly EMA20, and the 20-day SMA150 slope is negative.
-- `SIDEWAYS`: every other valid normal result, including an above-SMA150 streak
-  shorter than 10 closes.
+- `DOWNTREND`: the latest 3 completed daily closes are below their respective
+  SMA150 values and the latest daily EMA20 is below EMA50.
+- `SIDEWAYS`: every other valid normal result. The first completed close that
+  breaks an uptrend's three-close condition therefore reacts within one day;
+  three qualifying closes can confirm either directional regime within three.
 - `DOWNTREND` selects `HIGH`, `SIDEWAYS` selects `MID`, and `UPTREND`
   selects `LOW`.
 
-The normal classifier still requires at least 170 consecutive completed daily
-candles and 20 completed weekly candles. Those bounds support the existing
-downtrend slope and weekly confirmation as well as the new 10-close uptrend
-confirmation.
+The classifier still requires at least 170 consecutive completed daily candles
+and 20 completed weekly candles. Weekly EMA and 20-day SMA150 slope remain
+persisted informational signals but are no longer downtrend gates.
 
 An active entry in the optional `DCA_UPTREND_OVERRIDE_STATE` repository variable
 has absolute precedence and temporarily makes that target's effective regime
@@ -127,7 +125,7 @@ audited emergency control, not another market signal. Every decision records
 the normal result, confirmation progress, active/applied override flags, reason,
 and activation/release timestamps. Discord status visibly labels an active
 override. While `ACTIVE=true`, the override has absolute precedence. The
-analysis workflow's automatic release path runs only after the normal 10-close
+analysis workflow's automatic release path runs only after the normal 3-close
 rule confirms. Maintainers with repository-variable write access can technically
 deactivate or remove an override; that is an out-of-band break-glass production
 change, not proof of natural confirmation. Gemini and routine Discord commands
@@ -139,9 +137,9 @@ analysis decision exactly. A changed, removed, malformed, or unavailable
 override blocks new orders. Existing durable pending intents remain
 reconciliation-only so recovery never creates a replacement order.
 
-`MID` is derived from the two configured endpoints as `(LOW + UP) / 2` and is
-rounded to the nearest penny using half-up currency rounding. The configured
-lower endpoint cannot exceed the upper endpoint.
+The canonical rule stores explicit `LOW`, `MID`, and `UP` amounts and requires
+`LOW <= MID <= UP`. The legacy two-field form remains readable only for rollout
+compatibility and is normalized with its former half-up midpoint.
 
 The execution-time engine deterministically evaluates 3-, 5-, 7-, 14-, 30-,
 45-, and 60-day Bangkok-day windows at 15-minute resolution for the actual
@@ -251,7 +249,7 @@ only `ACTIVE`, canonical UTC `ACTIVATED_AT` / `RELEASED_AT`, and a nonempty
 `REASON`. A malformed document fails analysis closed. Activation is a deliberate
 maintainer repository-variable edit and must name the exact canonical target,
 time, and reason. The analysis workflow is the only automatic writer: once the
-target naturally reaches 10 qualifying closes, it persists the inactive release
+target naturally reaches 3 qualifying closes, it persists the inactive release
 record before publishing the matching `DCA_ANALYSIS_STATE`. The schema accepts
 inactive entries so released history can be loaded; schema validation does not
 authenticate which actor wrote the repository variable.
@@ -343,7 +341,7 @@ The producer refuses to infer completeness from a time-restricted API key.
 Examples use the canonical GBP-market targets:
 
 ```text
-!dca set BTC amounts to 12.50 low and 25 high
+!dca set BTC amounts to 5 low, 10 sideways, and 20 high
 !dca disable BTC
 !dca enable BTC
 !dca confirm enable BTC_GBP
@@ -358,7 +356,7 @@ help
 ```
 
 Budget changes require the target to be disabled. Enabling requires exact
-confirmation and displays the lower, midpoint, and higher amounts, the latest
+confirmation and displays the lower, sideways, and higher amounts, the latest
 regime, effective amount, next execution time, decision age, and aggregate
 maximum daily exposure. `show status` also displays a prominent per-target
 warning, normal rule result, confirmation count, activation time, and reason

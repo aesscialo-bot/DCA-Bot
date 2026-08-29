@@ -69,6 +69,7 @@ def apply_change(
     action: str,
     symbol: str,
     low_amount_gbp_json: str = "",
+    mid_amount_gbp_json: str = "",
     up_amount_gbp_json: str = "",
     enabled_json: str = "",
     expected_rules_hash: str = "",
@@ -90,9 +91,17 @@ def apply_change(
             raise ConfigError(f"Disable {symbol} before editing its budgets")
         low = _json_number(low_amount_gbp_json, "low_amount_gbp_json")
         up = _json_number(up_amount_gbp_json, "up_amount_gbp_json")
+        mid = (
+            _json_number(mid_amount_gbp_json, "mid_amount_gbp_json")
+            if mid_amount_gbp_json
+            else None
+        )
         candidate = {key: dict(value) for key, value in rules.items()}
+        amounts = {"LOW": low, "UP": up}
+        if mid is not None:
+            amounts["MID"] = mid
         candidate[symbol] = {
-            "REGIME_AMOUNTS_GBP": {"LOW": low, "UP": up},
+            "REGIME_AMOUNTS_GBP": amounts,
             "BUY_ENABLED": False,
         }
         normalized = validate_rules_map(candidate)
@@ -138,6 +147,7 @@ def main(argv=None) -> int:
     parser.add_argument("--action", required=True)
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--low-amount-gbp-json", default="")
+    parser.add_argument("--mid-amount-gbp-json", default="")
     parser.add_argument("--up-amount-gbp-json", default="")
     parser.add_argument("--enabled-json", default="")
     parser.add_argument("--expected-rules-hash", default="")
@@ -164,6 +174,7 @@ def main(argv=None) -> int:
         action=args.action,
         symbol=args.symbol,
         low_amount_gbp_json=args.low_amount_gbp_json,
+        mid_amount_gbp_json=args.mid_amount_gbp_json,
         up_amount_gbp_json=args.up_amount_gbp_json,
         enabled_json=args.enabled_json,
         expected_rules_hash=args.expected_rules_hash,

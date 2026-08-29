@@ -9,21 +9,21 @@ schemas, workflows, or deployment configuration.
 - Supported targets are exactly `BTC_GBP`, `ETH_GBP`, and `SOL_GBP` unless a
   deliberately staged pair-membership migration changes the full system.
 - `DCA_TARGET_MAP` contains every canonical target with only
-  `REGIME_AMOUNTS_GBP` (`LOW` lower endpoint and compatibility-named `UP` upper
-  endpoint) and boolean `BUY_ENABLED`.
+  `REGIME_AMOUNTS_GBP` (explicit `LOW`, `MID`, and compatibility-named `UP`)
+  and boolean `BUY_ENABLED`.
 - Budgets remain GBP-denominated. BTC, ETH, and SOL execute directly on Kraken
   `BTC/GBP`, `ETH/GBP`, and `SOL/GBP`; no active target has a funding leg.
   Never use implicit conversion, THB, Bitkub, or the legacy `AMOUNT_GBP` /
   `TIME` schema.
 - Counter-cyclical spend mapping is `DOWNTREND`→`HIGH`, `SIDEWAYS`→`MID`, and
-  `UPTREND`→`LOW`. `MID` is `(LOW + UP) / 2`, rounded to the nearest penny with
-  `ROUND_HALF_UP`; `HIGH` reads the stored `UP` endpoint. Never infer spend from
+  `UPTREND`→`LOW`. All three amounts are explicit; `HIGH` reads the stored `UP`
+  field. Never infer spend from
   the similarity between the `UP` endpoint name and `UPTREND`.
-- Normal `UPTREND` requires the latest 10 consecutive completed daily closes to
-  be strictly above each candle's own SMA150. Keep the deployed `DOWNTREND`
-  predicate: two daily close/SMA150 and EMA20/EMA50 confirmations, weekly
-  close/EMA20 confirmation, and negative 20-day SMA150 slope. Every other valid
-  normal result is `SIDEWAYS`; retain the 170-daily/20-weekly minimum.
+- Normal `UPTREND` requires the latest 3 completed daily closes above each
+  candle's own SMA150. The first break returns `SIDEWAYS`. `DOWNTREND` requires
+  the latest 3 closes below their SMA150 values plus latest EMA20 below EMA50.
+  Weekly EMA and 20-day SMA150 slope are informational; retain the
+  170-daily/20-weekly minimum.
 - Deterministic Python chooses regime, tier, and execution time from completed
   Kraken candles. Gemini Flash-Lite may explain but never choose a regime or
   create, change, or release an emergency override.
@@ -40,7 +40,7 @@ schemas, workflows, or deployment configuration.
   active per-target entry has absolute precedence and forces effective
   `UPTREND`, even over a normal `DOWNTREND`, while analysis signals retain the
   normal result, confirmation progress, reason, and activation/release audit.
-  Analysis automatically releases it only on natural 10-close confirmation and
+  Analysis automatically releases it only on natural 3-close confirmation and
   must persist that release before the matching `DCA_ANALYSIS_STATE`. Routine
   Discord controls and Gemini cannot write this state.
 - READY `AMOUNT_TIER` is exactly `LOW`, `MID`, or `HIGH` and must match the
@@ -73,8 +73,8 @@ schemas, workflows, or deployment configuration.
 - Exact Discord controls queue serialized writes through
   `.github/workflows/update_dca_config.yml`; Railway never patches repository
   variables directly.
-- Budget edits atomically replace the lower `LOW` and upper `UP` endpoints,
-  require `LOW <= UP`, use no more than two decimal places, and require the
+- Budget edits atomically replace `LOW`, `MID`, and `UP`, require
+  `LOW <= MID <= UP`, use no more than two decimal places, and require the
   target to be disabled.
 - Enabling requires a fresh matching decision, zero pending intents, a live
   Kraken minimum check, an allowlisted user, the exact `!dca ` prefix, and the
@@ -158,10 +158,10 @@ schemas, workflows, or deployment configuration.
   reconcile-only recovery, duplicate suppression, final live-state checks,
   scheduler windows, portfolio reporting, and optional logger failures. Keep
   both legs covered by the fixed historical HYPE incident tests.
-- Cover all three exact regime/tier mappings, ordered endpoints, equal
-  endpoints, half-penny midpoint rounding, and rejection of obsolete analysis
+- Cover all three exact regime/tier mappings, ordered amounts, legacy midpoint
+  normalization, and rejection of obsolete analysis
   state versions/tier pairs.
-- Cover 9-versus-10 close uptrend boundaries, preserved downtrend confirmation,
+- Cover 2-versus-3 close uptrend boundaries, responsive downtrend confirmation,
   override precedence over sideways/downtrend, automatic release ordering,
   malformed override rejection, and visible active-override status labelling.
 - Run tests with UTF-8 enabled on Windows.

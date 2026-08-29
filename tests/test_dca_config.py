@@ -72,8 +72,10 @@ def ready_signals():
         "DAILY_LAST_COMPLETE": "2026-08-04T00:00:00Z",
         "DAILY_CLOSE": 105.0,
         "DAILY_PREVIOUS_CLOSE": 104.0,
+        "DAILY_TWO_DAYS_AGO_CLOSE": 97.0,
         "DAILY_SMA150": 100.0,
         "DAILY_PREVIOUS_SMA150": 99.0,
+        "DAILY_TWO_DAYS_AGO_SMA150": 98.0,
         "DAILY_EMA20": 90.0,
         "DAILY_EMA50": 95.0,
         "DAILY_PREVIOUS_EMA20": 89.0,
@@ -84,12 +86,13 @@ def ready_signals():
         "SMA150_SLOPE_20D": -1.0,
         "TWO_DAY_ABOVE": False,
         "TWO_DAY_BELOW": False,
+        "THREE_DAY_BELOW": False,
         "WEEKLY_ABOVE": True,
         "WEEKLY_BELOW": False,
         "SLOPE_POSITIVE": False,
         "SLOPE_NEGATIVE": True,
-        "UPTREND_CONFIRMATION_REQUIRED": 10,
-        "UPTREND_CONFIRMATION_COUNT": 3,
+        "UPTREND_CONFIRMATION_REQUIRED": 3,
+        "UPTREND_CONFIRMATION_COUNT": 2,
         "UPTREND_CONFIRMED": False,
         "REGIME_WITHOUT_OVERRIDE": "SIDEWAYS",
         "UPTREND_OVERRIDE_ACTIVE": False,
@@ -161,7 +164,7 @@ class RulesSchemaTests(unittest.TestCase):
             self.assertEqual(
                 rule,
                 {
-                    "REGIME_AMOUNTS_GBP": {"LOW": 0, "UP": 0},
+                    "REGIME_AMOUNTS_GBP": {"LOW": 0, "MID": 0, "UP": 0},
                     "BUY_ENABLED": False,
                 },
             )
@@ -228,7 +231,7 @@ class RulesSchemaTests(unittest.TestCase):
             "REGIME_AMOUNTS_GBP": {"LOW": 20, "UP": 10},
             "BUY_ENABLED": False,
         }
-        with self.assertRaisesRegex(ValueError, "LOW must not exceed UP"):
+        with self.assertRaisesRegex(ValueError, "LOW <= MID <= UP"):
             dca_config.validate_rules_map(rules)
 
         rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10.001, "UP": 20}
@@ -296,15 +299,15 @@ class RulesSchemaTests(unittest.TestCase):
     def test_requested_three_asset_policy_keeps_gbp_budgets_on_gbp_pairs(self):
         rules = {
             "BTC_GBP": {
-                "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 20},
+                "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 20},
                 "BUY_ENABLED": True,
             },
             "ETH_GBP": {
-                "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 15},
+                "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
                 "BUY_ENABLED": True,
             },
             "SOL_GBP": {
-                "REGIME_AMOUNTS_GBP": {"LOW": 5, "UP": 15},
+                "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
                 "BUY_ENABLED": True,
             },
         }
@@ -315,19 +318,26 @@ class RulesSchemaTests(unittest.TestCase):
         )
         self.assertEqual(
             [dca_config.effective_amount_gbp(rule, "SIDEWAYS") for rule in validated.values()],
-            [15, 12.5, 10],
+            [10, 10, 10],
         )
         self.assertEqual(
             [dca_config.effective_amount_gbp(rule, "UPTREND") for rule in validated.values()],
-            [10, 10, 5],
+            [5, 5, 5],
         )
 
-    def test_sideways_midpoint_uses_half_up_penny_rounding(self):
+    def test_legacy_sideways_midpoint_uses_half_up_penny_rounding(self):
         rule = {
             "REGIME_AMOUNTS_GBP": {"LOW": 10.01, "UP": 10.02},
             "BUY_ENABLED": False,
         }
         self.assertEqual(dca_config.effective_amount_gbp(rule, "SIDEWAYS"), 10.02)
+
+    def test_explicit_sideways_amount_is_not_derived(self):
+        rule = {
+            "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 20},
+            "BUY_ENABLED": True,
+        }
+        self.assertEqual(dca_config.effective_amount_gbp(rule, "SIDEWAYS"), 10)
 
 
 class StateSchemaTests(unittest.TestCase):

@@ -7,28 +7,25 @@ workflows, or release configuration.
 ## Production invariants and current defaults
 
 - Supported targets are exactly `BTC_GBP`, `ETH_GBP`, and `SOL_GBP`.
-- `DCA_TARGET_MAP` contains only `REGIME_AMOUNTS_GBP` (`LOW` lower endpoint and
-  compatibility-named `UP` upper endpoint) and `BUY_ENABLED` for each target.
+- `DCA_TARGET_MAP` contains only `REGIME_AMOUNTS_GBP` (explicit `LOW`, `MID`,
+  and compatibility-named `UP`) and `BUY_ENABLED` for each target.
 - The current release gate is `DCA_START_DATE=2026-08-07`, interpreted as a
   strict `YYYY-MM-DD` date in `Asia/Bangkok`; all earlier trading fails closed.
 - Counter-cyclical spend mapping is downtrend=`HIGH`, sideways=`MID`, and
-  uptrend=`LOW`. `MID` is the half-up penny-rounded arithmetic midpoint.
-- Normal `UPTREND` requires the latest 10 consecutive completed daily closes to
-  be strictly above each candle's own SMA150. `DOWNTREND` retains the two-day
-  close/SMA150 and EMA20/EMA50 checks, weekly close/EMA20 check, and negative
-  20-day SMA150 slope; every other valid normal result is `SIDEWAYS`. Preserve
-  the 170-daily/20-weekly minimum because the downtrend inputs still require it.
+  uptrend=`LOW`; all three amounts are explicit and satisfy `LOW <= MID <= UP`.
+- Normal `UPTREND` requires the latest 3 completed daily closes above each
+  candle's own SMA150. The first break returns `SIDEWAYS`. `DOWNTREND` requires
+  the latest 3 closes below their SMA150 values and the latest EMA20 below EMA50.
+  Weekly EMA and 20-day SMA150 slope remain informational. Preserve the
+  170-daily/20-weekly data minimum.
 - `DCA_UPTREND_OVERRIDE_STATE` is an optional, strict, versioned per-target
   emergency state. An active override has absolute precedence, is surfaced in
   analysis signals and Discord status, and forces effective `UPTREND` while
   `ACTIVE=true`. The analysis-driven automatic release path is gated on normal
-  10-close confirmation and must persist the release before the matching
+  3-close confirmation and must persist the release before the matching
   analysis state. Gemini and routine Discord commands cannot write an override.
-- The current lower/higher endpoints are BTC £12.50/£25, ETH £12.50/£18.75,
-  and SOL £12.50/£18.75, producing sideways amounts £18.75/£15.63/£15.63.
-  Budget changes must use
-  the guarded configuration flow and must keep the lower endpoint at or below
-  the higher endpoint.
+- Current LOW/MID/UP amounts are BTC £5/£10/£20 and ETH/SOL £5/£10/£15.
+  Budget changes must use the guarded configuration flow and preserve ordering.
 - BTC, ETH, and SOL are direct GBP buys on `BTC/GBP`, `ETH/GBP`, and `SOL/GBP`.
   No active target has a funding leg.
 - One purchase per enabled asset per Bangkok calendar day is permitted.

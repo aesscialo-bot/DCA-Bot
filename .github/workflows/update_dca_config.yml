@@ -20,6 +20,11 @@ on:
         required: false
         default: ""
         type: string
+      mid_amount_gbp_json:
+        description: JSON number used in SIDEWAYS (blank derives the legacy midpoint)
+        required: false
+        default: ""
+        type: string
       up_amount_gbp_json:
         description: Compatibility name for the upper endpoint used in DOWNTREND
         required: false
@@ -84,6 +89,7 @@ jobs:
           ACTION: ${{ inputs.action }}
           SYMBOL: ${{ inputs.symbol }}
           LOW_AMOUNT_GBP_JSON: ${{ inputs.low_amount_gbp_json }}
+          MID_AMOUNT_GBP_JSON: ${{ inputs.mid_amount_gbp_json }}
           UP_AMOUNT_GBP_JSON: ${{ inputs.up_amount_gbp_json }}
           ENABLED_JSON: ${{ inputs.enabled_json }}
           EXPECTED_RULES_HASH: ${{ inputs.expected_rules_hash }}
@@ -140,6 +146,7 @@ jobs:
             --action "$ACTION" \
             --symbol "$SYMBOL" \
             --low-amount-gbp-json "$LOW_AMOUNT_GBP_JSON" \
+            --mid-amount-gbp-json "$MID_AMOUNT_GBP_JSON" \
             --up-amount-gbp-json "$UP_AMOUNT_GBP_JSON" \
             --enabled-json "$ENABLED_JSON" \
             --expected-rules-hash "$EXPECTED_RULES_HASH" \

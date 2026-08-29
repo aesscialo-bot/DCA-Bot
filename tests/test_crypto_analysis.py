@@ -170,12 +170,12 @@ class AnalysisSymbolTests(unittest.TestCase):
 
 
 class TrendClassificationTests(unittest.TestCase):
-    def test_ten_consecutive_closes_confirm_uptrend_and_old_downtrend_is_preserved(self):
+    def test_three_consecutive_closes_confirm_uptrend_and_downtrend(self):
         daily, weekly = trend_rows("up")
         regime, signals = crypto_analysis.classify_trend(daily, weekly, now=NOW)
         self.assertEqual(regime, "UPTREND")
-        self.assertEqual(signals["UPTREND_CONFIRMATION_REQUIRED"], 10)
-        self.assertEqual(signals["UPTREND_CONFIRMATION_COUNT"], 10)
+        self.assertEqual(signals["UPTREND_CONFIRMATION_REQUIRED"], 3)
+        self.assertEqual(signals["UPTREND_CONFIRMATION_COUNT"], 3)
         self.assertTrue(signals["UPTREND_CONFIRMED"])
         self.assertTrue(signals["TWO_DAY_ABOVE"])
         self.assertTrue(signals["WEEKLY_ABOVE"])
@@ -185,33 +185,42 @@ class TrendClassificationTests(unittest.TestCase):
         regime, signals = crypto_analysis.classify_trend(daily, weekly, now=NOW)
         self.assertEqual(regime, "DOWNTREND")
         self.assertTrue(signals["TWO_DAY_BELOW"])
+        self.assertTrue(signals["THREE_DAY_BELOW"])
         self.assertTrue(signals["WEEKLY_BELOW"])
         self.assertTrue(signals["SLOPE_NEGATIVE"])
         self.assertFalse(signals["UPTREND_CONFIRMED"])
 
-    def test_nine_consecutive_closes_are_sideways_even_when_old_up_signals_pass(self):
+    def test_two_consecutive_closes_are_sideways_even_when_old_up_signals_pass(self):
         daily, weekly = trend_rows("up")
-        daily[-10][1:5] = [1, 2, 0.5, 1]
+        daily[-3][1:5] = [250, 251, 249, 250]
         regime, signals = crypto_analysis.classify_trend(daily, weekly, now=NOW)
         self.assertEqual(regime, "SIDEWAYS")
-        self.assertEqual(signals["UPTREND_CONFIRMATION_COUNT"], 9)
+        self.assertEqual(signals["UPTREND_CONFIRMATION_COUNT"], 2)
         self.assertFalse(signals["UPTREND_CONFIRMED"])
         self.assertTrue(signals["TWO_DAY_ABOVE"])
         self.assertTrue(signals["WEEKLY_ABOVE"])
         self.assertTrue(signals["SLOPE_POSITIVE"])
 
-    def test_break_before_the_ten_candle_window_does_not_block_uptrend(self):
+    def test_break_before_the_three_candle_window_does_not_block_uptrend(self):
         daily, weekly = trend_rows("up")
-        daily[-11][1:5] = [1, 2, 0.5, 1]
+        daily[-4][1:5] = [1, 2, 0.5, 1]
         regime, signals = crypto_analysis.classify_trend(daily, weekly, now=NOW)
         self.assertEqual(regime, "UPTREND")
-        self.assertEqual(signals["UPTREND_CONFIRMATION_COUNT"], 10)
+        self.assertEqual(signals["UPTREND_CONFIRMATION_COUNT"], 3)
+
+    def test_first_close_below_sma150_leaves_uptrend_immediately(self):
+        daily, weekly = trend_rows("up")
+        daily[-1][1:5] = [1, 2, 0.5, 1]
+        regime, signals = crypto_analysis.classify_trend(daily, weekly, now=NOW)
+        self.assertEqual(regime, "SIDEWAYS")
+        self.assertEqual(signals["UPTREND_CONFIRMATION_COUNT"], 0)
+        self.assertFalse(signals["THREE_DAY_BELOW"])
 
     def test_each_close_is_compared_with_its_own_sma150(self):
         daily, weekly = trend_rows("up", count=170)
         for row in daily:
             row[1:5] = [100, 101, 99, 100]
-        for index, close in enumerate([101, *([1000] * 9)], start=160):
+        for index, close in enumerate([101, 1000, 1000], start=167):
             daily[index][1:5] = [close, close + 1, close - 1, close]
         regime, signals = crypto_analysis.classify_trend(daily, weekly, now=NOW)
         self.assertEqual(regime, "UPTREND")
@@ -228,15 +237,24 @@ class TrendClassificationTests(unittest.TestCase):
         self.assertFalse(signals["WEEKLY_ABOVE"])
         self.assertFalse(signals["WEEKLY_BELOW"])
 
-    def test_deployed_downtrend_still_requires_weekly_ema_and_slope_confirmation(self):
+    def test_downtrend_no_longer_requires_weekly_confirmation(self):
         daily, weekly = trend_rows("down")
         for row in weekly:
             row[1:5] = [100, 101, 99, 100]
         regime, signals = crypto_analysis.classify_trend(daily, weekly, now=NOW)
-        self.assertEqual(regime, "SIDEWAYS")
-        self.assertTrue(signals["TWO_DAY_BELOW"])
+        self.assertEqual(regime, "DOWNTREND")
+        self.assertTrue(signals["THREE_DAY_BELOW"])
         self.assertFalse(signals["WEEKLY_BELOW"])
         self.assertTrue(signals["SLOPE_NEGATIVE"])
+
+    def test_three_below_without_latest_bearish_ema_is_sideways(self):
+        daily, weekly = trend_rows("up")
+        for row in daily[-3:]:
+            row[1:5] = [250, 251, 249, 250]
+        regime, signals = crypto_analysis.classify_trend(daily, weekly, now=NOW)
+        self.assertEqual(regime, "SIDEWAYS")
+        self.assertTrue(signals["THREE_DAY_BELOW"])
+        self.assertGreater(signals["DAILY_EMA20"], signals["DAILY_EMA50"])
 
     def test_all_equal_and_zero_slope_are_strictly_sideways(self):
         daily, weekly = trend_rows("up")
@@ -246,6 +264,7 @@ class TrendClassificationTests(unittest.TestCase):
         self.assertEqual(regime, "SIDEWAYS")
         self.assertFalse(signals["TWO_DAY_ABOVE"])
         self.assertFalse(signals["TWO_DAY_BELOW"])
+        self.assertFalse(signals["THREE_DAY_BELOW"])
         self.assertEqual(signals["SMA150_SLOPE_20D"], 0)
         self.assertFalse(signals["SLOPE_POSITIVE"])
         self.assertFalse(signals["SLOPE_NEGATIVE"])
