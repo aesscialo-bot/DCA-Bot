@@ -1,6 +1,7 @@
 """GBP-budgeted Kraken spot client used by the DCA trade executor."""
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -33,7 +34,7 @@ class KrakenOrderStateUnknown(RuntimeError):
 
 
 class KrakenOrderNoFill(RuntimeError):
-    """Raised only for a confirmed terminal order with no executed quantity."""
+    """Raised for confirmed zero execution or an explicit rejected submission."""
 
 
 class KrakenPreSubmissionError(RuntimeError):
@@ -629,6 +630,38 @@ def _reconcile_after_submission_error(
     return None
 
 
+def _definite_submission_rejection(error: Exception) -> str | None:
+    """Recognize only allowlisted native rejection responses, never timeouts.
+
+    CCXT includes Kraken's JSON error response in ExchangeError. Do not infer
+    rejection from an exception class or a substring: duplicate-ID errors,
+    malformed responses and mixed/unknown errors must retain the intent.
+    """
+    if not isinstance(error, ccxt.ExchangeError):
+        return None
+    message = str(error)
+    if not message.startswith("kraken "):
+        return None
+    try:
+        response = json.loads(message[len("kraken "):])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(response, dict) or response.get("result"):
+        return None
+    errors = response.get("error")
+    allowed = {
+        "EOrder:Insufficient funds", "EOrder:Order minimum not met",
+        "EOrder:Cost minimum not met", "EOrder:Invalid price",
+        "EOrder:Invalid volume", "EOrder:Deadline elapsed",
+    }
+    if (
+        not isinstance(errors, list) or not errors
+        or any(not isinstance(item, str) or item not in allowed for item in errors)
+    ):
+        return None
+    return "; ".join(sorted(set(errors)))
+
+
 def _submission_deadline() -> str:
     """Return Kraken's short RFC3339 matching-engine deadline."""
     deadline = datetime.now(timezone.utc) + timedelta(
@@ -778,8 +811,14 @@ def place_market_buy(
             exchange, symbol, client_order_id
         )
         if matching_order is None:
+            rejection = _definite_submission_rejection(submission_error)
+            if rejection is not None:
+                raise KrakenOrderNoFill(
+                    f"Kraken rejected the order with no matching execution: {rejection}"
+                ) from submission_error
             raise KrakenOrderStateUnknown(
-                "Kraken order submission outcome is unknown and no matching order "
+                "Kraken order submission outcome is unknown "
+                f"({type(submission_error).__name__}) and no matching order "
                 f"was found for client ID {client_order_id}"
             ) from submission_error
         return _poll_known_order(
