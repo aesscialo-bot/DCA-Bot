@@ -115,6 +115,63 @@ def usd_buy_fill(
 
 
 class KrakenClientTests(unittest.TestCase):
+    def test_only_exact_native_rejection_responses_are_safe_no_fill(self):
+        import ccxt
+        accepted = ccxt.InsufficientFunds('kraken {"error":["EOrder:Insufficient funds"]}')
+        self.assertEqual(kraken_client._definite_submission_rejection(accepted), "EOrder:Insufficient funds")
+        for error in (
+            TimeoutError(str(accepted)),
+            ccxt.RequestTimeout(str(accepted)),
+            ccxt.InvalidOrder('kraken {"error":["EOrder:Duplicate client order id"]}'),
+            ccxt.ExchangeError('kraken {"error":["EOrder:Insufficient funds","EService:Unavailable"]}'),
+            ccxt.ExchangeError('kraken {"error":["EOrder:Insufficient funds"],"result":{"txid":["O-1"]}}'),
+            ccxt.InsufficientFunds("insufficient funds"),
+        ):
+            with self.subTest(error=error):
+                self.assertIsNone(kraken_client._definite_submission_rejection(error))
+
+    @patch.object(kraken_client.time, "sleep")
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_explicit_rejection_after_empty_reconciliation_does_not_lock_forever(self, get_exchange, sleep):
+        import ccxt
+        exchange = configured_exchange()
+        get_exchange.return_value = exchange
+        exchange.create_market_buy_order_with_cost.side_effect = ccxt.InsufficientFunds(
+            'kraken {"error":["EOrder:Insufficient funds"]}'
+        )
+        with self.assertRaisesRegex(kraken_client.KrakenOrderNoFill, "rejected.*Insufficient funds"):
+            kraken_client.place_market_buy("BTC_GBP", 5.50)
+        exchange.create_market_buy_order_with_cost.assert_called_once()
+        self.assertGreater(exchange.fetch_closed_orders.call_count, 1)
+
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_order_evidence_takes_precedence_over_rejection_message(self, get_exchange):
+        import ccxt
+        exchange = configured_exchange()
+        get_exchange.return_value = exchange
+        exchange.create_market_buy_order_with_cost.side_effect = ccxt.InsufficientFunds(
+            'kraken {"error":["EOrder:Insufficient funds"]}'
+        )
+        exchange.fetch_closed_orders.side_effect = [[], [terminal_fill()]]
+        result = kraken_client.place_market_buy(
+            "BTC_GBP", 5.50, client_order_id="dca-1234567890abcd"
+        )
+        self.assertEqual(result["order_id"], "kraken-order")
+        exchange.create_market_buy_order_with_cost.assert_called_once()
+
+    @patch.object(kraken_client.time, "sleep")
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_rejection_with_failed_reconciliation_remains_unknown(self, get_exchange, sleep):
+        import ccxt
+        exchange = configured_exchange()
+        get_exchange.return_value = exchange
+        exchange.create_market_buy_order_with_cost.side_effect = ccxt.InsufficientFunds(
+            'kraken {"error":["EOrder:Insufficient funds"]}'
+        )
+        exchange.fetch_open_orders.side_effect = [[], TimeoutError(), TimeoutError(), TimeoutError(), TimeoutError()]
+        with self.assertRaises(kraken_client.KrakenOrderStateUnknown):
+            kraken_client.place_market_buy("BTC_GBP", 5.50)
+
     def test_market_minimum_helper_is_read_only_and_uses_larger_limit(self):
         exchange = configured_exchange()
 

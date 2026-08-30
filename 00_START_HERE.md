@@ -395,6 +395,27 @@ start-day analysis. Check the start date and the Crypto Analysis workflow.
 - A pending intent is not permission to clear state manually; let the trader
   reconcile Kraken's open and closed orders.
 
+### An old pending intent has no matching Kraken order
+
+Do not delete execution JSON by hand or replay the missed date. The manual
+`Recover Absent Kraken Intents` workflow handles reviewed, direct-GBP intents
+older than 24 hours without placing or cancelling orders:
+
+1. Temporarily set repository `DCA_TRADING_MODE=shadow`.
+2. Run `preview`. Review the target dates, complete account-wide order scan,
+   zero exact-ID and nearby-order observations, and `all_confirmed_absent=true`.
+3. Run `apply` with the exact preview `state_hash`. It repeats the Kraken audit,
+   rechecks shadow mode and unchanged execution state under the writer lock,
+   and removes only the proven-absent pending records. Buy dates and outbox
+   evidence are preserved; missed purchases are not marked filled or replayed.
+4. Confirm no pending state remains, check available GBP, restore the prior
+   trading mode, and check the next Daily Crypto DCA and holdings snapshot runs.
+
+Any matching order, nearby untagged order, restricted history, incomplete page,
+recent intent or state change stops recovery. A real order must use normal
+reconciliation instead. New explicit Kraken rejection responses are reported as
+safe no-fill failures; network failures and unknown errors remain locked.
+
 ### A budget change is blocked
 
 Disable the pair first, wait for the workflow to finish, and retry the exact

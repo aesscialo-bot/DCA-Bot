@@ -1,0 +1,45 @@
+name: Recover Absent Kraken Intents
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Preview first; apply only the exact reviewed state hash
+        required: true
+        default: preview
+        type: choice
+        options: [preview, apply]
+      expected_state_hash:
+        description: Required for apply; exact state_hash from the reviewed preview
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dca-execution-state-writers
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Audit or recover absent intents without trading
+        env:
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+          GH_PAT_FOR_VARS: ${{ secrets.GH_PAT_FOR_VARS }}
+          TIMEZONE: ${{ vars.TIMEZONE || 'Asia/Bangkok' }}
+          RECOVERY_MODE: ${{ inputs.mode }}
+          RECOVERY_EXPECTED_HASH: ${{ inputs.expected_state_hash }}
+        run: python -u kraken_intent_recovery.py --mode "$RECOVERY_MODE" --expected-state-hash "$RECOVERY_EXPECTED_HASH"

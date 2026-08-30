@@ -94,6 +94,13 @@ later runs reconcile it before considering another order. The bot never submits
 another order merely because an API response was interrupted. The fixed
 historical HYPE/USD recovery retains its original two-leg evidence separately.
 
+Explicit, allowlisted native Kraken rejection responses become safe no-fill
+failures only after successful reconciliation finds no order. Timeouts and
+unrecognized responses remain locked. For an old intent that is independently
+proven absent, the manual `Recover Absent Kraken Intents` workflow provides a
+shadow-only, preview/hash/apply recovery without placing orders or replaying
+missed dates; see [the recovery procedure](00_START_HERE.md#an-old-pending-intent-has-no-matching-kraken-order).
+
 ## Trend and timing decisions
 
 Analysis runs at 04:07 Bangkok with an idempotent 04:37 recovery and uses
