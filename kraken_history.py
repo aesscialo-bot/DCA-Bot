@@ -37,6 +37,7 @@ TARGET_PAIRS = {
     "BTC_GBP": "BTC/GBP",
     "ETH_GBP": "ETH/GBP",
     "SOL_GBP": "SOL/GBP",
+    "DOGE_GBP": "DOGE/GBP",
 }
 
 

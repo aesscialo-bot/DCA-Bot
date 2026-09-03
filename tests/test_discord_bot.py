@@ -244,10 +244,11 @@ class DiscordBotControlTests(unittest.TestCase):
         self.rules = rules()
         self.analysis = analysis_state(self.rules)
 
-    def test_only_three_production_gbp_assets_are_accepted(self):
+    def test_only_four_production_gbp_assets_are_accepted(self):
         self.assertEqual(discord_bot._normalise_usd_key("bitcoin"), "BTC_GBP")
         self.assertEqual(discord_bot._normalise_usd_key("Ethereum"), "ETH_GBP")
         self.assertEqual(discord_bot._normalise_usd_key("BTC/GBP"), "BTC_GBP")
+        self.assertEqual(discord_bot._normalise_usd_key("dogecoin"), "DOGE_GBP")
         with self.assertRaisesRegex(ValueError, "Supported assets"):
             discord_bot._normalise_usd_key("CAR")
 
@@ -359,7 +360,7 @@ class DiscordBotControlTests(unittest.TestCase):
             )
         client_type.assert_not_called()
 
-    def test_symbols_are_derived_from_valid_three_target_map(self):
+    def test_symbols_are_derived_from_valid_four_target_map(self):
         with patch.object(
             discord_bot,
             "_get_repo_variable_and_refresh",
@@ -367,7 +368,7 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             self.assertEqual(
                 discord_bot._symbols_from_dca_map(),
-                "BTC/GBP, ETH/GBP, SOL/GBP",
+                "BTC/GBP, ETH/GBP, SOL/GBP, DOGE/GBP",
             )
 
     def test_amount_update_is_atomic_and_requires_disabled_target(self):
@@ -687,7 +688,7 @@ class DiscordBotControlTests(unittest.TestCase):
                 )
             )
         dispatch.assert_not_called()
-        self.assertIn("global three-asset DCA rules changed", message.replies[-1])
+        self.assertIn("global four-asset DCA rules changed", message.replies[-1])
 
     def test_analyze_exact_asset_or_all(self):
         message = MessageStub()
@@ -718,7 +719,7 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("UPTREND/lower £10", status_message.replies[-1])
         self.assertIn("SIDEWAYS £15", status_message.replies[-1])
         self.assertIn("DOWNTREND/higher £20", status_message.replies[-1])
-        self.assertEqual(status_message.replies[-1].count("Data through:"), 3)
+        self.assertEqual(status_message.replies[-1].count("Data through:"), 4)
         self.assertIn("2026-08-05 10:45 +07", status_message.replies[-1])
         self.assertIn("GitHub analysis workflow: **HEALTHY**", status_message.replies[-1])
         self.assertIn("actual ref: `main@0123456789ab`", status_message.replies[-1])
@@ -738,9 +739,9 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             asyncio.run(discord_bot.handle_health({}, health_message))
         self.assertIn("READY-BUT-DISABLED", health_message.replies[-1])
-        self.assertIn("fresh READY 3/3", health_message.replies[-1])
-        self.assertIn("Buy-enabled targets: 0/3", health_message.replies[-1])
-        self.assertIn("3/3 GBP targets", health_message.replies[-1])
+        self.assertIn("fresh READY 4/4", health_message.replies[-1])
+        self.assertIn("Buy-enabled targets: 0/4", health_message.replies[-1])
+        self.assertIn("4/4 GBP targets", health_message.replies[-1])
         self.assertNotIn("mixed targets", health_message.replies[-1])
         self.assertIn("Kraken GBP-market DCA controls", discord_bot.HELP_TEXT)
         self.assertLessEqual(len(health_message.replies[-1]), 2_000)
@@ -1125,6 +1126,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
                 "BTC_GBP": 30,
                 "ETH_GBP": 30,
                 "SOL_GBP": 45,
+                "DOGE_GBP": 60,
             },
         )
         self.assertTrue(
@@ -1403,7 +1405,7 @@ class DiscordBotSchedulerTests(unittest.TestCase):
             )
         )
         self.assertEqual(discord_bot._dca_schedule, {})
-        self.assertIn("global all-three Kraken history gate", discord_bot._schedule_warning)
+        self.assertIn("global all-four Kraken history gate", discord_bot._schedule_warning)
         self.assertIn("BTC_GBP: analysis ERROR", discord_bot._schedule_warning)
 
     def test_due_assets_use_inclusive_minus_five_plus_sixty_window(self):

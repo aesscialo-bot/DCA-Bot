@@ -28,12 +28,12 @@ The bot is intentionally contained while this recovery is validated:
 
 - Railway scheduling is paused with `DCA_CRON_ENABLED=false`.
 - `DCA_TRADING_MODE=shadow` blocks every new Kraken order.
-- All pairs remain analysis-enabled, but the all-three Kraken history gate must
+- All pairs remain analysis-enabled, but the all-four Kraken history gate must
   pass before even the SOL canary can submit an order.
 - The 7 August missed purchase will not be replayed.
 - Rollback at every rollout stage is `DCA_TRADING_MODE=shadow`.
 
-Do not resume Railway or choose `canary` until the history manifest shows three
+Do not resume Railway or choose `canary` until the history manifest shows four
 verified 60-day decisions and one complete scheduled shadow cycle has produced
 zero Kraken `AddOrder` calls.
 
@@ -46,6 +46,7 @@ The configured target set is exactly:
 | `BTC/GBP` | £5 | £10 | £20 | Enabled |
 | `ETH/GBP` | £5 | £10 | £15 | Enabled |
 | `SOL/GBP` | £5 | £10 | £15 | Enabled |
+| `DOGE/GBP` | £0 | £0 | £0 | Disabled pending approved budgets |
 
 - The bot deliberately buys more in a `DOWNTREND`, the explicit middle amount in a
   `SIDEWAYS` market, and less in an `UPTREND`.

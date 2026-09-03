@@ -16,17 +16,19 @@ import re
 from typing import Any, Callable, Mapping
 
 
-TARGET_KEYS = ("BTC_GBP", "ETH_GBP", "SOL_GBP")
+TARGET_KEYS = ("BTC_GBP", "ETH_GBP", "SOL_GBP", "DOGE_GBP")
 ALLOWED_TARGETS = TARGET_KEYS
 TARGET_SYMBOLS = {
     "BTC_GBP": "BTC/GBP",
     "ETH_GBP": "ETH/GBP",
     "SOL_GBP": "SOL/GBP",
+    "DOGE_GBP": "DOGE/GBP",
 }
 TARGET_ROUTES = {
     "BTC_GBP": "DIRECT_GBP",
     "ETH_GBP": "DIRECT_GBP",
     "SOL_GBP": "DIRECT_GBP",
+    "DOGE_GBP": "DIRECT_GBP",
 }
 RULE_FIELDS = frozenset({"REGIME_AMOUNTS_GBP", "BUY_ENABLED"})
 REGIME_AMOUNT_FIELDS = frozenset({"LOW", "MID", "UP"})
@@ -1736,7 +1738,7 @@ def validate_enabled_market_minimums(
 
 
 def default_rules_map() -> dict[str, dict[str, Any]]:
-    """Return the safe three-target bootstrap configuration."""
+    """Return the safe all-target bootstrap configuration."""
 
     return {
         target: {
@@ -1752,10 +1754,13 @@ def empty_analysis_state(
     *,
     now: datetime | None = None,
     reason: str = "Analysis has not run",
+    require_all: bool = True,
 ) -> dict[str, Any]:
     """Return a complete fail-closed v3 state awaiting deterministic analysis."""
 
-    rules = validate_rules_map(rules_map or default_rules_map())
+    rules = validate_rules_map(
+        rules_map or default_rules_map(), require_all=require_all
+    )
     generated = now or datetime.now(timezone.utc)
     if generated.tzinfo is None or generated.utcoffset() is None:
         raise ConfigError("now must include a timezone")
@@ -1763,7 +1768,7 @@ def empty_analysis_state(
     selected_tz = timezone(timedelta(hours=7))
     analysis_date = generated.astimezone(selected_tz).date().isoformat()
     targets = {}
-    for target in TARGET_KEYS:
+    for target in (TARGET_KEYS if require_all else tuple(rules)):
         digest = rules_hash(target, rules[target])
         targets[target] = {
             "ENABLED": bool(rules[target]["BUY_ENABLED"]),

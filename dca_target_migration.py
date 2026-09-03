@@ -189,7 +189,9 @@ def _new_rules(source_rules: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
         TARGET_MAP[source]: dict(source_rules[source]) for source in SOURCE_TARGETS
     }
     candidate["ETH_GBP"] = {**candidate["ETH_GBP"], "BUY_ENABLED": False}
-    return validate_rules_map(candidate)
+    # This historical migration's target contract predates DOGE/GBP. Keep its
+    # archived three-target replay independent from the current production set.
+    return validate_rules_map(candidate, require_all=False)
 
 
 def _source_execution_state(value: str | Mapping[str, Any]) -> dict[str, Any]:
@@ -226,6 +228,7 @@ def _new_analysis(
     return empty_analysis_state(
         rules,
         now=generated,
+        require_all=False,
         reason=(
             "HYPE/USD retired and ETH/GBP added; fresh verified ETH/GBP history "
             "analysis is required"
@@ -537,7 +540,7 @@ def migrate(
                 raise ValueError("archived source rules have invalid target membership")
             new_rules = _new_rules(source_rules)
         else:
-            new_rules = validate_rules_map(current_rules)
+            new_rules = validate_rules_map(current_rules, require_all=False)
         normalized_source_rules = {
             "BTC_GBP": new_rules["BTC_GBP"],
             "HYPE_USD": retired_state["RULE"],
@@ -558,7 +561,9 @@ def migrate(
             _source_analysis_state(current_analysis, normalized_source_rules)
             new_analysis = _new_analysis(new_rules, generated)
         else:
-            new_analysis = validate_analysis_state(current_analysis, new_rules)
+            new_analysis = validate_analysis_state(
+                current_analysis, new_rules, require_all=False
+            )
 
         rebuilt_target_hashes = _state_hashes(
             new_rules, new_analysis, new_execution

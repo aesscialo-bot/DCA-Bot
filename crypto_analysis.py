@@ -99,13 +99,16 @@ def _iso_utc(value: datetime) -> str:
 def _target_from_symbol(value: str) -> str:
     candidate = value.strip().strip("\"'").upper().replace("_", "/")
     if "/" not in candidate:
-        candidate = {"BTC": "BTC/GBP", "ETH": "ETH/GBP", "SOL": "SOL/GBP"}.get(
+        candidate = {
+            "BTC": "BTC/GBP", "ETH": "ETH/GBP", "SOL": "SOL/GBP",
+            "DOGE": "DOGE/GBP", "DOGECOIN": "DOGE/GBP",
+        }.get(
             candidate, candidate
         )
     target = candidate.replace("/", "_")
     if target not in TARGET_KEYS:
         raise ValueError(
-            f"Only BTC/GBP, ETH/GBP, and SOL/GBP are supported: {value}"
+            f"Only BTC/GBP, ETH/GBP, SOL/GBP, and DOGE/GBP are supported: {value}"
         )
     return target
 
@@ -1223,7 +1226,7 @@ def _analysis_is_complete_for_live_rules(
 
 
 def main() -> int:
-    """Analyze selected targets, persist three decisions, and alert per asset."""
+    """Analyze selected targets, persist four decisions, and alert per asset."""
 
     generated = _utc_now()
     try:

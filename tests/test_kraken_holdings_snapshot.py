@@ -18,6 +18,7 @@ class Exchange:
                 "HYPE": 2,
                 "ETH": 5,
                 "SOL": 3,
+                "DOGE": 100,
                 "GBP": 4,
                 "XRP": 6,
             }
@@ -30,6 +31,7 @@ class Exchange:
                 "HYPE/USD": 40,
                 "ETH/GBP": 2500,
                 "SOL/GBP": 50,
+                "DOGE/GBP": 0.17,
             }[pair]
         }
 
@@ -59,12 +61,14 @@ class KrakenHoldingsSnapshotTests(unittest.TestCase):
         snapshot = kraken_holdings_snapshot.build_snapshot(
             Exchange(), now=datetime(2026, 8, 7, tzinfo=timezone.utc)
         )
-        self.assertEqual(snapshot["version"], 2)
+        self.assertEqual(snapshot["version"], 3)
         self.assertEqual(snapshot["holdings"]["BTC_GBP"]["pair"], "BTC/GBP")
         self.assertEqual(snapshot["holdings"]["HYPE_USD"]["pair"], "HYPE/USD")
         self.assertEqual(snapshot["holdings"]["ETH_GBP"]["pair"], "ETH/GBP")
         self.assertEqual(snapshot["holdings"]["ETH_GBP"]["quantity"], "5")
         self.assertEqual(snapshot["holdings"]["SOL_GBP"]["pair"], "SOL/GBP")
+        self.assertEqual(snapshot["holdings"]["DOGE_GBP"]["pair"], "DOGE/GBP")
+        self.assertEqual(snapshot["holdings"]["DOGE_GBP"]["quantity"], "100")
         self.assertEqual(snapshot["unsupported_nonzero_assets"], ["XRP"])
         supplied = snapshot.pop("canonical_hash")
         actual = hashlib.sha256(

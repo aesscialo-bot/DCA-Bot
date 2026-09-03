@@ -116,13 +116,13 @@ class WorkflowSafetyTests(unittest.TestCase):
         analysis = self._read("crypto_analysis.yml")
         writer = self._read("update_dca_config.yml")
         portfolio = self._read("portfolio_check.yml")
-        self.assertIn("BTC, ETH, SOL, a canonical configured pair, or all", analysis)
+        self.assertIn("BTC, ETH, SOL, DOGE, a canonical configured pair, or all", analysis)
         self.assertIn("Analyze configured Kraken markets", analysis)
         self.assertNotIn("HYPE", analysis)
         self.assertNotIn("ADA", analysis)
-        self.assertIn("BTC_GBP, ETH_GBP, or SOL_GBP", writer)
+        self.assertIn("BTC_GBP, ETH_GBP, SOL_GBP, or DOGE_GBP", writer)
         self.assertIn("Canonical Kraken key", writer)
-        self.assertIn("--targets BTC_GBP,ETH_GBP,SOL_GBP", portfolio)
+        self.assertIn("--targets BTC_GBP,ETH_GBP,SOL_GBP,DOGE_GBP", portfolio)
         self.assertNotIn("HYPE_USD", portfolio)
 
     def test_hype_to_eth_migration_is_main_only_audited_and_masks_state(self):

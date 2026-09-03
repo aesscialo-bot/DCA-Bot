@@ -6,7 +6,7 @@ workflows, or release configuration.
 
 ## Production invariants and current defaults
 
-- Supported targets are exactly `BTC_GBP`, `ETH_GBP`, and `SOL_GBP`.
+- Supported targets are exactly `BTC_GBP`, `ETH_GBP`, `SOL_GBP`, and `DOGE_GBP`.
 - `DCA_TARGET_MAP` contains only `REGIME_AMOUNTS_GBP` (explicit `LOW`, `MID`,
   and compatibility-named `UP`) and `BUY_ENABLED` for each target.
 - The current release gate is `DCA_START_DATE=2026-08-07`, interpreted as a
@@ -25,8 +25,9 @@ workflows, or release configuration.
   3-close confirmation and must persist the release before the matching
   analysis state. Gemini and routine Discord commands cannot write an override.
 - Current LOW/MID/UP amounts are BTC £5/£10/£20 and ETH/SOL £5/£10/£15.
+  DOGE begins disabled at £0/£0/£0 until the operator explicitly chooses budgets.
   Budget changes must use the guarded configuration flow and preserve ordering.
-- BTC, ETH, and SOL are direct GBP buys on `BTC/GBP`, `ETH/GBP`, and `SOL/GBP`.
+- BTC, ETH, SOL, and DOGE are direct GBP buys on `BTC/GBP`, `ETH/GBP`, `SOL/GBP`, and `DOGE/GBP`.
   No active target has a funding leg.
 - One purchase per enabled asset per Bangkok calendar day is permitted.
 - Stale, missing, insufficient, or inconsistent state always skips trading.

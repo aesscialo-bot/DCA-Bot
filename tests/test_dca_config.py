@@ -149,15 +149,20 @@ class RulesSchemaTests(unittest.TestCase):
             }}),
         )
 
-    def test_safe_default_has_exact_three_usd_targets(self):
+    def test_safe_default_has_exact_four_gbp_targets(self):
         rules = dca_config.validate_rules_map(dca_config.default_rules_map())
         self.assertEqual(
             dca_config.ALLOWED_TARGETS,
-            ("BTC_GBP", "ETH_GBP", "SOL_GBP"),
+            ("BTC_GBP", "ETH_GBP", "SOL_GBP", "DOGE_GBP"),
         )
         self.assertEqual(
             dca_config.TARGET_SYMBOLS,
-            {"BTC_GBP": "BTC/GBP", "ETH_GBP": "ETH/GBP", "SOL_GBP": "SOL/GBP"},
+            {
+                "BTC_GBP": "BTC/GBP",
+                "ETH_GBP": "ETH/GBP",
+                "SOL_GBP": "SOL/GBP",
+                "DOGE_GBP": "DOGE/GBP",
+            },
         )
         self.assertEqual(tuple(rules), dca_config.ALLOWED_TARGETS)
         for rule in rules.values():
@@ -296,7 +301,7 @@ class RulesSchemaTests(unittest.TestCase):
         }
         self.assertEqual(dca_config.maximum_daily_exposure_gbp(rules), 50)
 
-    def test_requested_three_asset_policy_keeps_gbp_budgets_on_gbp_pairs(self):
+    def test_requested_four_asset_policy_keeps_gbp_budgets_on_gbp_pairs(self):
         rules = {
             "BTC_GBP": {
                 "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 20},
@@ -310,19 +315,23 @@ class RulesSchemaTests(unittest.TestCase):
                 "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
                 "BUY_ENABLED": True,
             },
+            "DOGE_GBP": {
+                "REGIME_AMOUNTS_GBP": {"LOW": 0, "MID": 0, "UP": 0},
+                "BUY_ENABLED": False,
+            },
         }
         validated = dca_config.validate_rules_map(rules)
         self.assertEqual(
             [dca_config.effective_amount_gbp(rule, "DOWNTREND") for rule in validated.values()],
-            [20, 15, 15],
+            [20, 15, 15, 0],
         )
         self.assertEqual(
             [dca_config.effective_amount_gbp(rule, "SIDEWAYS") for rule in validated.values()],
-            [10, 10, 10],
+            [10, 10, 10, 0],
         )
         self.assertEqual(
             [dca_config.effective_amount_gbp(rule, "UPTREND") for rule in validated.values()],
-            [5, 5, 5],
+            [5, 5, 5, 0],
         )
 
     def test_legacy_sideways_midpoint_uses_half_up_penny_rounding(self):

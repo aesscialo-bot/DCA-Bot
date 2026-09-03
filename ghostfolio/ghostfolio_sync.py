@@ -75,13 +75,14 @@ ASSET_PROFILES = {
     "HYPE_USD": {"symbol": "HYPE32196USD", "data_source": "YAHOO"},
     "ETH_GBP": {"symbol": "ethereum", "data_source": "COINGECKO"},
     "SOL_GBP": {"symbol": "solana", "data_source": "COINGECKO"},
+    "DOGE_GBP": {"symbol": "dogecoin", "data_source": "COINGECKO"},
 }
 LEGACY_KRAKEN_HOLDINGS_CONTRACT_V1 = {
     "BTC_GBP": {"asset": "BTC", "pair": "BTC/GBP", "quote_currency": "GBP"},
     "HYPE_USD": {"asset": "HYPE", "pair": "HYPE/USD", "quote_currency": "USD"},
     "SOL_GBP": {"asset": "SOL", "pair": "SOL/GBP", "quote_currency": "GBP"},
 }
-KRAKEN_HOLDINGS_CONTRACT = {
+KRAKEN_HOLDINGS_CONTRACT_V2 = {
     "BTC_GBP": {"asset": "BTC", "pair": "BTC/GBP", "quote_currency": "GBP"},
     # HYPE is retained in reporting snapshots and historical recovery even
     # though it is no longer an active DCA target.
@@ -89,9 +90,14 @@ KRAKEN_HOLDINGS_CONTRACT = {
     "ETH_GBP": {"asset": "ETH", "pair": "ETH/GBP", "quote_currency": "GBP"},
     "SOL_GBP": {"asset": "SOL", "pair": "SOL/GBP", "quote_currency": "GBP"},
 }
+KRAKEN_HOLDINGS_CONTRACT = {
+    **KRAKEN_HOLDINGS_CONTRACT_V2,
+    "DOGE_GBP": {"asset": "DOGE", "pair": "DOGE/GBP", "quote_currency": "GBP"},
+}
 KRAKEN_HOLDINGS_CONTRACTS = {
     1: LEGACY_KRAKEN_HOLDINGS_CONTRACT_V1,
-    2: KRAKEN_HOLDINGS_CONTRACT,
+    2: KRAKEN_HOLDINGS_CONTRACT_V2,
+    3: KRAKEN_HOLDINGS_CONTRACT,
 }
 PORTFOLIO_EVENT_FIELDS = {
     "event_version",
@@ -145,6 +151,11 @@ PORTFOLIO_EVENT_CONTRACT = {
         "quote_currency": "GBP",
         "route": "DIRECT_GBP",
     },
+    "DOGE_GBP": {
+        "base_currency": "DOGE",
+        "quote_currency": "GBP",
+        "route": "DIRECT_GBP",
+    },
 }
 SYMBOLS = {target: profile["symbol"] for target, profile in ASSET_PROFILES.items()}
 QUANTITY_TOLERANCE = {
@@ -152,6 +163,7 @@ QUANTITY_TOLERANCE = {
     "HYPE_USD": 1e-8,
     "ETH_GBP": 1e-10,
     "SOL_GBP": 1e-8,
+    "DOGE_GBP": 1e-8,
 }
 REPORTING_ACCOUNT_NAMES = ("Kraken DCA", "Bitkub Legacy")
 REPORTING_CURRENCY = "GBP"

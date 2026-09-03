@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       symbol:
-        description: BTC, ETH, SOL, a canonical configured pair, or all
+        description: BTC, ETH, SOL, DOGE, a canonical configured pair, or all
         required: false
         default: all
         type: string

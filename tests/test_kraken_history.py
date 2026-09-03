@@ -124,11 +124,12 @@ class KrakenHistoryTests(unittest.TestCase):
                 "BTC_GBP": "BTC/GBP",
                 "ETH_GBP": "ETH/GBP",
                 "SOL_GBP": "SOL/GBP",
+                "DOGE_GBP": "DOGE/GBP",
             },
         )
         self.assertEqual(
-            kraken_history._parse_targets("btc/gbp,BTC_GBP,eth_gbp,sol_gbp"),
-            ["BTC_GBP", "ETH_GBP", "SOL_GBP"],
+            kraken_history._parse_targets("btc/gbp,BTC_GBP,eth_gbp,sol_gbp,doge_gbp"),
+            ["BTC_GBP", "ETH_GBP", "SOL_GBP", "DOGE_GBP"],
         )
         with self.assertRaisesRegex(kraken_history.HistoryError, "unsupported"):
             kraken_history._parse_targets("ETH_USD")

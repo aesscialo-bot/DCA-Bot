@@ -17,12 +17,13 @@ from github_contents import (
 from kraken_client import get_kraken_exchange
 
 
-SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 TARGETS = {
     "BTC_GBP": ("BTC", "BTC/GBP", "GBP"),
     "HYPE_USD": ("HYPE", "HYPE/USD", "USD"),
     "ETH_GBP": ("ETH", "ETH/GBP", "GBP"),
     "SOL_GBP": ("SOL", "SOL/GBP", "GBP"),
+    "DOGE_GBP": ("DOGE", "DOGE/GBP", "GBP"),
 }
 FIAT = frozenset({"GBP", "USD", "EUR"})
 

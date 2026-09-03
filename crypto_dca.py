@@ -703,7 +703,7 @@ def _global_history_gate(analysis, now):
     """Enforce the selected Kraken-only policy before any new order.
 
     A pair-local analysis error still remains visible and retryable, but strict
-    production execution cannot proceed until all three canonical targets have
+    production execution cannot proceed until all four canonical targets have
     a current, verified decision built by the same 60-day policy.
     """
     today = now.astimezone(SELECTED_TZ).date().isoformat()
@@ -725,7 +725,7 @@ def _global_history_gate(analysis, now):
             failures.append(f"{target} history is {history.get('STATUS', 'missing')}")
     if failures:
         return False, "; ".join(failures)
-    return True, "all three Kraken histories and decisions are ready"
+    return True, "all four Kraken histories and decisions are ready"
 
 
 def _revalidate_trade_intent(
@@ -1226,7 +1226,7 @@ def main():
         return all_succeeded
     if not global_history_ready:
         message = (
-            "New Kraken orders are globally blocked until all three pairs have "
+            "New Kraken orders are globally blocked until all four pairs have "
             f"current verified 60-day decisions: {global_history_reason}."
         )
         print(message, flush=True)

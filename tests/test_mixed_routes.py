@@ -11,11 +11,13 @@ class MixedRouteTests(unittest.TestCase):
             "BTC_GBP": "BTC/GBP",
             "ETH_GBP": "ETH/GBP",
             "SOL_GBP": "SOL/GBP",
+            "DOGE_GBP": "DOGE/GBP",
         })
         self.assertEqual(TARGET_ROUTES, {
             "BTC_GBP": "DIRECT_GBP",
             "ETH_GBP": "DIRECT_GBP",
             "SOL_GBP": "DIRECT_GBP",
+            "DOGE_GBP": "DIRECT_GBP",
         })
 
     def test_native_gbp_route_uses_exactly_one_connector_call(self):
