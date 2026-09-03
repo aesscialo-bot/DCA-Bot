@@ -220,6 +220,11 @@ timing metrics. Its signals preserve the regime without override, the trailing
 uptrend-confirmation count, override metadata, and whether that specific
 analysis run performed an automatic release.
 
+The private Kraken history preserves genuine no-trade intervals as gaps. For
+timing analysis only, internal gaps are represented as unchanged OHLC with zero
+volume and the last real close. Leading and trailing gaps are never filled, so
+the normal real-candle freshness check still fails closed on stale markets.
+
 `DCA_EXECUTION_STATE` stores `LAST_BUY_DATE`, durable `PENDING_ORDER` state, and
 FIFO `PENDING_GIST_DELIVERIES`. Completion atomically moves confirmed fill
 evidence into that delivery queue before the pending Kraken intent is cleared.

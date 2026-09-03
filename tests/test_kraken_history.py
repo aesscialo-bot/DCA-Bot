@@ -100,6 +100,30 @@ class KrakenHistoryTests(unittest.TestCase):
         self.assertEqual(summary["RANGES"][0]["INTERVALS"], 2)
         self.assertEqual(summary["RANGES"][0]["FROM"], "2026-08-01T00:15:00Z")
 
+    def test_analysis_carries_internal_no_trade_intervals_without_extending_edges(self):
+        start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        candles = {
+            int(start.timestamp()): kraken_history._new_candle(
+                start, Decimal("100"), Decimal("2")
+            ),
+            int((start + timedelta(minutes=45)).timestamp()): kraken_history._new_candle(
+                start + timedelta(minutes=45), Decimal("90"), Decimal("3")
+            ),
+        }
+        rows, carried = kraken_history._analysis_rows(
+            candles,
+            start - timedelta(minutes=15),
+            start + timedelta(minutes=75),
+        )
+        self.assertEqual(carried, 2)
+        self.assertEqual([row[0] for row in rows], [
+            int((start + timedelta(minutes=offset)).timestamp() * 1000)
+            for offset in (0, 15, 30, 45)
+        ])
+        self.assertEqual(rows[1][1:], [100.0, 100.0, 100.0, 100.0, 0.0])
+        self.assertEqual(rows[2][1:], [100.0, 100.0, 100.0, 100.0, 0.0])
+        self.assertEqual(rows[3][1:], [90.0, 90.0, 90.0, 90.0, 3.0])
+
     def test_overlap_mismatch_and_minimum_are_blocking(self):
         cutoff = datetime(2026, 8, 2, tzinfo=timezone.utc)
         start = cutoff - timedelta(days=1)

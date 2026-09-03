@@ -352,6 +352,56 @@ def _gap_summary(
     return {"COUNT": len(missing), "RANGES": ranges}
 
 
+def _analysis_rows(
+    candles: Mapping[int, Mapping[str, Any]],
+    query_from: datetime,
+    cutoff: datetime,
+) -> tuple[list[list[float]], int]:
+    """Return exact-cadence analysis rows without inventing market trades.
+
+    Kraken PostTrade correctly omits intervals in which a thin market had no
+    executions.  For price-series analysis, an internal no-trade interval has
+    unchanged OHLC, zero volume, and the last observed close.  Leading and
+    trailing gaps remain absent so freshness checks still bind analysis to a
+    recent real Kraken candle.
+    """
+
+    lower = int(query_from.timestamp())
+    upper = int(cutoff.timestamp())
+    selected = {
+        epoch: row
+        for epoch, row in candles.items()
+        if lower <= epoch < upper
+    }
+    if not selected:
+        return [], 0
+    first = min(selected)
+    last = max(selected)
+    rows: list[list[float]] = []
+    previous_close: float | None = None
+    carried = 0
+    for epoch in range(first, last + INTERVAL_SECONDS, INTERVAL_SECONDS):
+        row = selected.get(epoch)
+        if row is None:
+            if previous_close is None:  # Defensive; ``first`` is a real candle.
+                continue
+            rows.append(
+                [epoch * 1000, previous_close, previous_close, previous_close, previous_close, 0.0]
+            )
+            carried += 1
+            continue
+        values = [
+            float(row["open"]),
+            float(row["high"]),
+            float(row["low"]),
+            float(row["close"]),
+            float(row["volume"]),
+        ]
+        rows.append([epoch * 1000, *values])
+        previous_close = values[3]
+    return rows, carried
+
+
 def _load_candles(
     store: HistoryGistStore,
     target_manifest: Mapping[str, Any],
@@ -656,18 +706,7 @@ def load_ready_history(
     if cutoff - query_from < timedelta(days=60):
         raise HistoryError(f"{target} history has less than 60 days of source coverage")
     candles = _load_candles(selected_store, entry, snapshot)
-    rows = [
-        [
-            epoch * 1000,
-            float(row["open"]),
-            float(row["high"]),
-            float(row["low"]),
-            float(row["close"]),
-            float(row["volume"]),
-        ]
-        for epoch, row in sorted(candles.items())
-        if query_from.timestamp() <= epoch < cutoff.timestamp()
-    ]
+    rows, carried_intervals = _analysis_rows(candles, query_from, cutoff)
     history_hash = sha256(
         _canonical_json(entry.get("PARTITIONS", {})).encode("utf-8")
     ).hexdigest()
@@ -679,6 +718,8 @@ def load_ready_history(
         "THROUGH": entry["CUTOFF"],
         "CANDLE_COUNT": entry["CANDLE_COUNT"],
         "NO_TRADE_INTERVALS": entry["NO_TRADE_INTERVALS"],
+        "ANALYSIS_CANDLE_COUNT": len(rows),
+        "CARRIED_NO_TRADE_INTERVALS": carried_intervals,
         "OVERLAP": dict(entry["OVERLAP"]),
         "HASH": history_hash,
     }

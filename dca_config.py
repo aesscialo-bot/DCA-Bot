@@ -34,7 +34,7 @@ RULE_FIELDS = frozenset({"REGIME_AMOUNTS_GBP", "BUY_ENABLED"})
 REGIME_AMOUNT_FIELDS = frozenset({"LOW", "MID", "UP"})
 LEGACY_REGIME_AMOUNT_FIELDS = frozenset({"LOW", "UP"})
 TIMING_POLICY_VERSION = (
-    "sma150-3-close-responsive-v2+multi-window-3-5-7-14-30-45-60-v2"
+    "sma150-3-close-responsive-v2+multi-window-3-5-7-14-30-45-60-v3"
 )
 UPTREND_OVERRIDE_STATE_VERSION = 1
 UPTREND_OVERRIDE_STATE_FIELDS = frozenset({"VERSION", "TARGETS"})
