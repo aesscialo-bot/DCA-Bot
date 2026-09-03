@@ -632,6 +632,7 @@ class GhostfolioSyncTests(unittest.TestCase):
             "HYPE_USD": "kraken",
             "ETH_GBP": "kraken",
             "SOL_GBP": "kraken",
+            "DOGE_GBP": "kraken",
             "BITKUB_LEGACY": "bitkub",
         }
         with patch.dict(
@@ -676,6 +677,7 @@ class GhostfolioSyncTests(unittest.TestCase):
                     "HYPE_USD": "kraken",
                     "ETH_GBP": "kraken",
                     "SOL_GBP": "kraken",
+                    "DOGE_GBP": "kraken",
                 })
             },
         ):

@@ -6,13 +6,13 @@ schemas, workflows, or deployment configuration.
 
 ## Current production contract
 
-- Supported targets are exactly `BTC_GBP`, `ETH_GBP`, and `SOL_GBP` unless a
+- Supported targets are exactly `BTC_GBP`, `ETH_GBP`, `SOL_GBP`, and `DOGE_GBP` unless a
   deliberately staged pair-membership migration changes the full system.
 - `DCA_TARGET_MAP` contains every canonical target with only
   `REGIME_AMOUNTS_GBP` (explicit `LOW`, `MID`, and compatibility-named `UP`)
   and boolean `BUY_ENABLED`.
-- Budgets remain GBP-denominated. BTC, ETH, and SOL execute directly on Kraken
-  `BTC/GBP`, `ETH/GBP`, and `SOL/GBP`; no active target has a funding leg.
+- Budgets remain GBP-denominated. BTC, ETH, SOL, and DOGE execute directly on Kraken
+  `BTC/GBP`, `ETH/GBP`, `SOL/GBP`, and `DOGE/GBP`; no active target has a funding leg.
   Never use implicit conversion, THB, Bitkub, or the legacy `AMOUNT_GBP` /
   `TIME` schema.
 - Counter-cyclical spend mapping is `DOWNTREND`→`HIGH`, `SIDEWAYS`→`MID`, and
@@ -87,7 +87,7 @@ schemas, workflows, or deployment configuration.
   `dca-analysis-state-writers`; the trader uses its own serialized execution
   group. Preserve `queue: max` and `cancel-in-progress: false`.
 - The analysis workflow uses 3/5/7/14/30/45/60-day Bangkok windows and the
-  canonical BTC/GBP, ETH/GBP, and SOL/GBP markets.
+  canonical BTC/GBP, ETH/GBP, SOL/GBP, and DOGE/GBP markets.
 - Primary analysis is scheduled for 04:07 Asia/Bangkok with an idempotent
   04:37 recovery run.
   Railway refreshes state and checks due decisions every five minutes.

@@ -159,6 +159,7 @@ _FULL_NAMES = {
     "ethereum": "ETH",
     "ether": "ETH",
     "solana": "SOL",
+    "dogecoin": "DOGE",
 }
 
 
@@ -170,10 +171,11 @@ def _normalise_usd_key(value: str) -> str:
         "BTC": "BTC_GBP", "BTC_GBP": "BTC_GBP",
         "ETH": "ETH_GBP", "ETH_GBP": "ETH_GBP",
         "SOL": "SOL_GBP", "SOL_GBP": "SOL_GBP",
+        "DOGE": "DOGE_GBP", "DOGE_GBP": "DOGE_GBP",
     }
     key = aliases.get(raw)
     if key not in ALLOWED_TARGETS:
-        raise ValueError("Supported assets are BTC/GBP, ETH/GBP, SOL/GBP")
+        raise ValueError("Supported assets are BTC/GBP, ETH/GBP, SOL/GBP, DOGE/GBP")
     return key
 
 
@@ -579,7 +581,7 @@ CHAT_TOPIC_REPLIES = {
         "command, and invalid or stale state fails closed."
     ),
     "markets": (
-        "📈 The configured markets are BTC/GBP, ETH/GBP, and SOL/GBP. All three "
+        "📈 The configured markets are BTC/GBP, ETH/GBP, SOL/GBP, and DOGE/GBP. All four "
         "spend GBP directly on Kraken. "
         "Type `show status` to see which pairs are currently enabled."
     ),
@@ -612,7 +614,7 @@ Natural language is strictly read-only. Never return an action that changes a
 budget, runs analysis, enables or disables a pair, confirms a change, or places
 an order. Requests for those actions must be chat/controls and must never be
 described as completed. Do not claim access to live prices or news. The exact
-markets are BTC/GBP, ETH/GBP, and SOL/GBP. Deterministic Python—not Gemini—owns
+markets are BTC/GBP, ETH/GBP, SOL/GBP, and DOGE/GBP. Deterministic Python—not Gemini—owns
 regimes, amounts, timing, analysis, and execution.
 
 Respond as JSON only with exactly `action` and `topic`. For non-chat actions use
@@ -965,7 +967,7 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
     if current["global_rules_hash"] != expected["global_rules_hash"]:
         _pending_enable_confirmations.pop(author_id, None)
         await message.reply(
-            "Blocked: the global three-asset DCA rules changed after review. "
+            "Blocked: the global four-asset DCA rules changed after review. "
             "Run the enable command again to review current aggregate exposure."
         )
         return
@@ -1010,7 +1012,7 @@ async def handle_analyze(params: dict[str, Any], message: discord.Message) -> No
     raw_symbol = str(params.get("symbol") or params.get("symbols") or "all").strip()
     if raw_symbol.lower() == "all":
         workflow_symbol = "all"
-        label = "all three Kraken DCA targets"
+        label = "all four Kraken DCA targets"
     else:
         try:
             workflow_symbol = _to_usd_pair(raw_symbol)
@@ -1352,18 +1354,17 @@ def _decision_summary(
     override_summary = _uptrend_override_summary(decision)
     override_suffix = f"{override_summary}\n" if override_summary else ""
     return (
-        f"{configured_icon} **{_pair_label(symbol)}** (`{symbol}`) | Configured: "
+        f"{configured_icon} **{_pair_label(symbol)}** (`{symbol}`) | "
         f"**{configured_status}** | Orders: **{permission}**\n"
         f"  💷 UPTREND/lower "
         f"{_display_amount(amounts['LOW'])} | SIDEWAYS "
         f"{_display_amount(amount_for_tier_gbp(rule, 'MID'))} | DOWNTREND/higher "
         f"{_display_amount(amounts['UP'])}\n"
-        f"  📊 Analysis: {decision_status} | Regime: `{regime}` | Spend: {amount} | "
-        f"Selected: `{selected_time}` | Effective: `{next_time}` | Age: `{age}`\n"
+        f"  📊 {decision_status} | Regime: `{regime}` | Spend: {amount} | "
+        f"Effective: `{next_time}`\n"
         f"{override_suffix}"
-        f"  🧾 Analysis date: `{decision['ANALYSIS_DATE']}` | Data through: `{history_data_through}` | "
-        f"Last buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}` | "
-        f"Decision: `{decision['DECISION_ID']}`"
+        f"  🧾 Data through: `{history_data_through}` | "
+        f"Last buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}`"
         f"{pending_text}{delivery_text}"
     )
 
@@ -1694,7 +1695,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     )
     lines = [
         f"**DCA health: {posture}**",
-        f"- Rules: valid ({len(rules)}/3 GBP targets; GBP budgets)",
+        f"- Rules: valid ({len(rules)}/{len(ALLOWED_TARGETS)} GBP targets; GBP budgets)",
         "- " + _format_analysis_workflow_health(workflow_health),
         "- " + _format_analysis_watchdog_health(watchdog_health),
         (
@@ -1704,7 +1705,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
                 else "- Analysis: awaiting 04:07 daily analysis"
             )
             if awaiting_analysis or daily_analysis_pending
-            else f"- Analysis: fresh READY {len(ready)}/3"
+            else f"- Analysis: fresh READY {len(ready)}/{len(ALLOWED_TARGETS)}"
         ),
         f"- Execution state: valid; pending Kraken recoveries {pending_count}",
         (
@@ -1723,7 +1724,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
         f"- Railway scheduler: {'running' if DCA_CRON_ENABLED else 'paused'}; "
         f"active targets {len(_dca_schedule)}",
         f"- Analysis/scheduling chain: {chain_status}",
-        f"- Buy-enabled targets: {enabled_count}/3",
+        f"- Buy-enabled targets: {enabled_count}/{len(ALLOWED_TARGETS)}",
     ]
     if _schedule_start_date is not None:
         lines.append(
@@ -1744,7 +1745,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
 
 
 HELP_TEXT = """🐙 **Kraken GBP-market DCA controls — clear command guide**
-Markets: **BTC/GBP**, **ETH/GBP**, and **SOL/GBP**. Budgets are in GBP.
+Markets: **BTC/GBP**, **ETH/GBP**, **SOL/GBP**, and **DOGE/GBP**. Budgets are in GBP.
 
 📊 **Read only**
 `show status` or `!dca status` — pair state, today’s analysis, times, and order permission
@@ -1754,7 +1755,7 @@ Markets: **BTC/GBP**, **ETH/GBP**, and **SOL/GBP**. Budgets are in GBP.
 
 🔎 **Run deterministic analysis** *(allowlisted user)*
 `!dca analyze BTC` — replace BTC with ETH or SOL
-`!dca analyze all` — analyze all three pairs
+`!dca analyze all` — analyze all four pairs
 
 💷 **Change a budget** *(disable the pair first)*
 `!dca set BTC amounts to 5 low, 10 sideways, and 20 high`
@@ -1892,7 +1893,7 @@ def refresh_dca_schedule(
         _dca_schedule.clear()
         _schedule_error = None
         _schedule_warning = (
-            "global all-three Kraken history gate: "
+            "global all-four Kraken history gate: "
             + "; ".join(global_history_failures)
         )
         return True

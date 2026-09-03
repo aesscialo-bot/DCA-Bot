@@ -51,7 +51,7 @@ class KrakenOrderAuditTests(unittest.TestCase):
     def test_active_targets_are_all_direct_gbp_and_legacy_markets_remain_audited(self):
         self.assertEqual(
             kraken_order_audit.TARGETS,
-            ("BTC_GBP", "ETH_GBP", "SOL_GBP"),
+            ("BTC_GBP", "ETH_GBP", "SOL_GBP", "DOGE_GBP"),
         )
         self.assertEqual(
             kraken_order_audit.LEGACY_AUDIT_MARKETS,

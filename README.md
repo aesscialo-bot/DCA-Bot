@@ -26,7 +26,7 @@ mirror and can never affect analysis, budgets, scheduling, or Kraken execution.
 > [!WARNING]
 > Recovery defaults to `DCA_TRADING_MODE=shadow`. Production scheduling remains
 > paused until the 65-day Kraken bootstrap reports verified `READY` coverage for
-> all three pairs and a full shadow cycle passes. The missed 7 August purchase
+> all four pairs and a full shadow cycle passes. The missed 7 August purchase
 > is intentionally not replayed.
 
 ## Production configuration
@@ -52,6 +52,10 @@ The approved counter-cyclical budgets are explicit for every regime:
   "SOL_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
     "BUY_ENABLED": true
+  },
+  "DOGE_GBP": {
+    "REGIME_AMOUNTS_GBP": {"LOW": 0, "MID": 0, "UP": 0},
+    "BUY_ENABLED": false
   }
 }
 ```
@@ -205,10 +209,10 @@ stopping automation.
 
 ## State and runtime configuration
 
-`DCA_TARGET_MAP` contains only the three exact target keys, their lower `LOW`
-and upper `UP` GBP endpoints, and `BUY_ENABLED` flags. Budget edits are atomic
-and permitted only while the selected asset is disabled. `MID` and `HIGH` are
-derived analysis tiers, not extra fields in this user-owned JSON.
+`DCA_TARGET_MAP` contains only the four exact target keys, explicit `LOW`, `MID`,
+and `UP` GBP amounts, and `BUY_ENABLED` flags. Budget edits are atomic and
+permitted only while the selected asset is disabled. DOGE starts disabled with
+zero amounts until its operator-approved budgets are configured.
 
 `DCA_ANALYSIS_STATE` stores each asset's status, effective regime, selected tier,
 `EXECUTE_AT`, `VALID_UNTIL`, `DECISION_ID`, `RULES_HASH`, signal metrics, and

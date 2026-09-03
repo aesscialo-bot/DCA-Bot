@@ -33,7 +33,7 @@ def source_analysis(rules=None):
         "ETH_GBP": rules["HYPE_USD"],
         "SOL_GBP": rules["SOL_GBP"],
     }
-    state = empty_analysis_state(mapped_rules, now=NOW)
+    state = empty_analysis_state(mapped_rules, now=NOW, require_all=False)
     state["TARGETS"]["HYPE_USD"] = state["TARGETS"].pop("ETH_GBP")
     return state
 

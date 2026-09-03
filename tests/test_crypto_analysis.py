@@ -139,15 +139,15 @@ class AnalysisSymbolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "configured Kraken markets only"):
             crypto_analysis.get_analysis_exchange("coinbase")
 
-    def test_derives_exact_three_kraken_gbp_pairs_from_rules(self):
+    def test_derives_exact_four_kraken_gbp_pairs_from_rules(self):
         rules = dca_config.default_rules_map()
         self.assertEqual(
             crypto_analysis._parse_symbols("", json.dumps(rules)),
-            ["BTC/GBP", "ETH/GBP", "SOL/GBP"],
+            ["BTC/GBP", "ETH/GBP", "SOL/GBP", "DOGE/GBP"],
         )
         self.assertEqual(
             crypto_analysis._parse_symbols("all", json.dumps(rules)),
-            ["BTC/GBP", "ETH/GBP", "SOL/GBP"],
+            ["BTC/GBP", "ETH/GBP", "SOL/GBP", "DOGE/GBP"],
         )
 
     def test_explicit_supported_subset_is_normalized(self):
@@ -339,7 +339,7 @@ class UptrendOverrideTests(unittest.TestCase):
             "boolean version": {**valid, "VERSION": True},
             "unknown target": {
                 "VERSION": 1,
-                "TARGETS": {"DOGE_GBP": next(iter(valid["TARGETS"].values()))},
+                "TARGETS": {"ADA_GBP": next(iter(valid["TARGETS"].values()))},
             },
             "extra entry field": {
                 "VERSION": 1,

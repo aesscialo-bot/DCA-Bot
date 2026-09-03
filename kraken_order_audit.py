@@ -38,6 +38,7 @@ ACTIVE_AUDIT_PROFILE = AuditProfile(
             "BTC_GBP": "DIRECT_GBP",
             "ETH_GBP": "DIRECT_GBP",
             "SOL_GBP": "DIRECT_GBP",
+            "DOGE_GBP": "DIRECT_GBP",
         }
     ),
 )
@@ -290,7 +291,7 @@ def audit_orders(
     now=None,
     profile: AuditProfile = ACTIVE_AUDIT_PROFILE,
 ) -> dict:
-    """Read account-wide order state for the three targets and their FX leg."""
+    """Read account-wide order state for active targets and legacy audit legs."""
     if not any(profile is candidate for candidate in AUDIT_PROFILES):
         raise ValueError("unsupported Kraken order audit profile")
     selected_tz = ZoneInfo(TIMEZONE_NAME)
