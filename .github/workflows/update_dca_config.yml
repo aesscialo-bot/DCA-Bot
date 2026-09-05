@@ -12,7 +12,7 @@ on:
           - set_enabled
           - dry_run
       symbol:
-        description: Canonical Kraken key (BTC_GBP, ETH_GBP, SOL_GBP, or DOGE_GBP)
+        description: Canonical Kraken key (BTC_GBP, ETH_GBP, SOL_GBP, or DOGE_GBP), or lowercase all for atomic set_enabled only
         required: true
         type: string
       low_amount_gbp_json:
@@ -36,7 +36,7 @@ on:
         default: ""
         type: string
       expected_rules_hash:
-        description: Exact rules fingerprint reviewed before enabling
+        description: Reviewed target rules fingerprint; for all use the global rules fingerprint
         required: false
         default: ""
         type: string
@@ -53,6 +53,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   # Acquire analysis first only for enabling. An enable queued behind a long
@@ -91,6 +92,7 @@ jobs:
         id: config_update
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+          DCA_WORKFLOW_READ_TOKEN: ${{ github.token }}
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
           KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
           ACTION: ${{ inputs.action }}
@@ -105,6 +107,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # A fresh dispatch has a new ordering identity. Replaying an old
+          # enable OR disable could otherwise invert the operator's requests.
+          if [ "$GITHUB_RUN_ATTEMPT" != "1" ]; then
+            echo "::error::Configuration runs cannot be replayed; check status and send a fresh command."
+            exit 1
+          fi
           check_target_migration_lock() {
             local lock_error="$RUNNER_TEMP/target-migration-lock-error.txt"
             if gh variable get DCA_TARGET_MIGRATION_LOCK --repo "$GITHUB_REPOSITORY" >/dev/null 2>"$lock_error"; then
@@ -121,25 +129,32 @@ jobs:
             echo "Could not read DCA_TARGET_MAP; refusing the update." >&2
             exit 1
           fi
-          analysis_error="$RUNNER_TEMP/analysis-state-error.txt"
-          if ! DCA_ANALYSIS_STATE=$(gh variable get DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY" 2>"$analysis_error"); then
-            if grep -Fq 'variable DCA_ANALYSIS_STATE was not found' "$analysis_error"; then
-              DCA_ANALYSIS_STATE='{}'
-            else
-              echo "Could not check DCA_ANALYSIS_STATE; refusing the update." >&2
-              exit 1
-            fi
-          fi
-          execution_error="$RUNNER_TEMP/execution-state-error.txt"
-          if ! DCA_EXECUTION_STATE=$(gh variable get DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY" 2>"$execution_error"); then
-            if ! grep -Fq 'variable DCA_EXECUTION_STATE was not found' "$execution_error"; then
-              echo "Could not check DCA_EXECUTION_STATE; refusing the update." >&2
-              exit 1
-            elif [ "$ACTION" = "set_enabled" ] && [ "$ENABLED_JSON" = "true" ]; then
-              echo "Could not read DCA_EXECUTION_STATE; refusing enable." >&2
-              exit 1
-            fi
+          if [ "$ACTION" = "set_enabled" ] && [ "$SYMBOL" = "all" ] && [ "$ENABLED_JSON" = "false" ]; then
+            # Emergency bulk disable changes only flags, even when ancillary
+            # state is missing, malformed, or temporarily unreadable.
+            DCA_ANALYSIS_STATE='{}'
             DCA_EXECUTION_STATE='{}'
+          else
+            analysis_error="$RUNNER_TEMP/analysis-state-error.txt"
+            if ! DCA_ANALYSIS_STATE=$(gh variable get DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY" 2>"$analysis_error"); then
+              if grep -Fq 'variable DCA_ANALYSIS_STATE was not found' "$analysis_error"; then
+                DCA_ANALYSIS_STATE='{}'
+              else
+                echo "Could not check DCA_ANALYSIS_STATE; refusing the update." >&2
+                exit 1
+              fi
+            fi
+            execution_error="$RUNNER_TEMP/execution-state-error.txt"
+            if ! DCA_EXECUTION_STATE=$(gh variable get DCA_EXECUTION_STATE --repo "$GITHUB_REPOSITORY" 2>"$execution_error"); then
+              if ! grep -Fq 'variable DCA_EXECUTION_STATE was not found' "$execution_error"; then
+                echo "Could not check DCA_EXECUTION_STATE; refusing the update." >&2
+                exit 1
+              elif [ "$ACTION" = "set_enabled" ] && [ "$ENABLED_JSON" = "true" ]; then
+                echo "Could not read DCA_EXECUTION_STATE; refusing enable." >&2
+                exit 1
+              fi
+              DCA_EXECUTION_STATE='{}'
+            fi
           fi
           for value in "$DCA_TARGET_MAP" "$DCA_ANALYSIS_STATE" "$DCA_EXECUTION_STATE"; do
             while IFS= read -r line; do
@@ -175,7 +190,11 @@ jobs:
           fi
           check_target_migration_lock
           if [ "$ACTION" = "set_enabled" ] && [ "$ENABLED_JSON" = "true" ]; then
-            # A prior enabled decision must not revive after disable/re-enable.
+            # A newer stop can leave the same flags/hash (already disabled).
+            # Check durable request ordering, not only the reviewed rule hash.
+            python -u dca_config_queue_guard.py
+            # Prior decisions for every selected target (all four for symbol=all)
+            # must not revive after disable/re-enable.
             # This job holds the rules lock as well as the outer analysis lock.
             if ! gh variable set DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY" \
               --body "$(<"$ANALYSIS_OUTPUT_FILE")" >"$RUNNER_TEMP/enable-analysis-write.log" 2>&1; then
@@ -191,6 +210,8 @@ jobs:
             python -u dca_config_notification.py verify-analysis-readback \
               --expected "$ANALYSIS_OUTPUT_FILE" --observed "$ANALYSIS_READBACK_FILE"
             check_target_migration_lock
+            # Recheck immediately before the one rules write, under its lock.
+            python -u dca_config_queue_guard.py
           fi
           if ! gh variable set DCA_TARGET_MAP \
             --repo "$GITHUB_REPOSITORY" \

@@ -98,6 +98,8 @@ DCA_OUTBOX_GHOSTFOLIO_EVENT_RECEIPT_PATH = "portfolio/ghostfolio_sync_receipts.j
 
 # A restart intentionally cancels pending confirmations.
 _pending_enable_confirmations: dict[str, dict[str, Any]] = {}
+# Disable intent invalidates overlapping reviews, including reads still in flight.
+_enable_review_revisions: dict[str, int] = {target: 0 for target in ALLOWED_TARGETS}
 
 # symbol -> absolute decision and execution-state metadata.
 _dca_schedule: dict[str, dict[str, Any]] = {}
@@ -892,29 +894,53 @@ async def handle_set_amounts(
         await message.reply(_unconfirmed_dispatch("update_dca_config.yml"))
 
 
+def _enable_targets(symbol: str) -> tuple[str, ...]:
+    return tuple(ALLOWED_TARGETS) if symbol == "all" else (symbol,)
+
+
+def _enable_review_revision(symbol: str) -> tuple[int, ...]:
+    return tuple(_enable_review_revisions[target] for target in _enable_targets(symbol))
+
+
+def _cancel_overlapping_enable_reviews(symbol: str) -> None:
+    targets = set(_enable_targets(symbol))
+    for target in targets:
+        _enable_review_revisions[target] += 1
+    for author_id, pending in list(_pending_enable_confirmations.items()):
+        if targets.intersection(_enable_targets(pending["review"]["symbol"])):
+            _pending_enable_confirmations.pop(author_id, None)
+
+
 async def handle_disable(symbol_value: str, message: discord.Message) -> None:
     if not _is_authorized_config_writer(message):
         await message.reply("Blocked: this write requires an allowlisted Discord user.")
         return
     try:
-        symbol = _normalise_usd_key(symbol_value)
+        symbol = "all" if symbol_value == "all" else _normalise_usd_key(symbol_value)
     except ValueError as exc:
         await message.reply(f"Invalid request: {_safe_text(exc)}")
         return
+    # Do this before any await, even if GitHub later returns an ambiguous failure.
+    _cancel_overlapping_enable_reviews(symbol)
     inputs = {
         "action": "set_enabled",
         "symbol": symbol,
         "enabled_json": "false",
     }
     if await asyncio.to_thread(trigger_workflow, "update_dca_config.yml", inputs):
-        _pending_enable_confirmations.pop(_message_author_id(message), None)
+        label = "all four targets" if symbol == "all" else symbol
         await message.reply(
-            f"Queued disable for **{symbol}**. Once applied, the trader's live "
+            f"Queued disable for **{label}**. Overlapping enable reviews were cancelled. "
+            "Once applied, the trader's live "
             "pre-submit check blocks a new order; an order already accepted by "
-            "Kraken will still be reconciled.\n" + _workflow_link("update_dca_config.yml")
+            "Kraken will still be reconciled. Budgets, trading modes, and scheduling "
+            "are unchanged.\n" + _workflow_link("update_dca_config.yml")
         )
     else:
-        await message.reply(_unconfirmed_dispatch("update_dca_config.yml"))
+        await message.reply(
+            "Overlapping enable reviews were cancelled locally. "
+            + _unconfirmed_dispatch("update_dca_config.yml")
+        )
 
 
 def _enable_review(
@@ -932,36 +958,48 @@ def _enable_review(
             "cannot enable while Kraken order reconciliation is pending for "
             + ", ".join(pending_symbols)
         )
-    rule = rules[symbol]
-    if rule["BUY_ENABLED"]:
-        raise ConfigError(f"{symbol} is already enabled")
-    amounts = rule["REGIME_AMOUNTS_GBP"]
-    tier_amounts = {
-        "LOW": amount_for_tier_gbp(rule, "LOW"),
-        "MID": amount_for_tier_gbp(rule, "MID"),
-        "UP": amount_for_tier_gbp(rule, "HIGH"),
-    }
-    for tier, configured_amount in tier_amounts.items():
-        amount = float(configured_amount)
-        if not DCA_AMOUNT_MIN_GBP <= amount <= DCA_AMOUNT_MAX_GBP:
-            raise ConfigError(
-                f"{symbol} {tier} must be between £{DCA_AMOUNT_MIN_GBP:g} "
-                f"and £{DCA_AMOUNT_MAX_GBP:,.0f} before enabling"
-            )
+    targets = _enable_targets(symbol)
+    if all(rules[target]["BUY_ENABLED"] for target in targets):
+        label = "All four targets are" if symbol == "all" else f"{symbol} is"
+        raise ConfigError(f"{label} already enabled")
+    reviewed_targets = {}
+    for target in targets:
+        rule = rules[target]
+        tier_amounts = {
+            "LOW": amount_for_tier_gbp(rule, "LOW"),
+            "MID": amount_for_tier_gbp(rule, "MID"),
+            "UP": amount_for_tier_gbp(rule, "HIGH"),
+        }
+        for tier, configured_amount in tier_amounts.items():
+            amount = float(configured_amount)
+            if not DCA_AMOUNT_MIN_GBP <= amount <= DCA_AMOUNT_MAX_GBP:
+                raise ConfigError(
+                    f"{target} {tier} must be between £{DCA_AMOUNT_MIN_GBP:g} "
+                    f"and £{DCA_AMOUNT_MAX_GBP:,.0f} before enabling"
+                )
+        reviewed_targets[target] = {
+            "low": float(tier_amounts["LOW"]),
+            "mid": float(tier_amounts["MID"]),
+            "high": float(tier_amounts["UP"]),
+            "enabled": rule["BUY_ENABLED"],
+        }
 
-    expected_hash = rules_hash(symbol, rule)
+    global_hash = global_rules_pre_state_hash(rules)
+    expected_hash = global_hash if symbol == "all" else rules_hash(symbol, rules[symbol])
     exposure_rules = deepcopy(dict(rules))
-    exposure_rules[symbol]["BUY_ENABLED"] = True
+    for target in targets:
+        exposure_rules[target]["BUY_ENABLED"] = True
     maximum_exposure = float(maximum_daily_exposure_gbp(exposure_rules))
-    return {
+    review = {
         "symbol": symbol,
-        "low": float(amounts["LOW"]),
-        "mid": float(amount_for_tier_gbp(rule, "MID")),
-        "high": float(amounts["UP"]),
+        "targets": reviewed_targets,
         "rules_hash": expected_hash,
-        "global_rules_hash": global_rules_pre_state_hash(rules),
+        "global_rules_hash": global_hash,
         "maximum_exposure": maximum_exposure,
     }
+    if symbol != "all":
+        review.update(reviewed_targets[symbol])
+    return review
 
 
 async def handle_enable(symbol_value: str, message: discord.Message) -> None:
@@ -969,7 +1007,8 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
         await message.reply("Blocked: this write requires an allowlisted Discord user.")
         return
     try:
-        symbol = _normalise_usd_key(symbol_value)
+        symbol = "all" if symbol_value == "all" else _normalise_usd_key(symbol_value)
+        revision = _enable_review_revision(symbol)
         raw_rules, raw_execution = await asyncio.gather(
             asyncio.to_thread(get_repo_variable, RULES_VARIABLE),
             asyncio.to_thread(get_repo_variable, EXECUTION_STATE_VARIABLE),
@@ -978,6 +1017,16 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
             raise ConfigError("GitHub did not return rules and execution state")
         rules = validate_rules_map(raw_rules)
         execution = validate_execution_state(raw_execution)
+        if revision != _enable_review_revision(symbol):
+            raise ConfigError("a disable was requested during this review; review again")
+        if symbol == "all" and all(rules[target]["BUY_ENABLED"] for target in ALLOWED_TARGETS):
+            _pending_enable_confirmations.pop(_message_author_id(message), None)
+            await message.reply(
+                "All four targets are already enabled. No workflow queued. "
+                "Trading modes and scheduling are unchanged; enablement alone "
+                "does not authorize an order."
+            )
+            return
         review = _enable_review(
             symbol,
             rules,
@@ -994,6 +1043,32 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
         "review": review,
         "expires_at": monotonic() + ENABLE_CONFIRMATION_TTL_SECONDS,
     }
+    if symbol == "all":
+        lines = [
+            "**Enable review — all four targets**",
+            "UPTREND/LOW · SIDEWAYS/MID · DOWNTREND/HIGH budgets in GBP:",
+        ]
+        for target, target_review in review["targets"].items():
+            flag = "ENABLED" if target_review["enabled"] else "DISABLED"
+            lines.append(
+                f"**{target.replace('_', '/')}** — currently {flag} → ENABLED\n"
+                f"{_display_amount(target_review['low'])} / "
+                f"{_display_amount(target_review['mid'])} / "
+                f"{_display_amount(target_review['high'])}"
+            )
+        lines.extend([
+            "Maximum aggregate daily exposure after enable: "
+            f"**{_display_amount(review['maximum_exposure'])}**",
+            "One atomic update: any invalid budget, Kraken minimum, changed rule, "
+            "or pending order blocks the whole enable. All four prior decisions "
+            "are invalidated before enabling.",
+            "This does not change trading modes or scheduling and places no immediate order. "
+            "After the workflow reports APPLIED, run `!dca analyze all`; buying "
+            "still requires the next successful analysis and every execution check.",
+            f"Send exactly `{command}` within {ENABLE_CONFIRMATION_TTL_SECONDS // 60} minutes.",
+        ])
+        await _reply_sections(message, ["\n".join(lines)])
+        return
     await message.reply(
         f"**Enable review for {symbol}**\n"
         f"UPTREND/lower: {_display_amount(review['low'])} | "
@@ -1041,7 +1116,8 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
             execution,
         )
     except ConfigError as exc:
-        _pending_enable_confirmations.pop(author_id, None)
+        if _pending_enable_confirmations.get(author_id) is pending:
+            _pending_enable_confirmations.pop(author_id, None)
         await message.reply(f"Blocked after live revalidation: {_safe_text(exc)}.")
         return
 
@@ -1062,9 +1138,7 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
         return
 
     bound_fields = (
-        "low",
-        "mid",
-        "high",
+        "targets",
         "rules_hash",
         "maximum_exposure",
     )
@@ -1085,6 +1159,16 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
     }
     _pending_enable_confirmations.pop(author_id, None)
     if await asyncio.to_thread(trigger_workflow, "update_dca_config.yml", inputs):
+        if expected["symbol"] == "all":
+            await message.reply(
+                "Bulk enable validation queued for **all four targets** as one atomic "
+                "update. No configuration result is confirmed yet. After the workflow "
+                "reports APPLIED, run `!dca analyze all`; buying waits for the next "
+                "successful analysis and every execution check. Trading modes and "
+                "scheduling are unchanged; this places no immediate order.\n"
+                + _workflow_link("update_dca_config.yml")
+            )
+            return
         await message.reply(
             f"Enable validation queued for **{expected['symbol']}**. It remains disabled "
             "unless the workflow confirms the same live rules and Kraken minimum. "
@@ -1974,12 +2058,16 @@ Markets: **BTC/GBP**, **ETH/GBP**, **SOL/GBP**, and **DOGE/GBP**. Budgets are in
 💷 **Change a budget** *(disable the pair first)*
 `!dca set BTC amounts to 5 low, 10 sideways, and 20 high`
 Wait for the workflow's applied confirmation before the next change.
-LOW ≤ MID ≤ UP; all three need approved budgets before enabling. DOGE starts at £0.
+LOW ≤ MID ≤ UP; all three need approved nonzero budgets before enabling.
 
-⏸️ **Disable or review-enable a pair**
+⏸️ **Disable or review-enable targets**
 `!dca disable BTC`
 `!dca enable BTC` — review first, then copy the exact confirmation returned
+`!dca disable all` — one update; cancels everyone's outstanding enable reviews
+`!dca enable all` — review all four budgets and flags, then `!dca confirm enable all`
 Confirm within five minutes. Enablement starts with the next successful analysis.
+Any invalid budget or pending order blocks bulk enable. After APPLIED, run
+`!dca analyze all`. These commands do not change modes or scheduling and place no immediate order.
 
 💬 **Chat with Gemini**
 Talk normally for explanations or read-only requests. Natural language cannot

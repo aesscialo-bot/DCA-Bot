@@ -17,11 +17,30 @@ class ReleaseDocumentationTests(unittest.TestCase):
                 rules = validate_rules_map(json.loads(examples[0]))
                 self.assertEqual(set(rules), set(TARGET_KEYS))
                 self.assertTrue(all(not rule["BUY_ENABLED"] for rule in rules.values()))
-                self.assertEqual(rules["DOGE_GBP"]["REGIME_AMOUNTS_GBP"], {"LOW": 0, "MID": 0, "UP": 0})
+                self.assertEqual(rules["DOGE_GBP"]["REGIME_AMOUNTS_GBP"], {"LOW": 5, "MID": 10, "UP": 15})
+                self.assertEqual(sum(rule["REGIME_AMOUNTS_GBP"]["LOW"] for rule in rules.values()), 20)
+                self.assertEqual(sum(rule["REGIME_AMOUNTS_GBP"]["MID"] for rule in rules.values()), 40)
+                self.assertEqual(sum(rule["REGIME_AMOUNTS_GBP"]["UP"] for rule in rules.values()), 65)
                 self.assertIn("DCA_CRON_ENABLED=false", text)
                 self.assertIn("LAST_REAL_CANDLE_AT", text)
                 self.assertIn("COVERAGE_THROUGH", text)
                 self.assertIn("expected_decision_id", text)
+
+    def test_bulk_controls_document_confirmation_atomicity_and_unchanged_pause(self):
+        root = Path(__file__).resolve().parents[1]
+        for name in ("README.md", "00_START_HERE.md", "CLAUDE.md"):
+            with self.subTest(document=name):
+                text = (root / name).read_text(encoding="utf-8")
+                for command in ("!dca enable all", "!dca confirm enable all", "!dca disable all"):
+                    self.assertIn(command, text)
+                self.assertIn("five minutes", text)
+                self.assertIn("atomic", text)
+                self.assertIn("APPLIED", text)
+                self.assertIn("!dca analyze all", text)
+                self.assertIn("DCA_CRON_ENABLED=false", text)
+                self.assertIn("DCA_TRADING_MODE=shadow", text)
+                self.assertIn("supersedes", text)
+                self.assertIn("fresh request", text)
 
 
 if __name__ == "__main__":
