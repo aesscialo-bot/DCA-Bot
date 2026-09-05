@@ -40,6 +40,7 @@ from dca_config import (
     empty_analysis_state,
     rules_hash,
     validate_analysis_state,
+    validate_history_summary,
     validate_rules_map,
     validate_uptrend_override_state,
 )
@@ -796,6 +797,9 @@ def analyze_asset(
     generated = now or _utc_now()
     fingerprint = rules_hash(target, rule)
     daily, weekly, intraday, history = _fetch_asset_rows(exchange, TARGET_SYMBOLS[target])
+    # Freshness is the verified completed source scan, not the latest actual
+    # trade on a thin market. Historical prices never size a live Kraken order.
+    validate_history_summary(target, history, analyzed_at=generated)
     normal_regime, signals = classify_trend(daily, weekly, now=generated)
     regime, signals = _apply_uptrend_override(
         normal_regime, signals, uptrend_override

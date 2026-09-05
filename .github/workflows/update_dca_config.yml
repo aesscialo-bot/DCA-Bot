@@ -41,12 +41,12 @@ on:
         default: ""
         type: string
       expected_decision_id:
-        description: Exact analysis decision reviewed before enabling
+        description: Legacy compatibility input (not required for guarded enabling)
         required: false
         default: ""
         type: string
       expected_global_rules_hash:
-        description: Canonical fingerprint of all three reviewed rules
+        description: Canonical fingerprint of all four reviewed rules
         required: false
         default: ""
         type: string
@@ -55,9 +55,9 @@ permissions:
   contents: read
 
 concurrency:
-  # Rule writes serialize with each other but remain independent of the trader,
-  # allowing a disable to reach the trader's final live-state check immediately.
-  group: dca-rule-writers
+  # Acquire analysis first only for enabling. An enable queued behind a long
+  # analysis must not hold the rules lock and delay a later emergency disable.
+  group: ${{ inputs.action == 'set_enabled' && inputs.enabled_json == 'true' && 'dca-analysis-state-writers' || format('dca-config-no-analysis-{0}', github.run_id) }}
   queue: max
   cancel-in-progress: false
 
@@ -66,6 +66,12 @@ jobs:
     name: Validate and update rules
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    concurrency:
+      # Every config write shares this lock, independent of the trader. Enable
+      # jobs arrive here only after acquiring the outer analysis lock.
+      group: dca-rule-writers
+      queue: max
+      cancel-in-progress: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7.0.1
@@ -82,6 +88,7 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Validate atomic update against live state
+        id: config_update
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
           KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
@@ -142,7 +149,10 @@ jobs:
           export DCA_TARGET_MAP DCA_ANALYSIS_STATE DCA_EXECUTION_STATE
 
           OUTPUT_FILE="$RUNNER_TEMP/dca-target-map.json"
-          python -u dca_config_writer.py \
+          ANALYSIS_OUTPUT_FILE="$RUNNER_TEMP/dca-enable-analysis.json"
+          # Untrusted inputs, exchange responses, and production JSON must not
+          # escape in a traceback. Only fixed diagnostics are logged here.
+          if ! python -u dca_config_writer.py \
             --action "$ACTION" \
             --symbol "$SYMBOL" \
             --low-amount-gbp-json "$LOW_AMOUNT_GBP_JSON" \
@@ -152,14 +162,61 @@ jobs:
             --expected-rules-hash "$EXPECTED_RULES_HASH" \
             --expected-decision-id "$EXPECTED_DECISION_ID" \
             --expected-global-rules-hash "$EXPECTED_GLOBAL_RULES_HASH" \
-            --output "$OUTPUT_FILE"
+            --output "$OUTPUT_FILE" --analysis-output "$ANALYSIS_OUTPUT_FILE" \
+            >"$RUNNER_TEMP/config-validation.log" 2>&1; then
+            echo "::error::Configuration validation failed; check budgets, confirmation, pending orders, and Kraken availability. Run analyze all if analysis state is invalid."
+            exit 1
+          fi
 
           if [ "$ACTION" = "dry_run" ]; then
+            echo "verified_result=validated" >> "$GITHUB_OUTPUT"
             echo "Dry run passed; DCA_TARGET_MAP was not changed."
             exit 0
           fi
           check_target_migration_lock
-          gh variable set DCA_TARGET_MAP \
+          if [ "$ACTION" = "set_enabled" ] && [ "$ENABLED_JSON" = "true" ]; then
+            # A prior enabled decision must not revive after disable/re-enable.
+            # This job holds the rules lock as well as the outer analysis lock.
+            if ! gh variable set DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY" \
+              --body "$(<"$ANALYSIS_OUTPUT_FILE")" >"$RUNNER_TEMP/enable-analysis-write.log" 2>&1; then
+              echo "::error::Analysis invalidation was not confirmed; enable was not written."
+              exit 1
+            fi
+            ANALYSIS_READBACK_FILE="$RUNNER_TEMP/dca-enable-analysis-readback.json"
+            if ! gh variable get DCA_ANALYSIS_STATE --repo "$GITHUB_REPOSITORY" \
+              >"$ANALYSIS_READBACK_FILE" 2>"$RUNNER_TEMP/enable-analysis-readback-error.txt"; then
+              echo "::error::Analysis invalidation readback failed; enable was not written."
+              exit 1
+            fi
+            python -u dca_config_notification.py verify-analysis-readback \
+              --expected "$ANALYSIS_OUTPUT_FILE" --observed "$ANALYSIS_READBACK_FILE"
+            check_target_migration_lock
+          fi
+          if ! gh variable set DCA_TARGET_MAP \
             --repo "$GITHUB_REPOSITORY" \
-            --body "$(<"$OUTPUT_FILE")"
-          echo "Applied one serialized configuration update for $SYMBOL."
+            --body "$(<"$OUTPUT_FILE")" >"$RUNNER_TEMP/config-write.log" 2>&1; then
+            echo "::error::Configuration write was not confirmed; inspect live status before retrying."
+            exit 1
+          fi
+          READBACK_FILE="$RUNNER_TEMP/dca-target-map-readback.json"
+          if ! gh variable get DCA_TARGET_MAP --repo "$GITHUB_REPOSITORY" \
+            >"$READBACK_FILE" 2>"$RUNNER_TEMP/config-readback-error.txt"; then
+            echo "::error::Configuration readback failed; a write may already have occurred."
+            exit 1
+          fi
+          python -u dca_config_notification.py verify-readback \
+            --expected "$OUTPUT_FILE" --observed "$READBACK_FILE"
+          echo "verified_result=applied" >> "$GITHUB_OUTPUT"
+          echo "Applied one serialized configuration update; persisted rules readback matched."
+
+      - name: Publish configuration result to Discord
+        if: always()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          ACTION: ${{ inputs.action }}
+          SYMBOL: ${{ inputs.symbol }}
+          CONFIG_STEP_OUTCOME: ${{ steps.config_update.outcome }}
+          CONFIG_VERIFIED_RESULT: ${{ steps.config_update.outputs.verified_result }}
+          CONFIG_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        # A failed receipt makes this run visibly fail but never replays the write.
+        run: python -u dca_config_notification.py notify

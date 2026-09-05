@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import unittest
 
 import dca_config
+from tests.history_fixtures import ready_history
 
 
 ANALYZED_AT = datetime(2026, 8, 23, 0, 0, tzinfo=timezone.utc)
@@ -110,7 +111,7 @@ def ready_decision(regime="SIDEWAYS", override="none"):
             "VALID_UNTIL": (selected_at + timedelta(minutes=60))
             .isoformat()
             .replace("+00:00", "Z"),
-            "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
+            "HISTORY": ready_history("BTC_GBP", ANALYZED_AT),
             "SIGNALS": ready_signals(regime, override),
             "TIMING": {"ANALYZED_AT": "2026-08-23T00:00:00Z"},
             "ERROR": None,

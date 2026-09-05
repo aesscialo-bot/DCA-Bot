@@ -1,8 +1,10 @@
+import copy
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from dca_config import default_rules_map, empty_analysis_state, rules_hash
-from dca_config_writer import apply_change, global_rules_pre_state_hash
+from dca_config import default_rules_map, empty_analysis_state, rules_hash, validate_analysis_state
+from dca_config_writer import apply_change, global_rules_pre_state_hash, prepare_enable_analysis_invalidation
+from tests.history_fixtures import ready_history
 
 
 def ready_signals():
@@ -60,7 +62,7 @@ class DcaConfigWriterTests(unittest.TestCase):
                 "EXECUTE_AT": (self.now + timedelta(hours=1)).isoformat(),
                 "VALID_UNTIL": (self.now + timedelta(hours=2)).isoformat(),
                 "SIGNALS": ready_signals(),
-                "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
+                "HISTORY": ready_history("BTC_GBP", self.now),
                 "ERROR": None,
             }
         )
@@ -143,7 +145,7 @@ class DcaConfigWriterTests(unittest.TestCase):
                 "VALID_UNTIL": (self.now + timedelta(hours=2)).isoformat(),
                 "RULES_HASH": "0" * 64,
                 "SIGNALS": ready_signals(),
-                "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
+                "HISTORY": ready_history("ETH_GBP", self.now),
                 "ERROR": None,
             }
         )
@@ -163,14 +165,14 @@ class DcaConfigWriterTests(unittest.TestCase):
         self.assertTrue(should_write)
         self.assertTrue(updated["BTC_GBP"]["BUY_ENABLED"])
 
-    def test_enable_accepts_missing_or_stale_analysis_for_next_cycle(self):
+    def test_enable_accepts_valid_non_ready_or_stale_analysis_for_next_cycle(self):
         self.rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
         expected_hash = rules_hash("BTC_GBP", self.rules["BTC_GBP"])
-        for analysis in (None, {}, self._ready_state()):
-            if analysis:
-                analysis["TARGETS"]["BTC_GBP"]["VALID_UNTIL"] = (
-                    self.now - timedelta(days=1)
-                ).isoformat()
+        for analysis in (
+            empty_analysis_state(self.rules, now=self.now),
+            empty_analysis_state(self.rules, now=self.now - timedelta(days=1)),
+            self._ready_state(),
+        ):
             with self.subTest(analysis=analysis is not None):
                 updated, should_write = apply_change(
                     self.rules,
@@ -186,6 +188,75 @@ class DcaConfigWriterTests(unittest.TestCase):
                 )
                 self.assertTrue(should_write)
                 self.assertTrue(updated["BTC_GBP"]["BUY_ENABLED"])
+
+    def test_enable_cannot_replace_missing_invalid_or_old_policy_analysis(self):
+        self.rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
+        old_policy = self._ready_state()
+        old_policy["POLICY_VERSION"] = "obsolete-policy"
+        for analysis in (None, {}, {"secret": "do not expose"}, old_policy):
+            with self.subTest(analysis=type(analysis).__name__), self.assertRaisesRegex(
+                ValueError, "run !dca analyze all before enabling"
+            ):
+                apply_change(
+                    self.rules,
+                    analysis,
+                    {},
+                    action="set_enabled",
+                    symbol="BTC_GBP",
+                    enabled_json="true",
+                    expected_rules_hash=rules_hash("BTC_GBP", self.rules["BTC_GBP"]),
+                    expected_global_rules_hash=global_rules_pre_state_hash(self.rules),
+                    market_minimum_provider=lambda _symbol: 5,
+                    now=self.now,
+                )
+
+    def test_disable_reenable_invalidates_old_enabled_decision_without_touching_others(self):
+        self.rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
+        state = self._ready_state()
+        # This READY decision predates the disable and originally allowed buying.
+        state["TARGETS"]["BTC_GBP"]["ENABLED"] = True
+        original = copy.deepcopy(state)
+        updated, _ = apply_change(
+            self.rules,
+            state,
+            {},
+            action="set_enabled",
+            symbol="BTC_GBP",
+            enabled_json="true",
+            expected_rules_hash=rules_hash("BTC_GBP", self.rules["BTC_GBP"]),
+            expected_global_rules_hash=global_rules_pre_state_hash(self.rules),
+            market_minimum_provider=lambda _symbol: 5,
+            now=self.now,
+        )
+        invalidated = prepare_enable_analysis_invalidation(updated, state, symbol="BTC_GBP", now=self.now)
+        self.assertEqual(state, original)
+        validate_analysis_state(invalidated)
+        target = invalidated["TARGETS"]["BTC_GBP"]
+        self.assertEqual(target["ANALYSIS_STATUS"], "ERROR")
+        self.assertEqual(target["EXECUTION_STATUS"], "BLOCKED")
+        self.assertTrue(target["ENABLED"])
+        for key in ("SELECTED_AT", "EXECUTE_AT", "VALID_UNTIL", "REGIME", "AMOUNT_TIER"):
+            self.assertIsNone(target[key])
+        for other in ("ETH_GBP", "SOL_GBP", "DOGE_GBP"):
+            self.assertEqual(invalidated["TARGETS"][other], original["TARGETS"][other])
+
+    def test_invalidation_preserves_prior_day_envelope_and_override_audit(self):
+        self.rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
+        self.rules["BTC_GBP"]["BUY_ENABLED"] = True
+        state = empty_analysis_state(self.rules, now=self.now - timedelta(days=1))
+        signals = state["TARGETS"]["BTC_GBP"]["SIGNALS"]
+        signals.update(ready_signals())
+        signals.update({
+            "UPTREND_OVERRIDE_ACTIVE": True,
+            "UPTREND_OVERRIDE_REASON": "Operator approved emergency override",
+            "UPTREND_OVERRIDE_ACTIVATED_AT": "2026-08-01T00:00:00Z",
+        })
+        result = prepare_enable_analysis_invalidation(self.rules, state, symbol="BTC_GBP", now=self.now)
+        validate_analysis_state(result)
+        self.assertEqual(result["ANALYSIS_DATE"], state["ANALYSIS_DATE"])
+        self.assertEqual(result["TARGETS"]["BTC_GBP"]["ANALYSIS_DATE"], state["ANALYSIS_DATE"])
+        for key in ("UPTREND_OVERRIDE_ACTIVE", "UPTREND_OVERRIDE_REASON", "UPTREND_OVERRIDE_ACTIVATED_AT"):
+            self.assertEqual(result["TARGETS"]["BTC_GBP"]["SIGNALS"][key], signals[key])
 
     def test_enable_fails_when_minimum_or_confirmation_changed(self):
         self.rules["BTC_GBP"]["REGIME_AMOUNTS_GBP"] = {"LOW": 10, "UP": 20}
@@ -237,7 +308,7 @@ class DcaConfigWriterTests(unittest.TestCase):
                     "VALID_UNTIL": (self.now + timedelta(hours=2)).isoformat(),
                     "RULES_HASH": rules_hash(symbol, self.rules[symbol]),
                     "SIGNALS": ready_signals(),
-                    "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
+                    "HISTORY": ready_history(symbol, self.now),
                     "ERROR": None,
                 }
             )

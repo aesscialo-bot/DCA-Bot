@@ -27,10 +27,27 @@ workflows, or release configuration.
 - Current LOW/MID/UP amounts are BTC £5/£10/£20 and ETH/SOL £5/£10/£15.
   DOGE begins disabled at £0/£0/£0 until the operator explicitly chooses budgets.
   Budget changes must use the guarded configuration flow and preserve ordering.
+- This review-and-polish release is deployed paused: every `BUY_ENABLED=false`,
+  GitHub and Railway both `DCA_TRADING_MODE=shadow`, and Railway
+  `DCA_CRON_ENABLED=false`. Deployment/review success is not live-activation
+  approval. No target-membership migration is required; retain existing archives.
 - BTC, ETH, SOL, and DOGE are direct GBP buys on `BTC/GBP`, `ETH/GBP`, `SOL/GBP`, and `DOGE/GBP`.
   No active target has a funding leg.
 - One purchase per enabled asset per Bangkok calendar day is permitted.
 - Stale, missing, insufficient, or inconsistent state always skips trading.
+- Timing evidence separates verified `COVERAGE_THROUGH` (alias `THROUGH`) from
+  `LAST_REAL_CANDLE_AT` (last traded candle start). At analysis creation, preserve
+  the 45-minute verified-coverage freshness gate. Carry last-close, zero-volume
+  candles only for proven no-trade intervals after the first real candle through
+  the verified cutoff; never conceal partial ingestion or invent leading data.
+  Version-2 history evidence and timing policy v4 invalidate older decisions.
+- A fresh executable direct-GBP Kraken quote is required for order sizing and
+  market minimums; carried historical prices never authorize a new order.
+- Exact enable confirmation expires after five minutes and binds reviewed
+  budgets and all four rules. Every enable invalidates the selected target's old
+  analysis before the rules write under both writer locks, verifies readback,
+  and waits for new successful analysis. Missing/malformed/obsolete analysis
+  blocks enable until repaired; never clear execution state or unrelated decisions.
 - Before intent creation and immediately before Kraken submission, re-read the
   live override document and require an exact match with the analysis decision.
   Preserve reconciliation-only recovery for an existing durable pending intent.
@@ -57,6 +74,11 @@ workflows, or release configuration.
   restricted to the separate market-history Gist during its transition.
 - Never log tokens, API responses containing credentials, complete production
   rules, complete analysis state, or complete execution state.
+- A missing/empty Discord allowlist denies private reads, report dispatches,
+  and configuration operations. Suppress mentions and escape untrusted text.
+- Queued configuration is not applied. Completion receipts require exact rules
+  readback, fixed sanitized wording, and the expected GitHub run URL. A failed
+  receipt is visible but never automatically retries the configuration write.
 - Treat every override activation as an auditable maintainer production-state
   change: canonical target, activation timestamp, and nonempty reason are
   required. Missing/blank means no override; malformed present state fails
@@ -70,6 +92,10 @@ workflows, or release configuration.
 
 - Compile Python, run the complete unit suite, validate every workflow YAML,
   and build the Docker image before merging.
+- Require independent trading-safety and Discord-usability review, a full-day
+  isolated shadow simulation with zero order submissions, and deployed-SHA,
+  worker/log/Discord checks. Verify fresh all-four analysis and the next scheduled
+  GitHub cycle; report this release as deployed and paused, never buying live.
 - Preserve deterministic regime/timing behavior, override audit/release
   ordering, visible active-override warnings, and final live-state checks.
 - Test direct fills, partial/unknown responses, durable recovery, duplicate

@@ -136,7 +136,84 @@ def _message_author_id(message: discord.Message) -> str:
 def _is_authorized_config_writer(message: discord.Message) -> bool:
     allowed = _allowed_user_ids()
     author_id = _message_author_id(message)
-    return bool(allowed and author_id and author_id in allowed)
+    channel_id = str(getattr(getattr(message, "channel", None), "id", ""))
+    return bool(
+        allowed and author_id and author_id in allowed
+        and CHANNEL_ID and channel_id == str(CHANNEL_ID)
+        and not getattr(getattr(message, "author", None), "bot", False)
+    )
+
+
+def _safe_text(value: Any) -> str:
+    """Escape external display text without silently dropping warning content."""
+
+    text = str(value)
+    for name in ("GH_PAT", "DISCORD_BOT_TOKEN", "GEMINI_API_KEY", TOKEN_ENV):
+        secret = os.environ.get(name, "")
+        if len(secret) >= 8:
+            text = text.replace(secret, "[redacted]")
+    text = " ".join(text.split())
+    return discord.utils.escape_markdown(discord.utils.escape_mentions(text))
+
+
+def _message_parts(content: str, *, limit: int = 1_900) -> list[str]:
+    """Keep complete lines where possible; split oversized lines losslessly.
+
+    Leave space below Discord's 2,000-character ceiling. Each section/card is
+    sent separately, so a verbose override cannot hide any later asset.
+    """
+
+    if limit < 2:
+        raise ValueError("Discord message limit must permit a complete character")
+    def units(text: str) -> int:
+        return len(text.encode("utf-16-le")) // 2
+    parts: list[str] = []
+    pending = ""
+    for line in content.splitlines(keepends=True):
+        while units(line) > limit:
+            if pending:
+                parts.append(pending)
+                pending = ""
+            split_at = limit
+            while units(line[:split_at]) > limit:
+                split_at -= 1
+            parts.append(line[:split_at])
+            line = line[split_at:]
+        if units(pending) + units(line) > limit:
+            parts.append(pending)
+            pending = ""
+        pending += line
+    if pending:
+        parts.append(pending)
+    return parts
+
+
+async def _reply_sections(
+    message: discord.Message, sections: list[str], *, color: int = 0x5865F2
+) -> None:
+    for section in sections:
+        for part in _message_parts(section):
+            # Native cards wrap naturally in both desktop and mobile Discord.
+            # One bounded description per message stays below both embed and
+            # aggregate limits, including unusually long recovery warnings.
+            await message.reply(
+                embed=discord.Embed(description=part, color=color),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+
+def _workflow_link(workflow_file: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", GITHUB_REPO):
+        return "Open GitHub Actions to follow the workflow."
+    return f"[Follow workflow](https://github.com/{GITHUB_REPO}/actions/workflows/{workflow_file})"
+
+
+def _unconfirmed_dispatch(workflow_file: str) -> str:
+    return (
+        "Dispatch not confirmed; GitHub may already have accepted it. "
+        "Check the workflow and `show status` before retrying.\n"
+        + _workflow_link(workflow_file)
+    )
 
 
 def _config_write_block_reason(
@@ -487,7 +564,11 @@ def get_repo_variable(name: str) -> str | None:
     if response.status_code != 200:
         _log(f"ERROR repository variable read failed for {name}: HTTP {response.status_code}")
         return None
-    value = response.json().get("value")
+    try:
+        value = response.json().get("value")
+    except (ValueError, AttributeError):
+        _log(f"ERROR repository variable read failed for {name}: invalid JSON response")
+        return None
     return value if isinstance(value, str) else None
 
 
@@ -776,14 +857,14 @@ async def handle_set_amounts(
         if low > mid or mid > high:
             raise ValueError("the amounts must satisfy low <= sideways <= high")
     except ValueError as exc:
-        await message.reply(f"Invalid request: {exc}")
+        await message.reply(f"Invalid request: {_safe_text(exc)}")
         return
 
     raw = await asyncio.to_thread(get_repo_variable, RULES_VARIABLE)
     try:
         rules = validate_rules_map(raw or "")
     except ConfigError as exc:
-        await message.reply(f"Blocked: live rules are invalid ({exc}).")
+        await message.reply(f"Blocked: live rules are invalid ({_safe_text(exc)}).")
         return
     if rules[symbol]["BUY_ENABLED"]:
         await message.reply(
@@ -805,10 +886,10 @@ async def handle_set_amounts(
             f"Queued atomic budgets for **{symbol}**: lower {_display_amount(low)}, "
             f"sideways {_display_amount(mid)}, higher "
             f"{_display_amount(high)}. Run `!dca analyze {symbol.split('_', 1)[0]}` "
-            "after the workflow completes."
+            "after the workflow completes.\n" + _workflow_link("update_dca_config.yml")
         )
     else:
-        await message.reply("Failed to queue the budget update. No rules were changed.")
+        await message.reply(_unconfirmed_dispatch("update_dca_config.yml"))
 
 
 async def handle_disable(symbol_value: str, message: discord.Message) -> None:
@@ -818,7 +899,7 @@ async def handle_disable(symbol_value: str, message: discord.Message) -> None:
     try:
         symbol = _normalise_usd_key(symbol_value)
     except ValueError as exc:
-        await message.reply(f"Invalid request: {exc}")
+        await message.reply(f"Invalid request: {_safe_text(exc)}")
         return
     inputs = {
         "action": "set_enabled",
@@ -830,10 +911,10 @@ async def handle_disable(symbol_value: str, message: discord.Message) -> None:
         await message.reply(
             f"Queued disable for **{symbol}**. Once applied, the trader's live "
             "pre-submit check blocks a new order; an order already accepted by "
-            "Kraken will still be reconciled."
+            "Kraken will still be reconciled.\n" + _workflow_link("update_dca_config.yml")
         )
     else:
-        await message.reply("Failed to queue disable. Check GitHub Actions and retry.")
+        await message.reply(_unconfirmed_dispatch("update_dca_config.yml"))
 
 
 def _enable_review(
@@ -903,7 +984,7 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
             execution,
         )
     except (ValueError, ConfigError) as exc:
-        await message.reply(f"Blocked: {exc}.")
+        await message.reply(f"Blocked: {_safe_text(exc)}.")
         return
 
     command = f"!dca confirm enable {symbol}"
@@ -936,7 +1017,7 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
     if not pending:
         await message.reply("Blocked: no enable confirmation is pending for your user.")
         return
-    if monotonic() > pending["expires_at"]:
+    if monotonic() >= pending["expires_at"]:
         _pending_enable_confirmations.pop(author_id, None)
         await message.reply("Blocked: that enable confirmation expired; review again.")
         return
@@ -961,7 +1042,15 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
         )
     except ConfigError as exc:
         _pending_enable_confirmations.pop(author_id, None)
-        await message.reply(f"Blocked after live revalidation: {exc}.")
+        await message.reply(f"Blocked after live revalidation: {_safe_text(exc)}.")
+        return
+
+    if _pending_enable_confirmations.get(author_id) is not pending:
+        await message.reply("Blocked: this review was replaced or already consumed. Review again.")
+        return
+    if monotonic() >= pending["expires_at"]:
+        _pending_enable_confirmations.pop(author_id, None)
+        await message.reply("Blocked: that enable confirmation expired during validation; review again.")
         return
 
     if current["global_rules_hash"] != expected["global_rules_hash"]:
@@ -999,10 +1088,11 @@ async def _handle_enable_confirmation(message: discord.Message, raw_text: str) -
         await message.reply(
             f"Enable validation queued for **{expected['symbol']}**. It remains disabled "
             "unless the workflow confirms the same live rules and Kraken minimum. "
-            "Once enabled, it waits for the next successful analysis before trading."
+            "Once enabled, it waits for the next successful analysis before trading.\n"
+            + _workflow_link("update_dca_config.yml")
         )
     else:
-        await message.reply("Failed to queue enable validation. The target remains disabled.")
+        await message.reply(_unconfirmed_dispatch("update_dca_config.yml"))
 
 
 async def handle_analyze(params: dict[str, Any], message: discord.Message) -> None:
@@ -1017,25 +1107,29 @@ async def handle_analyze(params: dict[str, Any], message: discord.Message) -> No
         try:
             workflow_symbol = _to_usd_pair(raw_symbol)
         except ValueError as exc:
-            await message.reply(f"Invalid request: {exc}")
+            await message.reply(f"Invalid request: {_safe_text(exc)}")
             return
         label = workflow_symbol
     inputs = {"symbol": workflow_symbol}
     if await asyncio.to_thread(trigger_workflow, "crypto_analysis.yml", inputs):
         await message.reply(
             f"Analysis queued for **{label}**. Deterministic Python selects regime, "
-            "budget tier, and execution time; Gemini only explains the result."
+            "budget tier, and execution time; Gemini only explains the result.\n"
+            + _workflow_link("crypto_analysis.yml")
         )
     else:
-        await message.reply("Failed to queue analysis. Existing decisions will not be reused.")
+        await message.reply(_unconfirmed_dispatch("crypto_analysis.yml"))
 
 
 async def handle_portfolio(params: dict[str, Any], message: discord.Message) -> None:
+    if not _is_authorized_config_writer(message):
+        await message.reply("Blocked: private reports require the configured channel and an allowlisted user.")
+        return
     inputs = {"short_report": "true" if params.get("short_report", True) else "false"}
     if await asyncio.to_thread(trigger_workflow, "portfolio_check.yml", inputs):
-        await message.reply("Read-only Kraken portfolio check queued.")
+        await message.reply("Read-only Kraken portfolio check queued.\n" + _workflow_link("portfolio_check.yml"))
     else:
-        await message.reply("Failed to queue the portfolio check.")
+        await message.reply(_unconfirmed_dispatch("portfolio_check.yml"))
 
 
 def _history_data_through(decision: Mapping[str, Any]) -> str:
@@ -1044,29 +1138,35 @@ def _history_data_through(decision: Mapping[str, Any]) -> str:
     history = decision.get("HISTORY")
     if not isinstance(history, Mapping):
         return "unknown"
-    value = history.get("THROUGH")
+    value = history.get("COVERAGE_THROUGH")
     if not isinstance(value, str) or not value.strip():
         return "unknown"
     rendered = _local_timestamp(value)
     return "unknown" if rendered == "not scheduled" else rendered
 
 
+def _history_last_traded_candle(decision: Mapping[str, Any]) -> str:
+    history = decision.get("HISTORY")
+    value = history.get("LAST_REAL_CANDLE_AT") if isinstance(history, Mapping) else None
+    return _local_timestamp(value) if isinstance(value, str) and value else "unknown"
+
+
 def _format_analysis_workflow_health(health: Mapping[str, Any]) -> str:
     """Format one concise line of GitHub workflow evidence for Discord."""
 
     status = str(health.get("status") or "UNKNOWN").upper()
-    configured_ref = health.get("configured_ref") or "missing"
+    configured_ref = _safe_text(health.get("configured_ref") or "missing")
     actual_ref = health.get("actual_ref")
     head_sha = health.get("head_sha")
     actual = "unknown"
     if isinstance(actual_ref, str) and actual_ref:
-        actual = actual_ref
+        actual = _safe_text(actual_ref)
         if isinstance(head_sha, str) and head_sha:
-            actual += f"@{head_sha[:12]}"
-    run_state = health.get("run_status") or "unobserved"
+            actual += f"@{_safe_text(head_sha[:12])}"
+    run_state = _safe_text(health.get("run_status") or "unobserved")
     conclusion = health.get("conclusion")
     if conclusion:
-        run_state = f"{run_state}/{conclusion}"
+        run_state = f"{run_state}/{_safe_text(conclusion)}"
     updated_at = health.get("updated_at")
     observed = _local_timestamp(updated_at) if isinstance(updated_at, str) else "unknown"
     line = (
@@ -1075,7 +1175,7 @@ def _format_analysis_workflow_health(health: Mapping[str, Any]) -> str:
     )
     reason = health.get("reason")
     if isinstance(reason, str) and reason:
-        line += f" | `{reason}`"
+        line += f" | {_safe_text(reason)}"
     return line
 
 
@@ -1150,7 +1250,7 @@ def _analysis_watchdog_health(
 
 def _format_analysis_watchdog_health(health: Mapping[str, Any]) -> str:
     status = str(health.get("status") or "UNKNOWN").upper()
-    detail = str(health.get("detail") or "no watchdog evidence")
+    detail = _safe_text(health.get("detail") or "no watchdog evidence")
     return f"Analysis watchdog: **{status}** | {detail}"
 
 
@@ -1183,22 +1283,38 @@ def _pair_label(symbol: str) -> str:
     return symbol.replace("_", "/")
 
 
-def _trading_mode_summary() -> str:
-    """Explain order permission without conflating it with pair enablement."""
+def get_trading_mode_health() -> dict[str, Any]:
+    """Observe the execution authority separately from this Railway process."""
 
-    if DCA_TRADING_MODE == "shadow":
-        return (
-            "🟡 Trading mode: **SHADOW — REAL KRAKEN ORDERS OFF** | "
-            "analysis and scheduling remain active"
-        )
-    if DCA_TRADING_MODE == "canary":
-        return (
-            "🧪 Trading mode: **CANARY — REAL ORDERS LIMITED TO "
-            f"{_pair_label(DCA_CANARY_SYMBOL)}**"
-        )
-    if DCA_TRADING_MODE == "live":
-        return "🟢 Trading mode: **LIVE — REAL KRAKEN ORDERS ON**"
-    return f"🔴 Trading mode: **{DCA_TRADING_MODE.upper()} — INVALID; ORDERS BLOCKED**"
+    mode = get_repo_variable("DCA_TRADING_MODE")
+    mode = mode.strip().lower() if isinstance(mode, str) else "unknown"
+    canary = get_repo_variable("DCA_CANARY_SYMBOL") if mode == "canary" else None
+    canary = canary.strip().upper() if isinstance(canary, str) else None
+    valid_modes = {"shadow", "canary", "live"}
+    status = "MATCHED"
+    if mode not in valid_modes or DCA_TRADING_MODE not in valid_modes:
+        status = "UNKNOWN"
+    elif mode != DCA_TRADING_MODE:
+        status = "MISMATCH"
+    elif mode == "canary" and (canary not in ALLOWED_TARGETS or canary != DCA_CANARY_SYMBOL):
+        status = "MISMATCH" if canary in ALLOWED_TARGETS else "UNKNOWN"
+    return {"status": status, "github_mode": mode, "canary_symbol": canary}
+
+
+def _trading_mode_summary(mode_health: Mapping[str, Any] | None = None) -> str:
+    health = mode_health or {"status": "UNKNOWN", "github_mode": "unknown"}
+    github_mode = str(health.get("github_mode") or "unknown")
+    line = (
+        f"Trading modes: GitHub **{_safe_text(github_mode.upper())}** (order authority) | "
+        f"Railway **{_safe_text(DCA_TRADING_MODE.upper())}**\n"
+    )
+    if health.get("status") != "MATCHED":
+        return line + "⚠️ **MODE " + str(health.get("status", "UNKNOWN")) + " — buying readiness unverified.** Check both environments."
+    if github_mode == "shadow":
+        return line + "⏸️ **SHADOW — REAL KRAKEN ORDERS OFF**. Analysis can continue."
+    if github_mode == "canary":
+        return line + f"Canary target: **{_pair_label(str(health.get('canary_symbol')))}**; every execution check still applies."
+    return line + "Live mode configured; this status is not order authorization. Every execution check still applies."
 
 
 def _uptrend_override_summary(decision: Mapping[str, Any]) -> str:
@@ -1233,7 +1349,7 @@ def _uptrend_override_summary(decision: Mapping[str, Any]) -> str:
     reason = signals.get("UPTREND_OVERRIDE_REASON")
     reason_text = "not recorded"
     if isinstance(reason, str) and reason.strip():
-        reason_text = " ".join(reason.split())[:160]
+        reason_text = _safe_text(reason)
     return (
         "  🚨 **EMERGENCY UPTREND OVERRIDE ACTIVE** | "
         f"Rule result: `{natural}` | Confirmation: `{progress}` | "
@@ -1249,11 +1365,23 @@ def _order_permission(
     decision_expired: bool,
     rules_match: bool,
     daily_analysis_pending: bool = False,
+    mode_health: Mapping[str, Any] | None = None,
+    global_history_ready: bool = False,
+    pending_recovery: bool = False,
+    bought_today: bool = False,
+    execution_due: bool = False,
+    start_date_blocked: bool = False,
 ) -> str:
     """Return the effective order posture for one pair in plain language."""
 
+    if pending_recovery:
+        return "⛔ RECOVERY ONLY — no new order; reconcile Kraken first"
+    if bought_today:
+        return "✅ ALREADY BOUGHT TODAY — daily limit reached"
     if not enabled:
         return "⛔ OFF — PAIR DISABLED"
+    if start_date_blocked:
+        return "⏳ WAITING — configured start date / first eligible analysis"
     if daily_analysis_pending:
         return "⏳ WAITING — TODAY'S ANALYSIS NOT DUE YET"
     if decision_expired:
@@ -1262,13 +1390,18 @@ def _order_permission(
         return "⛔ BLOCKED — NO CURRENT DECISION"
     if not rules_match:
         return "🔄 WAITING FOR FRESH ANALYSIS"
-    if DCA_TRADING_MODE == "shadow":
+    if not global_history_ready:
+        return "⛔ BLOCKED — all four histories need current analysis"
+    health = mode_health or {}
+    if health.get("status") != "MATCHED":
+        return "⚠️ UNVERIFIED — GitHub/Railway modes unavailable or mismatched"
+    if health.get("github_mode") == "shadow":
         return "🟡 SIMULATION ONLY"
-    if DCA_TRADING_MODE == "canary" and symbol != DCA_CANARY_SYMBOL:
+    if health.get("github_mode") == "canary" and symbol != health.get("canary_symbol"):
         return "🟡 SIMULATION ONLY — NOT CANARY"
-    if DCA_TRADING_MODE in {"canary", "live"}:
-        return "🟢 LIVE ORDERS ALLOWED"
-    return "⛔ BLOCKED — INVALID TRADING MODE"
+    if not execution_due:
+        return "⏳ WAITING FOR EXECUTION WINDOW — no order authorized here"
+    return "🔎 DUE — trader must recheck quote, minimum, balance and live state"
 
 
 def _decision_summary(
@@ -1279,6 +1412,8 @@ def _decision_summary(
     *,
     now: datetime,
     daily_analysis_pending: bool = False,
+    mode_health: Mapping[str, Any] | None = None,
+    global_history_ready: bool = False,
 ) -> str:
     enabled = rule["BUY_ENABLED"]
     amounts = rule["REGIME_AMOUNTS_GBP"]
@@ -1307,7 +1442,10 @@ def _decision_summary(
         and decision["ANALYSIS_DATE"] == current_date
         and parse_utc_iso(decision["VALID_UNTIL"]) >= now
     )
-    rules_match = decision["RULES_HASH"] == rules_hash(symbol, rule)
+    rules_match = (
+        decision["RULES_HASH"] == rules_hash(symbol, rule)
+        and decision.get("ENABLED") is enabled
+    )
     permission = _order_permission(
         symbol,
         enabled=enabled,
@@ -1315,6 +1453,17 @@ def _decision_summary(
         decision_expired=decision_expired,
         rules_match=rules_match,
         daily_analysis_pending=daily_analysis_pending,
+        mode_health=mode_health,
+        global_history_ready=global_history_ready,
+        pending_recovery=any(isinstance(entry.get("PENDING_ORDER"), Mapping) for entry in execution.values()),
+        bought_today=state_entry.get("LAST_BUY_DATE") == current_date,
+        execution_due=decision_ready and is_execution_window(now, decision["EXECUTE_AT"], decision["VALID_UNTIL"]),
+        start_date_blocked=(
+            _schedule_start_date is not None and (
+                now.astimezone(TIMEZONE).date() < _schedule_start_date
+                or not decision_analyzed_on_or_after(decision, _schedule_start_date, TIMEZONE)
+            )
+        ),
     )
     if daily_analysis_pending:
         regime = decision["REGIME"]
@@ -1332,7 +1481,7 @@ def _decision_summary(
         decision_status = (
             "✅ CURRENT"
             if rules_match
-            else "🔄 REFRESH REQUIRED — budgets changed after this analysis"
+            else "🔄 REFRESH REQUIRED — budgets or enablement changed after this analysis"
         )
     elif decision_expired:
         regime = decision["REGIME"]
@@ -1353,6 +1502,15 @@ def _decision_summary(
         decision_status = f"❌ {decision['ANALYSIS_STATUS']}"
     override_summary = _uptrend_override_summary(decision)
     override_suffix = f"{override_summary}\n" if override_summary else ""
+    next_step = ""
+    if any(float(value) == 0 for value in amounts.values()):
+        next_step = "\n  Next: approve and set LOW / MID / UP budgets while disabled; £0 cannot be enabled."
+    elif not rules_match:
+        next_step = f"\n  Next: run `!dca analyze {symbol.split('_')[0]}` after the configuration workflow succeeds."
+    elif not decision_ready and not daily_analysis_pending and not decision_expired:
+        next_step = "\n  Next: inspect the analysis workflow failure, then run `!dca analyze all`."
+    error = decision.get("ERROR")
+    error_text = f"\n  Analysis issue: {_safe_text(error)}" if error else ""
     return (
         f"{configured_icon} **{_pair_label(symbol)}** (`{symbol}`) | "
         f"**{configured_status}** | Orders: **{permission}**\n"
@@ -1363,9 +1521,10 @@ def _decision_summary(
         f"  📊 {decision_status} | Regime: `{regime}` | Spend: {amount} | "
         f"Effective: `{next_time}`\n"
         f"{override_suffix}"
-        f"  🧾 Data through: `{history_data_through}` | "
-        f"Last buy: `{state_entry.get('LAST_BUY_DATE') or 'never'}`"
-        f"{pending_text}{delivery_text}"
+        f"  🧾 Coverage through: `{history_data_through}`\n"
+        f"  Last traded candle: `{_history_last_traded_candle(decision)}` | "
+        f"Last buy: `{_safe_text(state_entry.get('LAST_BUY_DATE') or 'never')}`"
+        f"{pending_text}{delivery_text}{error_text}{next_step}"
     )
 
 
@@ -1448,18 +1607,22 @@ def get_ghostfolio_delivery_health() -> dict[str, Any]:
 
 
 async def handle_status(params: dict[str, Any], message: discord.Message) -> None:
+    if not _is_authorized_config_writer(message):
+        await message.reply("Blocked: private status requires the configured channel and an allowlisted user.")
+        return
     try:
         rules, analysis, execution = await asyncio.to_thread(_load_live_state)
     except ConfigError as exc:
-        await message.reply(
-            f"**DCA status: NOT READY**\nConfiguration/state validation failed: `{exc}`\n"
+        await _reply_sections(message, [
+            f"**DCA status: NOT READY**\nConfiguration/state validation failed: {_safe_text(exc)}\n"
             "Trading and scheduling fail closed."
-        )
+        ], color=0xED4245)
         return
 
-    ghostfolio_health, workflow_health = await asyncio.gather(
+    ghostfolio_health, workflow_health, mode_health = await asyncio.gather(
         asyncio.to_thread(get_ghostfolio_delivery_health),
         asyncio.to_thread(get_analysis_workflow_health),
+        asyncio.to_thread(get_trading_mode_health),
     )
     now = datetime.now(timezone.utc)
     awaiting_symbols = _pending_start_day_analysis_symbols(rules, analysis, now)
@@ -1473,6 +1636,12 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
         awaiting_symbols=awaiting_symbols,
     )
     current_date = now.astimezone(TIMEZONE).date().isoformat()
+    global_history_ready = all(
+        decision["ANALYSIS_STATUS"] == "READY"
+        and decision["ANALYSIS_DATE"] == current_date
+        and decision.get("HISTORY", {}).get("STATUS") == "READY"
+        for decision in analysis["TARGETS"].values()
+    )
     refresh_symbols = [
         symbol
         for symbol in ALLOWED_TARGETS
@@ -1484,7 +1653,9 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
     ]
     lines = [
         "🤖 **Kraken GBP-market DCA status (GBP budgets)**",
-        _trading_mode_summary(),
+        f"Discord service: **{'CONNECTED' if client.is_ready() else 'CONNECTION UNVERIFIED'}** | Times: {TIMEZONE.key}",
+        _trading_mode_summary(mode_health),
+        f"All-four history gate: **{'READY' if global_history_ready else 'WAITING FOR DAILY ANALYSIS' if daily_analysis_pending else 'BLOCKED'}**",
         "⚙️ " + _format_analysis_workflow_health(workflow_health),
     ]
     if refresh_symbols:
@@ -1494,8 +1665,9 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
             f"{labels} budgets changed after today's decisions. "
             "No order can use an old decision."
         )
+    cards = []
     for symbol in ALLOWED_TARGETS:
-        lines.append(
+        cards.append(
             _decision_summary(
                 symbol,
                 rules[symbol],
@@ -1503,13 +1675,15 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
                 execution,
                 now=now,
                 daily_analysis_pending=daily_analysis_pending,
+                mode_health=mode_health,
+                global_history_ready=global_history_ready,
             )
         )
     all_disabled = not any(rule["BUY_ENABLED"] for rule in rules.values())
     if _schedule_error:
-        scheduler = f"INVALID — {_schedule_error}"
+        scheduler = f"INVALID — {_safe_text(_schedule_error)}"
     elif _schedule_warning:
-        scheduler = f"running with skipped target(s) — {_schedule_warning}"
+        scheduler = f"{'running' if DCA_CRON_ENABLED else 'paused'}; skipped target(s) — {_safe_text(_schedule_warning)}"
     elif not DCA_CRON_ENABLED:
         scheduler = "paused by DCA_CRON_ENABLED=false"
     elif daily_analysis_pending:
@@ -1546,6 +1720,8 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
     )
     lines.append(f"⏱️ Railway scheduler: **{scheduler}**")
     lines.append("🛟 " + _format_analysis_watchdog_health(watchdog_health))
+    if not DCA_CRON_ENABLED and _schedule_error is None:
+        displayed_chain_status = "RAILWAY PAUSED — GitHub workflow health shown separately"
     lines.append(f"🔗 Analysis/scheduling chain: **{displayed_chain_status}**")
     analysis_ready = daily_analysis_pending or all(
         decision["ANALYSIS_STATUS"] == "READY"
@@ -1583,30 +1759,44 @@ async def handle_status(params: dict[str, Any], message: discord.Message) -> Non
             "👻 Local Ghostfolio completion: **"
             f"{ghostfolio_health['status'].lower()}**"
         )
-    if (
+    safe_paused = (
+        all_disabled and not DCA_CRON_ENABLED
+        and mode_health["status"] == "MATCHED"
+        and mode_health["github_mode"] == "shadow"
+    )
+    if safe_paused:
+        lines.append("⏸️ Trading posture: **INTENTIONALLY PAUSED** — all four targets disabled, shadow modes, Railway scheduling off.")
+        if not global_history_ready or _schedule_error or _schedule_warning or pending_count or workflow_health["status"] not in {"HEALTHY", "ACTIVE"}:
+            lines.append("⚠️ **Readiness needs attention independently of the safe pause.** Check the analysis, recovery and workflow details below.")
+    elif (
         all_disabled
         and analysis_ready
         and pending_count == 0
         and chain_status == "OPERATIONAL"
+        and mode_health["status"] == "MATCHED"
     ):
         lines.append("⏸️ Trading posture: **ready-but-disabled** (no target can submit a new order).")
     elif all_disabled:
         lines.append("⛔ Trading posture: **disabled and fail-closed; readiness needs attention**.")
-    await message.reply("\n".join(lines)[:1_990])
+    await _reply_sections(message, ["\n".join(lines), *cards], color=0xF0B232 if safe_paused else 0x5865F2)
 
 
 async def handle_health(params: dict[str, Any], message: discord.Message) -> None:
+    if not _is_authorized_config_writer(message):
+        await message.reply("Blocked: private health requires the configured channel and an allowlisted user.")
+        return
     try:
         rules, analysis, execution = await asyncio.to_thread(_load_live_state)
     except ConfigError as exc:
-        await message.reply(
-            f"**DCA health: NOT READY**\n- State validation: FAILED (`{exc}`)\n"
+        await _reply_sections(message, [
+            f"**DCA health: NOT READY**\n- State validation: FAILED ({_safe_text(exc)})\n"
             "- New orders: blocked"
-        )
+        ], color=0xED4245)
         return
-    ghostfolio_health, workflow_health = await asyncio.gather(
+    ghostfolio_health, workflow_health, mode_health = await asyncio.gather(
         asyncio.to_thread(get_ghostfolio_delivery_health),
         asyncio.to_thread(get_analysis_workflow_health),
+        asyncio.to_thread(get_trading_mode_health),
     )
     now = datetime.now(timezone.utc)
     awaiting_symbols = _pending_start_day_analysis_symbols(rules, analysis, now)
@@ -1622,6 +1812,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     ready = []
     errors = []
     stale = []
+    closed_windows = []
     mismatched = []
     for symbol in ALLOWED_TARGETS:
         decision = analysis["TARGETS"][symbol]
@@ -1633,12 +1824,13 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
         if decision["ANALYSIS_DATE"] != now.astimezone(TIMEZONE).date().isoformat():
             stale.append(symbol)
             continue
-        if decision["RULES_HASH"] != rules_hash(symbol, rules[symbol]):
+        if decision["RULES_HASH"] != rules_hash(symbol, rules[symbol]) or decision.get("ENABLED") is not rules[symbol]["BUY_ENABLED"]:
             mismatched.append(symbol)
             continue
         if parse_utc_iso(decision["VALID_UNTIL"]) < now:
-            stale.append(symbol)
-            continue
+            # An elapsed same-day execution window is expected, not broken
+            # analysis. The trader and each status card still prohibit replay.
+            closed_windows.append(symbol)
         ready.append(symbol)
     pending_count = sum(
         isinstance(entry.get("PENDING_ORDER"), Mapping) for entry in execution.values()
@@ -1693,8 +1885,24 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
         if not analysis_ok or not scheduler_ok or pending_count or delivery_count
         else "ACTIVE"
     )
+    safe_paused = (
+        enabled_count == 0 and not DCA_CRON_ENABLED
+        and mode_health["status"] == "MATCHED"
+        and mode_health["github_mode"] == "shadow"
+    )
+    faults = (
+        not analysis_ok or pending_count or delivery_count
+        or bool(_schedule_error) or bool(_schedule_warning)
+        or workflow_health["status"] not in {"HEALTHY", "ACTIVE"}
+    )
+    if safe_paused:
+        posture = "INTENTIONALLY PAUSED — ATTENTION REQUIRED" if faults else "INTENTIONALLY PAUSED"
+    elif mode_health["status"] != "MATCHED":
+        posture = "ATTENTION REQUIRED"
     lines = [
         f"**DCA health: {posture}**",
+        f"- Discord service: {'CONNECTED' if client.is_ready() else 'CONNECTION UNVERIFIED'}",
+        _trading_mode_summary(mode_health),
         f"- Rules: valid ({len(rules)}/{len(ALLOWED_TARGETS)} GBP targets; GBP budgets)",
         "- " + _format_analysis_workflow_health(workflow_health),
         "- " + _format_analysis_watchdog_health(watchdog_health),
@@ -1723,7 +1931,7 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
         ),
         f"- Railway scheduler: {'running' if DCA_CRON_ENABLED else 'paused'}; "
         f"active targets {len(_dca_schedule)}",
-        f"- Analysis/scheduling chain: {chain_status}",
+        f"- Analysis/scheduling chain: {'RAILWAY PAUSED — GitHub workflow health shown separately' if not DCA_CRON_ENABLED and _schedule_error is None else chain_status}",
         f"- Buy-enabled targets: {enabled_count}/{len(ALLOWED_TARGETS)}",
     ]
     if _schedule_start_date is not None:
@@ -1738,10 +1946,16 @@ async def handle_health(params: dict[str, Any], message: discord.Message) -> Non
     if mismatched and not awaiting_analysis:
         lines.append("- Rules mismatch: " + ", ".join(mismatched))
     if _schedule_error:
-        lines.append(f"- Scheduler validation: FAILED (`{_schedule_error}`)")
+        lines.append(f"- Scheduler validation: FAILED ({_safe_text(_schedule_error)})")
     if _schedule_warning:
-        lines.append(f"- Scheduler skipped target(s): `{_schedule_warning}`")
-    await message.reply("\n".join(lines)[:1_990])
+        lines.append(f"- Scheduler skipped target(s): {_safe_text(_schedule_warning)}")
+    if errors or stale or mismatched:
+        lines.append("- Next: inspect Crypto Analysis, then run `!dca analyze all`; never replay an old decision.")
+    if closed_windows:
+        lines.append("- Execution windows closed for today: " + ", ".join(closed_windows) + "; no late purchases will be replayed.")
+    if pending_count:
+        lines.append("- Next: allow Kraken reconciliation to finish; never clear a pending intent by hand.")
+    await _reply_sections(message, ["\n".join(lines)], color=0xED4245 if "ATTENTION REQUIRED" in posture else 0xF0B232 if safe_paused else 0x5865F2)
 
 
 HELP_TEXT = """🐙 **Kraken GBP-market DCA controls — clear command guide**
@@ -1754,27 +1968,31 @@ Markets: **BTC/GBP**, **ETH/GBP**, **SOL/GBP**, and **DOGE/GBP**. Budgets are in
 `help`, `!help`, or `!dca help` — show this guide
 
 🔎 **Run deterministic analysis** *(allowlisted user)*
-`!dca analyze BTC` — replace BTC with ETH or SOL
+`!dca analyze BTC` — replace BTC with ETH, SOL or DOGE
 `!dca analyze all` — analyze all four pairs
 
 💷 **Change a budget** *(disable the pair first)*
 `!dca set BTC amounts to 5 low, 10 sideways, and 20 high`
+Wait for the workflow's applied confirmation before the next change.
+LOW ≤ MID ≤ UP; all three need approved budgets before enabling. DOGE starts at £0.
 
 ⏸️ **Disable or review-enable a pair**
 `!dca disable BTC`
 `!dca enable BTC` — review first, then copy the exact confirmation returned
+Confirm within five minutes. Enablement starts with the next successful analysis.
 
 💬 **Chat with Gemini**
 Talk normally for explanations or read-only requests. Natural language cannot
 change budgets, run analysis, enable/disable a pair, or place an order.
 
-🛡️ Write and analysis commands require the exact lowercase `!dca ` prefix and
-an allowlisted Discord user. “Queued” does not mean “completed.”
+🛡️ Use the configured channel and allowlisted account for private reads and changes.
+Changes require exact lowercase `!dca ` commands. “Queued” is not “applied”.
+GitHub shadow mode prevents real orders even when a pair is enabled.
 """
 
 
 async def handle_help(params: dict[str, Any], message: discord.Message) -> None:
-    await message.reply(HELP_TEXT)
+    await _reply_sections(message, [HELP_TEXT])
 
 
 # ---------------------------------------------------------------------------
@@ -1912,7 +2130,7 @@ def refresh_dca_schedule(
         if decision["ANALYSIS_DATE"] != current_date:
             invalid_enabled.append(f"{symbol}: stale analysis date")
             continue
-        if decision["RULES_HASH"] != rules_hash(symbol, rule):
+        if decision["RULES_HASH"] != rules_hash(symbol, rule) or decision.get("ENABLED") is not rule["BUY_ENABLED"]:
             invalid_enabled.append(f"{symbol}: rules mismatch")
             continue
         if parse_utc_iso(decision["VALID_UNTIL"]) < current.astimezone(timezone.utc):
@@ -2071,7 +2289,8 @@ async def _notify(content: str) -> None:
         channel = client.get_channel(int(CHANNEL_ID)) or await client.fetch_channel(
             int(CHANNEL_ID)
         )
-        await channel.send(content[:1_990])
+        for part in _message_parts(_safe_text(content)):
+            await channel.send(part, allowed_mentions=discord.AllowedMentions.none())
     except Exception as exc:
         _log(f"WARN Discord scheduler alert failed: {type(exc).__name__}")
 
@@ -2179,7 +2398,7 @@ async def _before_schedule_refresh() -> None:
 
 intents = discord.Intents.default()
 intents.message_content = True
-client = discord.Client(intents=intents)
+client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions.none())
 
 READ_ONLY_ACTION_HANDLERS = {
     "portfolio": handle_portfolio,
@@ -2311,22 +2530,16 @@ async def _handle_exact_dca_command(text: str, message: discord.Message) -> bool
 async def on_message(message: discord.Message) -> None:
     if message.author == client.user:
         return
-    if CHANNEL_ID and str(message.channel.id) != CHANNEL_ID:
+    if not _is_authorized_config_writer(message):
         return
-    allowed = _allowed_user_ids()
-    if allowed and _message_author_id(message) not in allowed:
-        return
-    is_dm = isinstance(message.channel, discord.DMChannel)
     mentions = getattr(message, "mentions", [])
-    if not CHANNEL_ID and not is_dm and client.user not in mentions:
-        return
 
     text = str(message.content)
     for mention in mentions:
         text = text.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
     text = text.strip()
     if not text:
-        await message.reply(HELP_TEXT)
+        await handle_help({}, message)
         return
     if await _handle_exact_dca_command(text, message):
         return
@@ -2366,6 +2579,8 @@ if __name__ == "__main__":
         "GH_PAT",
         "GITHUB_REPO",
         "GITHUB_WORKFLOW_REF",
+        "DISCORD_CHANNEL_ID",
+        "DISCORD_ALLOWED_USERS",
     )
     missing = [name for name in required if not os.environ.get(name, "").strip()]
     if missing:

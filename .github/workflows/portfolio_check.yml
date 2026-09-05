@@ -23,6 +23,12 @@ jobs:
   check_balance:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    concurrency:
+      # Only the legacy recovery bootstrap writes history. Normal read-only
+      # reports keep an independent per-run group and do not wait for history.
+      group: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/recovery/dca-core' && inputs.bootstrap_history == true && 'dca-kraken-history-writer' || format('dca-portfolio-report-{0}', github.run_id) }}
+      queue: max
+      cancel-in-progress: false
     
     steps:
     - name: Checkout repository

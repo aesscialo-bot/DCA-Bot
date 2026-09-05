@@ -14,6 +14,7 @@ permissions:
 
 concurrency:
   group: dca-kraken-history-writer
+  queue: max
   cancel-in-progress: false
 
 jobs:

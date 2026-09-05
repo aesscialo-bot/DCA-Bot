@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import discord_bot
+from tests.history_fixtures import ready_history
 from dca_config import (
     ANALYSIS_STATE_VERSION,
     ALLOWED_TARGETS,
@@ -32,10 +33,19 @@ class FrozenDateTime(datetime):
 class MessageStub:
     def __init__(self, user_id="123"):
         self.replies = []
+        self.embeds = []
         self.author = SimpleNamespace(id=user_id)
+        self.channel = SimpleNamespace(id="456")
 
-    async def reply(self, content):
+    async def reply(self, content=None, **kwargs):
+        if kwargs.get("embed") is not None:
+            self.embeds.append(kwargs["embed"])
+            content = kwargs["embed"].description
         self.replies.append(content)
+
+    @property
+    def text(self):
+        return "\n".join(self.replies)
 
 
 def rules(*, enabled=(), low=10, up=20):
@@ -131,16 +141,7 @@ def analysis_state(
             "POLICY_VERSION": TIMING_POLICY_VERSION,
             "ANALYSIS_DATE": analysis_date,
             "HISTORY": (
-                {
-                    "STATUS": "READY",
-                    "FROM": (generated_at - timedelta(days=65))
-                    .isoformat()
-                    .replace("+00:00", "Z"),
-                    "THROUGH": (generated_at - timedelta(minutes=15))
-                    .isoformat()
-                    .replace("+00:00", "Z"),
-                    "HASH": "a" * 64,
-                }
+                ready_history(symbol, analyzed_at=generated_at)
                 if status == "READY" else {"STATUS": "ERROR"}
             ),
             "SIGNALS": ready_signals(generated_at) if status == "READY" else {},
@@ -211,6 +212,15 @@ class DiscordBotControlTests(unittest.TestCase):
         self.allowlist = patch.object(discord_bot, "ALLOWED_USERS", "123")
         self.allowlist.start()
         self.addCleanup(self.allowlist.stop)
+        for name, value in (("CHANNEL_ID", "456"), ("DCA_TRADING_MODE", "shadow")):
+            patched = patch.object(discord_bot, name, value)
+            patched.start()
+            self.addCleanup(patched.stop)
+        modes = patch.object(discord_bot, "get_trading_mode_health", return_value={
+            "status": "MATCHED", "github_mode": "shadow", "canary_symbol": None,
+        })
+        modes.start()
+        self.addCleanup(modes.stop)
         discord_bot._pending_enable_confirmations.clear()
         discord_bot._dca_dispatch_guard.clear()
         discord_bot._dca_schedule.clear()
@@ -390,9 +400,9 @@ class DiscordBotControlTests(unittest.TestCase):
                 "up_amount_gbp_json": "20.0",
             },
         )
-        self.assertIn("atomic budgets", message.replies[-1])
-        self.assertIn("sideways £15", message.replies[-1])
-        self.assertIn("`!dca analyze ETH`", message.replies[-1])
+        self.assertIn("atomic budgets", message.text)
+        self.assertIn("sideways £15", message.text)
+        self.assertIn("`!dca analyze ETH`", message.text)
 
         enabled_rules = rules(enabled={"ETH_GBP"})
         blocked = MessageStub()
@@ -406,7 +416,7 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             asyncio.run(discord_bot.handle_set_amounts("ETH", 11, 21, blocked))
         dispatch.assert_not_called()
-        self.assertIn("disable", blocked.replies[-1])
+        self.assertIn("disable", blocked.text)
 
     def test_zero_is_allowed_only_as_disabled_placeholder(self):
         message = MessageStub()
@@ -426,7 +436,7 @@ class DiscordBotControlTests(unittest.TestCase):
         with patch.object(discord_bot, "trigger_workflow") as dispatch:
             asyncio.run(discord_bot.handle_set_amounts("BTC", 20, 10, message))
         dispatch.assert_not_called()
-        self.assertIn("lower amount must not exceed", message.replies[-1])
+        self.assertIn("lower amount must not exceed", message.text)
 
     def test_write_safety_is_allowlisted_and_exact_prefix(self):
         message = MessageStub()
@@ -456,7 +466,7 @@ class DiscordBotControlTests(unittest.TestCase):
             )
         self.assertTrue(handled)
         handler.assert_not_called()
-        self.assertIn("Unrecognized exact", message.replies[-1])
+        self.assertIn("Unrecognized exact", message.text)
 
     def test_budget_command_accepts_clear_high_word_and_legacy_up_alias(self):
         self.assertIsNotNone(
@@ -500,7 +510,7 @@ class DiscordBotControlTests(unittest.TestCase):
             patch.object(discord_bot, "datetime", FrozenDateTime),
         ):
             asyncio.run(discord_bot.handle_enable("BTC", message))
-        reply = message.replies[-1]
+        reply = message.text
         self.assertIn("UPTREND/lower: £10", reply)
         self.assertIn("SIDEWAYS: £15", reply)
         self.assertIn("DOWNTREND/higher: £20", reply)
@@ -519,7 +529,7 @@ class DiscordBotControlTests(unittest.TestCase):
             side_effect=variable_reader(zero_rules, analysis_state(zero_rules)),
         ):
             asyncio.run(discord_bot.handle_enable("BTC", message))
-        self.assertIn("must be between £5", message.replies[-1])
+        self.assertIn("must be between £5", message.text)
 
         stale_analysis = analysis_state(
             self.rules, generated_at=NOW - timedelta(days=2)
@@ -534,8 +544,8 @@ class DiscordBotControlTests(unittest.TestCase):
             patch.object(discord_bot, "datetime", FrozenDateTime),
         ):
             asyncio.run(discord_bot.handle_enable("BTC", stale))
-        self.assertIn("Enable review for BTC_GBP", stale.replies[-1])
-        self.assertIn("next successful analysis", stale.replies[-1])
+        self.assertIn("Enable review for BTC_GBP", stale.text)
+        self.assertIn("next successful analysis", stale.text)
 
     def test_exact_enable_confirmation_binds_decision_and_dispatches_live_check(self):
         message = MessageStub()
@@ -564,7 +574,7 @@ class DiscordBotControlTests(unittest.TestCase):
                 ),
             },
         )
-        self.assertIn("next successful analysis", message.replies[-1])
+        self.assertIn("next successful analysis", message.text)
         self.assertNotIn("123", discord_bot._pending_enable_confirmations)
 
     def test_enable_review_rejects_pending_order_for_any_asset(self):
@@ -593,7 +603,7 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             asyncio.run(discord_bot.handle_enable("BTC", message))
         dispatch.assert_not_called()
-        self.assertIn("reconciliation is pending for SOL_GBP", message.replies[-1])
+        self.assertIn("reconciliation is pending for SOL\\_GBP", message.text)
 
     def test_enable_review_allows_pending_portfolio_ledger_delivery(self):
         execution = {
@@ -639,7 +649,7 @@ class DiscordBotControlTests(unittest.TestCase):
                 )
             )
         dispatch.assert_called_once()
-        self.assertIn("next successful analysis", message.replies[-1])
+        self.assertIn("next successful analysis", message.text)
 
     def test_confirmation_rejects_global_rule_change_with_same_target_exposure(self):
         analysis = deepcopy(self.analysis)
@@ -688,7 +698,7 @@ class DiscordBotControlTests(unittest.TestCase):
                 )
             )
         dispatch.assert_not_called()
-        self.assertIn("global four-asset DCA rules changed", message.replies[-1])
+        self.assertIn("global four-asset DCA rules changed", message.text)
 
     def test_analyze_exact_asset_or_all(self):
         message = MessageStub()
@@ -714,19 +724,19 @@ class DiscordBotControlTests(unittest.TestCase):
             patch.object(discord_bot, "DCA_CRON_ENABLED", True),
         ):
             asyncio.run(discord_bot.handle_status({}, status_message))
-        self.assertIn("Kraken GBP-market DCA status", status_message.replies[-1])
-        self.assertIn("BTC_GBP", status_message.replies[-1])
-        self.assertIn("UPTREND/lower £10", status_message.replies[-1])
-        self.assertIn("SIDEWAYS £15", status_message.replies[-1])
-        self.assertIn("DOWNTREND/higher £20", status_message.replies[-1])
-        self.assertEqual(status_message.replies[-1].count("Data through:"), 4)
-        self.assertIn("2026-08-05 10:45 +07", status_message.replies[-1])
-        self.assertIn("GitHub analysis workflow: **HEALTHY**", status_message.replies[-1])
-        self.assertIn("actual ref: `main@0123456789ab`", status_message.replies[-1])
-        self.assertIn("Analysis watchdog: **SATISFIED**", status_message.replies[-1])
-        self.assertIn("Analysis/scheduling chain: **OPERATIONAL**", status_message.replies[-1])
-        self.assertIn("ready-but-disabled", status_message.replies[-1])
-        self.assertLessEqual(len(status_message.replies[-1]), 2_000)
+        self.assertIn("Kraken GBP-market DCA status", status_message.text)
+        self.assertIn("BTC_GBP", status_message.text)
+        self.assertIn("UPTREND/lower £10", status_message.text)
+        self.assertIn("SIDEWAYS £15", status_message.text)
+        self.assertIn("DOWNTREND/higher £20", status_message.text)
+        self.assertEqual(status_message.text.count("Coverage through:"), 4)
+        self.assertIn("2026-08-05 10:45 +07", status_message.text)
+        self.assertIn("GitHub analysis workflow: **HEALTHY**", status_message.text)
+        self.assertIn("actual ref: `main@0123456789ab`", status_message.text)
+        self.assertIn("Analysis watchdog: **SATISFIED**", status_message.text)
+        self.assertIn("Analysis/scheduling chain: **OPERATIONAL**", status_message.text)
+        self.assertIn("ready-but-disabled", status_message.text)
+        self.assertTrue(all(len(part.encode("utf-16-le")) // 2 <= 2_000 for part in status_message.replies))
 
         with (
             patch.object(
@@ -738,13 +748,13 @@ class DiscordBotControlTests(unittest.TestCase):
             patch.object(discord_bot, "DCA_CRON_ENABLED", True),
         ):
             asyncio.run(discord_bot.handle_health({}, health_message))
-        self.assertIn("READY-BUT-DISABLED", health_message.replies[-1])
-        self.assertIn("fresh READY 4/4", health_message.replies[-1])
-        self.assertIn("Buy-enabled targets: 0/4", health_message.replies[-1])
-        self.assertIn("4/4 GBP targets", health_message.replies[-1])
-        self.assertNotIn("mixed targets", health_message.replies[-1])
+        self.assertIn("READY-BUT-DISABLED", health_message.text)
+        self.assertIn("fresh READY 4/4", health_message.text)
+        self.assertIn("Buy-enabled targets: 0/4", health_message.text)
+        self.assertIn("4/4 GBP targets", health_message.text)
+        self.assertNotIn("mixed targets", health_message.text)
         self.assertIn("Kraken GBP-market DCA controls", discord_bot.HELP_TEXT)
-        self.assertLessEqual(len(health_message.replies[-1]), 2_000)
+        self.assertTrue(all(len(part.encode("utf-16-le")) // 2 <= 2_000 for part in health_message.replies))
 
     def test_status_and_health_label_unknown_workflow_evidence_fail_closed(self):
         unknown = {
@@ -772,8 +782,8 @@ class DiscordBotControlTests(unittest.TestCase):
             asyncio.run(discord_bot.handle_status({}, status_message))
             asyncio.run(discord_bot.handle_health({}, health_message))
 
-        status = status_message.replies[-1]
-        health = health_message.replies[-1]
+        status = status_message.text
+        health = health_message.text
         self.assertIn("GitHub analysis workflow: **UNKNOWN**", status)
         self.assertIn("Railway scheduler: **running", status)
         self.assertIn("Analysis/scheduling chain: **UNKNOWN**", status)
@@ -783,7 +793,7 @@ class DiscordBotControlTests(unittest.TestCase):
 
     def test_missing_history_through_is_reported_as_unknown(self):
         decision = deepcopy(self.analysis["TARGETS"]["BTC_GBP"])
-        decision["HISTORY"].pop("THROUGH")
+        decision["HISTORY"].pop("COVERAGE_THROUGH")
 
         summary = discord_bot._decision_summary(
             "BTC_GBP",
@@ -793,7 +803,7 @@ class DiscordBotControlTests(unittest.TestCase):
             now=NOW,
         )
 
-        self.assertIn("Data through: `unknown`", summary)
+        self.assertIn("Coverage through: `unknown`", summary)
 
     def test_status_summary_visibly_labels_active_uptrend_override(self):
         decision = deepcopy(self.analysis["TARGETS"]["BTC_GBP"])
@@ -855,7 +865,7 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             asyncio.run(discord_bot.handle_status({}, message))
 
-        status = message.replies[-1]
+        status = message.text
         self.assertIn("SHADOW — REAL KRAKEN ORDERS OFF", status)
         self.assertIn("BTC/GBP", status)
         self.assertIn("SIMULATION ONLY", status)
@@ -863,9 +873,9 @@ class DiscordBotControlTests(unittest.TestCase):
         self.assertIn("OFF — PAIR DISABLED", status)
         self.assertIn("SOL/GBP", status)
         self.assertIn("WAITING FOR FRESH ANALYSIS", status)
-        self.assertIn("budgets changed after this analysis", status)
+        self.assertIn("budgets or enablement changed after this analysis", status)
         self.assertNotIn("RULES MISMATCH", status)
-        self.assertLessEqual(len(status), 2_000)
+        self.assertTrue(all(len(part.encode("utf-16-le")) // 2 <= 2_000 for part in message.replies))
 
     def test_expired_enabled_pair_says_no_replay_and_resumes_tomorrow(self):
         live_rules = rules(enabled={"ETH_GBP"})
@@ -946,9 +956,9 @@ class DiscordBotControlTests(unittest.TestCase):
             asyncio.run(discord_bot.handle_status({}, status_message))
         self.assertIn(
             "PORTFOLIO LEDGER DELIVERY WARNING (2 pending)",
-            status_message.replies[-1],
+            status_message.text,
         )
-        self.assertIn("2 pending record(s)", status_message.replies[-1])
+        self.assertIn("2 pending record(s)", status_message.text)
 
         with (
             patch.object(
@@ -960,11 +970,11 @@ class DiscordBotControlTests(unittest.TestCase):
             patch.object(discord_bot, "DCA_CRON_ENABLED", True),
         ):
             asyncio.run(discord_bot.handle_health({}, health_message))
-        self.assertIn("DCA health: ATTENTION REQUIRED", health_message.replies[-1])
-        self.assertIn("pending Kraken recoveries 0", health_message.replies[-1])
+        self.assertIn("DCA health: ATTENTION REQUIRED", health_message.text)
+        self.assertIn("pending Kraken recoveries 0", health_message.text)
         self.assertIn(
             "Portfolio ledger delivery: WARNING; 2 pending record(s)",
-            health_message.replies[-1],
+            health_message.text,
         )
 
     def test_health_reports_armed_while_waiting_for_start_day_analysis(self):
@@ -994,10 +1004,10 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             asyncio.run(discord_bot.handle_health({}, message))
 
-        self.assertIn("DCA health: ARMED", message.replies[-1])
-        self.assertIn("awaiting 04:07 start-day analysis", message.replies[-1])
-        self.assertNotIn("ATTENTION REQUIRED", message.replies[-1])
-        self.assertNotIn("Analysis ERROR", message.replies[-1])
+        self.assertIn("DCA health: ARMED", message.text)
+        self.assertIn("awaiting 04:07 start-day analysis", message.text)
+        self.assertNotIn("ATTENTION REQUIRED", message.text)
+        self.assertNotIn("Analysis ERROR", message.text)
 
     def test_status_and_health_report_armed_during_daily_rollover_wait(self):
         live_rules = rules(enabled=set(ALLOWED_TARGETS))
@@ -1033,8 +1043,8 @@ class DiscordBotControlTests(unittest.TestCase):
             finally:
                 FrozenDateTime.current = NOW
 
-        status = status_message.replies[-1]
-        health = health_message.replies[-1]
+        status = status_message.text
+        health = health_message.text
         self.assertIn("awaiting 04:07 daily analysis", status)
         self.assertIn("TODAY'S ANALYSIS NOT DUE YET", status)
         self.assertNotIn("NEXT ANALYSIS TOMORROW", status)
@@ -1068,8 +1078,8 @@ class DiscordBotControlTests(unittest.TestCase):
         ):
             asyncio.run(discord_bot.handle_health({}, message))
 
-        self.assertIn("DCA health: ARMED", message.replies[-1])
-        self.assertIn("active targets 0", message.replies[-1])
+        self.assertIn("DCA health: ARMED", message.text)
+        self.assertIn("active targets 0", message.text)
 
     def test_invalid_state_reports_not_ready_without_echoing_json(self):
         message = MessageStub()
@@ -1082,8 +1092,8 @@ class DiscordBotControlTests(unittest.TestCase):
             else "{}",
         ):
             asyncio.run(discord_bot.handle_health({}, message))
-        self.assertIn("NOT READY", message.replies[-1])
-        self.assertNotIn("do-not-echo", message.replies[-1])
+        self.assertIn("NOT READY", message.text)
+        self.assertNotIn("do-not-echo", message.text)
 
 
 class DiscordBotSchedulerTests(unittest.TestCase):

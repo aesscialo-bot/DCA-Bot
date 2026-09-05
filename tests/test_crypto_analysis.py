@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 import crypto_analysis
 import dca_config
+from tests.history_fixtures import ready_history
 
 
 NOW = datetime(2026, 8, 5, 21, 0, tzinfo=timezone.utc)  # 04:00 Bangkok
@@ -100,15 +101,6 @@ def capped_rolling_intraday_rows(now, selected_time="03:00", count=720):
 
 def candidate(time_text, miss, win, days):
     return {"TIME": time_text, "MEDIAN_MISS": miss, "WIN_RATE": win, "DAYS": days}
-
-
-def ready_history():
-    return {
-        "VERSION": 1, "STATUS": "READY", "PAIR": "BTC/GBP",
-        "FROM": "2026-06-01T00:00:00Z", "THROUGH": "2026-08-05T21:00:00Z",
-        "CANDLE_COUNT": 6240, "NO_TRADE_INTERVALS": 0,
-        "OVERLAP": {"STATUS": "MATCH"}, "HASH": "a" * 64,
-    }
 
 
 def uptrend_override_state(
@@ -1245,7 +1237,7 @@ class DecisionAndNarrationTests(unittest.TestCase):
             patch.object(
                 crypto_analysis,
                 "_fetch_asset_rows",
-                return_value=(daily, weekly, intraday_rows("05:00"), ready_history()),
+                return_value=(daily, weekly, intraday_rows("05:00"), ready_history("ETH_GBP")),
             ) as fetch_rows,
             patch.object(crypto_analysis, "LOCAL_TZ", "Asia/Bangkok"),
         ):
@@ -1268,7 +1260,7 @@ class DecisionAndNarrationTests(unittest.TestCase):
             patch.object(
                 crypto_analysis,
                 "_fetch_asset_rows",
-                return_value=(daily, weekly, intraday_rows(), ready_history()),
+                return_value=(daily, weekly, intraday_rows(), ready_history("ETH_GBP")),
             ),
             patch.object(
                 crypto_analysis,
