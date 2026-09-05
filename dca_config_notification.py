@@ -63,7 +63,11 @@ def notification_payload(
     """Only fixed wording, allowlisted labels, and a verified run URL may escape."""
 
     run_url = validated_run_url(repository, run_id, run_url)
-    target = symbol if symbol in ALLOWED_TARGETS else "configuration request"
+    supported_bulk = action == "set_enabled" and symbol == "all"
+    target = (
+        "all four targets (BTC, ETH, SOL, DOGE)" if supported_bulk
+        else symbol if symbol in ALLOWED_TARGETS else "configuration request"
+    )
     operation = {
         "set_amounts": "budgets",
         "set_enabled": "enable/disable setting",
@@ -71,7 +75,7 @@ def notification_payload(
     }.get(action, "configuration")
     if outcome == "success" and verified_result == "applied" and action in {
         "set_amounts", "set_enabled"
-    } and symbol in ALLOWED_TARGETS:
+    } and (symbol in ALLOWED_TARGETS or supported_bulk):
         status = "APPLIED — persisted rules readback matched the requested update."
         next_step = (
             "Check `show status`. Enabling waits for the next successful analysis; "

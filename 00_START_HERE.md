@@ -28,13 +28,14 @@ This review-and-polish release publishes the bot without activating buying:
 
 - Railway scheduling is paused with `DCA_CRON_ENABLED=false`.
 - GitHub **and** Railway use `DCA_TRADING_MODE=shadow`.
-- All four `BUY_ENABLED` flags remain `false`; DOGE stays £0/£0/£0.
+- All four `BUY_ENABLED` flags remain `false`; DOGE's approved budgets are £5/£10/£15.
 - All pairs remain analysis-enabled. GitHub's scheduled workflows continue,
   but disabled rules and repository shadow mode block new orders.
 - No missed purchase is replayed, and no execution or migration archive is reset.
 
-An online worker is not a live-buying claim. Live activation and DOGE budgets
-require separate explicit approval after release checks pass. Before activation,
+An online worker is not a live-buying claim. DOGE's budgets were approved and
+configured, but live activation still requires separate explicit approval after
+release checks pass. Before activation,
 require four verified 60-day decisions, a complete shadow cycle with zero order
 submissions, and matching runtime modes. Rollback must retain a four-target-
 compatible build and explicitly recheck disabled rules, both shadow settings,
@@ -49,13 +50,13 @@ The configured target set is exactly:
 | `BTC/GBP` | £5 | £10 | £20 | Disabled for paused release |
 | `ETH/GBP` | £5 | £10 | £15 | Disabled for paused release |
 | `SOL/GBP` | £5 | £10 | £15 | Disabled for paused release |
-| `DOGE/GBP` | £0 | £0 | £0 | Disabled pending approved budgets |
+| `DOGE/GBP` | £5 | £10 | £15 | Disabled for paused release |
 
 - The bot deliberately buys more in a `DOWNTREND`, the explicit middle amount in a
   `SIDEWAYS` market, and less in an `UPTREND`.
-- If BTC/ETH/SOL are enabled later, their aggregate daily exposure is
-  £50 / £30 / £15 when all three are downtrend / sideways / uptrend respectively.
-  This all-disabled release has £0 new-order exposure; DOGE is not allocated.
+- If all four targets are enabled later, their aggregate daily exposure is
+  £65 / £40 / £20 when all four are downtrend / sideways / uptrend respectively.
+  This all-disabled release has £0 new-order exposure.
 - Each enabled pair can buy at most once per Asia/Bangkok calendar day.
 - The strict trading start gate is `DCA_START_DATE=2026-08-07` in
   `Asia/Bangkok`. Earlier orders are blocked.
@@ -63,6 +64,10 @@ The configured target set is exactly:
 This table is the approved baseline, not a substitute for checking live state.
 Use `show status` and `!dca health` in Discord whenever you need the current
 rules, decisions, pending state, and scheduler posture.
+
+DOGE's £5/£10/£15 configuration was confirmed by the
+[approved configuration workflow](https://github.com/aesscialo-bot/DCA-Bot/actions/runs/33952770359).
+That budget update did not enable any target or change either trading mode.
 
 ## What happens each day
 
@@ -207,8 +212,8 @@ show status
 !dca health
 ```
 
-Replace `BTC` with `ETH`, `SOL`, or `DOGE` as needed, using only approved budgets.
-The BTC example does not approve DOGE amounts. Enter numbers without a `£` sign
+Replace `BTC` with `ETH`, `SOL`, or `DOGE` as needed, using the approved budgets
+above; DOGE's higher amount is £15, not the BTC example's £20. Enter numbers without a `£` sign
 and with no more than two decimal places. Amounts must satisfy
 `low <= sideways <= high`. All three must be between £5 and £1,000 and at or
 above Kraken's current market minimum before enabling. Zero is permitted only
@@ -225,6 +230,59 @@ analysis state, then review and confirm enable again and run analysis after it.
 
 These commands do not switch GitHub/Railway out of shadow or start the paused
 Railway scheduler. This release remains paused unless separately approved.
+
+Finish one configuration operation before submitting the next. Any newer main
+configuration request, including a dry run, supersedes an older queued enable;
+the old enable must be reviewed and confirmed again as a fresh request. Do not
+use Actions `Re-run` for configuration changes: repeat attempts are refused.
+Use a fresh Discord command or new workflow dispatch after checking live status.
+Historical pre-guard configuration runs must never be replayed against production.
+
+### Enable or disable all four pairs
+
+For a reviewed all-four enable, send:
+
+```text
+!dca enable all
+```
+
+The review lists BTC, ETH, SOL, and DOGE's LOW/MID/UP budgets and aggregate maximum
+daily exposure (£65 with the approved baseline). It supports a mixture of enabled
+and disabled pairs. After checking every pair, send exactly this within five
+minutes:
+
+```text
+!dca confirm enable all
+```
+
+The workflow validates every target and the exact reviewed rules before one
+atomic enable update. If any budget or Kraken minimum fails, any order needs
+reconciliation, the analysis document cannot be safely invalidated, or the
+reviewed rules changed, the entire enable is refused. Previously enabled flags
+are retained on validation failure; no subset is newly enabled. On success, all
+four old decisions are invalidated, including those for
+already enabled targets. Wait for the `APPLIED`
+receipt, then run:
+
+```text
+!dca analyze all
+```
+
+Buying requires fresh successful analysis after that enable, along with every
+normal mode, date, timing, quote, balance, and daily-limit check. Bulk enabling
+does not switch shadow mode or start Railway scheduling.
+
+To stop all four pairs, send:
+
+```text
+!dca disable all
+```
+
+This immediately queues one atomic disable of all four buy flags; no confirmation
+is required. It is not applied until the workflow verifies and reports `APPLIED`.
+Budgets, buy dates, pending Kraken recovery, reporting deliveries, trading modes,
+and Railway scheduler settings remain unchanged. Any order already accepted by
+Kraken must still be reconciled; never clear its state to make a disable look done.
 
 ### Stop buying a pair
 
@@ -289,7 +347,7 @@ The user-owned repository variable is `DCA_TARGET_MAP`. Its approved shape is:
     "BUY_ENABLED": false
   },
   "DOGE_GBP": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 0, "MID": 0, "UP": 0},
+    "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
     "BUY_ENABLED": false
   }
 }
@@ -311,6 +369,7 @@ If Discord is unavailable, the
 can safely perform these limited operations:
 
 - Disable: `action=set_enabled`, canonical `symbol`, `enabled_json=false`.
+- Disable all: `action=set_enabled`, lowercase `symbol=all`, `enabled_json=false`.
 - Change budgets while disabled: `action=set_amounts`, canonical `symbol`, and
   numeric `low_amount_gbp_json`, `mid_amount_gbp_json`, and
   `up_amount_gbp_json` values.
@@ -319,6 +378,8 @@ can safely perform these limited operations:
 
 The workflow input `up_amount_gbp_json` is a compatibility name for the
 upper/higher endpoint.
+`symbol=all` is supported only for `set_enabled`; edit each target's budgets
+individually. Start a new workflow dispatch for an operation, never a rerun.
 
 Do not manually use `set_enabled=true`; safe enabling binds to rules fingerprints
 that Discord supplies during exact confirmation. `expected_decision_id` is a

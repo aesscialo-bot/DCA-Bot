@@ -32,7 +32,7 @@ def global_rules_pre_state_hash(current_rules) -> str:
 def prepare_enable_analysis_invalidation(
     updated_rules, analysis_state, *, symbol: str, now: datetime | None = None
 ) -> dict:
-    """Invalidate only the enabled target, retaining every unrelated decision.
+    """Invalidate the enabled target(s), retaining every unrelated decision.
 
     The workflow holds both rule-writer and analysis-writer locks and persists
     this document BEFORE enabling rules. A failed enable therefore only blocks
@@ -40,7 +40,8 @@ def prepare_enable_analysis_invalidation(
     """
 
     rules = validate_rules_map(updated_rules)
-    if symbol not in ALLOWED_TARGETS or rules[symbol]["BUY_ENABLED"] is not True:
+    targets = ALLOWED_TARGETS if symbol == "all" else (symbol,)
+    if any(target not in ALLOWED_TARGETS or rules[target]["BUY_ENABLED"] is not True for target in targets):
         raise ConfigError("Analysis invalidation requires a valid enabled target")
     try:
         state = validate_analysis_state(analysis_state)
@@ -49,16 +50,18 @@ def prepare_enable_analysis_invalidation(
             "Cannot safely invalidate analysis; run !dca analyze all before enabling"
         ) from None
     reason = "Enable request invalidated the prior decision; successful analysis is required"
-    replacement = empty_analysis_state(rules, now=now, reason=reason)["TARGETS"][symbol]
-    replacement["ANALYSIS_STATUS"] = "ERROR"
-    replacement["HISTORY"] = {"STATUS": "ERROR"}
-    # Other targets keep their original envelope date, including at midnight.
-    replacement["ANALYSIS_DATE"] = state["ANALYSIS_DATE"]
-    # An invalidation is not an override release. Preserve visible audit fields.
-    replacement["SIGNALS"] = {
-        **copy.deepcopy(state["TARGETS"][symbol]["SIGNALS"]), "ERROR": reason
-    }
-    state["TARGETS"][symbol] = replacement
+    replacements = empty_analysis_state(rules, now=now, reason=reason)["TARGETS"]
+    for target in targets:
+        replacement = replacements[target]
+        replacement["ANALYSIS_STATUS"] = "ERROR"
+        replacement["HISTORY"] = {"STATUS": "ERROR"}
+        # Keep the original envelope date, including at a midnight boundary.
+        replacement["ANALYSIS_DATE"] = state["ANALYSIS_DATE"]
+        # An invalidation is not an override release. Preserve each audit trail.
+        replacement["SIGNALS"] = {
+            **copy.deepcopy(state["TARGETS"][target]["SIGNALS"]), "ERROR": reason
+        }
+        state["TARGETS"][target] = replacement
     return validate_analysis_state(state)
 
 
@@ -118,10 +121,12 @@ def apply_change(
     """Return the validated replacement map and whether it should be written."""
 
     rules = validate_rules_map(current_rules)
-    if symbol not in ALLOWED_TARGETS:
+    if symbol not in ALLOWED_TARGETS and symbol != "all":
         raise ConfigError(f"Unknown production target: {symbol}")
     if action not in {"set_amounts", "set_enabled", "dry_run"}:
         raise ConfigError(f"Unsupported configuration action: {action}")
+    if symbol == "all" and action != "set_enabled":
+        raise ConfigError("The all target is supported only for set_enabled; edit budgets individually")
 
     if action in {"set_amounts", "dry_run"}:
         if rules[symbol]["BUY_ENABLED"]:
@@ -146,10 +151,12 @@ def apply_change(
 
     enabled = _json_boolean(enabled_json, "enabled_json")
     candidate = {key: dict(value) for key, value in rules.items()}
-    candidate[symbol] = {
-        "REGIME_AMOUNTS_GBP": dict(rules[symbol]["REGIME_AMOUNTS_GBP"]),
-        "BUY_ENABLED": enabled,
-    }
+    targets = ALLOWED_TARGETS if symbol == "all" else (symbol,)
+    for target in targets:
+        candidate[target] = {
+            "REGIME_AMOUNTS_GBP": dict(rules[target]["REGIME_AMOUNTS_GBP"]),
+            "BUY_ENABLED": enabled,
+        }
     if not enabled:
         return validate_rules_map(candidate), True
 
@@ -170,13 +177,17 @@ def apply_change(
             "Cannot enable while Kraken order reconciliation is pending for "
             + ", ".join(pending_symbols)
         )
-    live_hash = rules_hash(symbol, rules[symbol])
+    live_hash = global_rules_pre_state_hash(rules) if symbol == "all" else rules_hash(symbol, rules[symbol])
     if expected_rules_hash != live_hash:
         raise ConfigError("Budgets changed after the enable review")
     if market_minimum_provider is None:
         raise ConfigError("A fresh Kraken market-minimum check is required")
-    minimum = _minimum_value(market_minimum_provider, symbol)
-    updated = validate_enabled_market_minimums(candidate, {symbol: minimum})
+    # Reject any unconfigured bulk budget before querying markets. No subset of
+    # the requested change or invalidation is returned if a later check fails.
+    if symbol == "all":
+        candidate = validate_rules_map(candidate)
+    minimums = {target: _minimum_value(market_minimum_provider, target) for target in targets}
+    updated = validate_enabled_market_minimums(candidate, minimums)
     prepare_enable_analysis_invalidation(updated, analysis_state, symbol=symbol, now=now)
     return updated, True
 

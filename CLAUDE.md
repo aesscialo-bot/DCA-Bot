@@ -24,8 +24,9 @@ workflows, or release configuration.
   `ACTIVE=true`. The analysis-driven automatic release path is gated on normal
   3-close confirmation and must persist the release before the matching
   analysis state. Gemini and routine Discord commands cannot write an override.
-- Current LOW/MID/UP amounts are BTC £5/£10/£20 and ETH/SOL £5/£10/£15.
-  DOGE begins disabled at £0/£0/£0 until the operator explicitly chooses budgets.
+- Current approved LOW/MID/UP amounts are BTC £5/£10/£20 and ETH/SOL/DOGE
+  £5/£10/£15. DOGE's approved configuration is persisted; all four flags remain
+  disabled. All-enabled aggregate LOW/MID/UP exposure is £20/£40/£65.
   Budget changes must use the guarded configuration flow and preserve ordering.
 - This review-and-polish release is deployed paused: every `BUY_ENABLED=false`,
   GitHub and Railway both `DCA_TRADING_MODE=shadow`, and Railway
@@ -48,6 +49,19 @@ workflows, or release configuration.
   analysis before the rules write under both writer locks, verifies readback,
   and waits for new successful analysis. Missing/malformed/obsolete analysis
   blocks enable until repaired; never clear execution state or unrelated decisions.
+- Bulk `!dca enable all` reviews every target's three budgets and aggregate
+  maximum exposure, including mixed current flags. Exact `!dca confirm enable all`
+  is required within five minutes. Validate all four before any enabling write;
+  one failed target fails the whole operation. After `APPLIED`, require successful
+  fresh `!dca analyze all`; no old decision may revive through bulk enable.
+- `!dca disable all` queues a single atomic all-four disable without confirmation.
+  It never changes budgets, modes, scheduling, buy dates, or recovery evidence.
+  Queued is not applied, and accepted Kraken orders still require reconciliation.
+- The newest main configuration request supersedes any older queued enable,
+  including when the newer request is a no-op disable or dry run. Verify complete
+  GitHub run evidence under the writer lock and fail enable closed if unreadable.
+  Configuration attempt reruns are refused before writes; require a fresh request.
+  Never replay historical pre-guard configuration runs against production.
 - Before intent creation and immediately before Kraken submission, re-read the
   live override document and require an exact match with the analysis decision.
   Preserve reconciliation-only recovery for an existing durable pending intent.

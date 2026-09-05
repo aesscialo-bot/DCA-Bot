@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -9,6 +10,33 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 class WorkflowSafetyTests(unittest.TestCase):
     def _read(self, name):
         return (WORKFLOWS / name).read_text(encoding="utf-8")
+
+    def test_bulk_enable_is_order_guarded_and_configuration_replays_cannot_write(self):
+        text = self._read("update_dca_config.yml")
+        attempt_gate = text.index('if [ "$GITHUB_RUN_ATTEMPT" != "1" ]; then')
+        analysis_write = text.index('gh variable set DCA_ANALYSIS_STATE')
+        rules_write = text.index('gh variable set DCA_TARGET_MAP')
+        guards = [match.start() for match in re.finditer(
+            r"python -u dca_config_queue_guard\.py", text
+        )]
+        self.assertEqual(len(guards), 2)
+        self.assertLess(attempt_gate, guards[0])
+        self.assertLess(guards[0], analysis_write)
+        self.assertLess(analysis_write, guards[1])
+        self.assertLess(guards[1], rules_write)
+        self.assertIn("actions: read", text)
+        self.assertIn("DCA_WORKFLOW_READ_TOKEN: ${{ github.token }}", text)
+        enable_region = text[text.rindex('if [ "$ACTION" = "set_enabled" ] && [ "$ENABLED_JSON" = "true" ]; then'):rules_write]
+        self.assertEqual(enable_region.count("python -u dca_config_queue_guard.py"), 2)
+
+    def test_bulk_disable_does_not_need_analysis_execution_or_queue_api(self):
+        text = self._read("update_dca_config.yml")
+        guard = 'if [ "$ACTION" = "set_enabled" ] && [ "$SYMBOL" = "all" ] && [ "$ENABLED_JSON" = "false" ]; then'
+        branch = text.split(guard, 1)[1].split("else", 1)[0]
+        self.assertIn("DCA_ANALYSIS_STATE='{}'", branch)
+        self.assertIn("DCA_EXECUTION_STATE='{}'", branch)
+        self.assertNotIn("gh variable get", branch)
+        self.assertNotIn("dca_config_queue_guard.py", branch)
 
     def test_official_actions_are_node_24_compatible(self):
         for path in WORKFLOWS.glob("*.yml"):

@@ -28,8 +28,9 @@ mirror and can never affect analysis, budgets, scheduling, or Kraken execution.
 > This release is **deployed and paused**, not buying live: all four targets
 > remain disabled, GitHub and Railway both use `DCA_TRADING_MODE=shadow`, and
 > Railway uses `DCA_CRON_ENABLED=false`. Analysis continues independently.
-> Successful review or deployment does not authorize live activation or DOGE
-> budgets. No missed purchase is replayed.
+> Successful review or deployment does not authorize live activation. DOGE's
+> approved budgets are £5/£10/£15, but its buy flag remains disabled like the
+> other three targets. No missed purchase is replayed.
 
 ## Production configuration
 
@@ -39,8 +40,8 @@ date, the trader fails closed without creating a Kraken order. Check live
 operation with `show status` and `!dca health` rather than treating this static
 baseline as current runtime state.
 
-The release preserves approved BTC/ETH/SOL budgets and unconfigured DOGE budgets,
-with every target disabled:
+The approved budgets are BTC £5/£10/£20 and ETH/SOL/DOGE £5/£10/£15, with every
+target disabled for this release:
 
 ```json
 {
@@ -57,7 +58,7 @@ with every target disabled:
     "BUY_ENABLED": false
   },
   "DOGE_GBP": {
-    "REGIME_AMOUNTS_GBP": {"LOW": 0, "MID": 0, "UP": 0},
+    "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
     "BUY_ENABLED": false
   }
 }
@@ -67,14 +68,13 @@ with every target disabled:
 downtrend budgets respectively. `UP` does not mean "use this in an uptrend."
 The counter-cyclical policy is:
 
-- `DOWNTREND` → higher amount: BTC £20, ETH £15, SOL £15; £50 aggregate.
-- `SIDEWAYS` → explicit middle amount: BTC/ETH/SOL £10 each; £30 aggregate.
-- `UPTREND` → lower amount: BTC/ETH/SOL £5 each; £15 aggregate.
+- `DOWNTREND` → higher amount: BTC £20, ETH/SOL/DOGE £15 each; £65 aggregate.
+- `SIDEWAYS` → explicit middle amount: £10 per target; £40 aggregate.
+- `UPTREND` → lower amount: £5 per target; £20 aggregate.
 
-Those aggregate amounts assume BTC/ETH/SOL are enabled; this paused release has
-£0 new-order exposure. DOGE remains £0/£0/£0 until separately approved and cannot
-be enabled with placeholder budgets. Each enabled asset can buy at most once
-per Bangkok calendar day.
+Those aggregate amounts assume all four targets are enabled; this paused release
+has £0 new-order exposure. Budget approval alone does not enable buying or change
+shadow mode. Each enabled asset can buy at most once per Bangkok calendar day.
 
 ## Automated daily flow
 
@@ -217,8 +217,9 @@ stopping automation.
 
 `DCA_TARGET_MAP` contains only the four exact target keys, explicit `LOW`, `MID`,
 and `UP` GBP amounts, and `BUY_ENABLED` flags. Budget edits are atomic and
-permitted only while the selected asset is disabled. DOGE starts disabled with
-zero amounts until its operator-approved budgets are configured.
+permitted only while the selected asset is disabled. DOGE's approved configured
+budgets are now £5/£10/£15; all four targets remain disabled. Zero-budget defaults
+are valid disabled placeholders, not enabled allocations.
 
 `DCA_ANALYSIS_STATE` stores each asset's status, effective regime, selected tier,
 `EXECUTE_AT`, `VALID_UNTIL`, `DECISION_ID`, `RULES_HASH`, signal metrics, and
@@ -387,6 +388,9 @@ Examples use the canonical GBP-market targets:
 !dca disable BTC
 !dca enable BTC
 !dca confirm enable BTC_GBP
+!dca enable all
+!dca confirm enable all
+!dca disable all
 !dca analyze BTC
 !dca analyze all
 show status
@@ -412,11 +416,33 @@ even after disable/re-enable in the same execution window. Missing, malformed,
 or obsolete analysis state blocks enable until `!dca analyze all` repairs it;
 other decisions and all execution records are preserved.
 
+`!dca enable all` supports a mixture of enabled and disabled targets and reviews
+all four LOW/MID/UP budgets plus aggregate maximum daily exposure. Send exactly
+`!dca confirm enable all` within five minutes. Validation is all-or-nothing:
+changed reviewed rules, an invalid budget or Kraken minimum, pending order
+recovery, or an invalid analysis document prevents the bulk enable; no subset is
+newly enabled and existing flags remain unchanged on validation failure.
+Successful bulk enable invalidates all four old decisions, including decisions
+for targets that were already enabled. It requires fresh analysis for this
+activation. After the workflow says `APPLIED`, run `!dca analyze all` and wait for
+successful fresh decisions before expecting purchases.
+
+`!dca disable all` immediately queues one atomic all-four disable without a
+confirmation step. Queued still is not applied: check its completion receipt.
+Already accepted Kraken orders continue through reconciliation. The command
+changes no budgets, buy dates, pending recovery, trading modes, or scheduler
+settings. Neither bulk command switches this paused release into live trading.
+
 Dispatch acknowledgement means **queued**, not applied. The configuration workflow
 reports **APPLIED** only after reading back and matching the complete intended
 rules. Its sanitized Discord receipt links to the exact run. Failed or ambiguous
 writes require a status check before retrying; failed receipt delivery is visible
 in Actions and never automatically repeats the configuration operation.
+Finish one configuration request before submitting another. Any newer main
+configuration request supersedes an older queued enable, even a dry run; review
+and confirm a fresh enable if it was superseded. Configuration workflow reruns
+are refused: use a fresh request from Discord or a new workflow dispatch, not Actions
+`Re-run`. Never replay an old pre-guard configuration run against production.
 
 `show status` separates connection, configured enablement, analysis readiness,
 GitHub order-authority mode, Railway mode, scheduler state, and buying blockers.

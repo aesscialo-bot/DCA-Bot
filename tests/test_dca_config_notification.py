@@ -46,6 +46,20 @@ class ConfigurationReceiptTests(unittest.TestCase):
         self.assertIn("no configuration was changed", content)
         self.assertNotIn("APPLIED", content)
 
+    def test_bulk_applied_receipt_names_all_four_targets_only_for_supported_operation(self):
+        result = self.payload(symbol="all")
+        self.assertIn("all four targets (BTC, ETH, SOL, DOGE)", result["content"])
+        self.assertIn("APPLIED", result["content"])
+        self.assertEqual(result["allowed_mentions"]["parse"], [])
+        for changes in (
+            {"action": "set_amounts"}, {"action": "dry_run", "verified_result": "validated"},
+            {"symbol": "ALL"}, {"outcome": "failure"}, {"verified_result": ""},
+        ):
+            with self.subTest(changes=changes):
+                content = self.payload(**({"symbol": "all"} | changes))["content"]
+                self.assertNotIn("APPLIED", content)
+                self.assertIn("NOT CONFIRMED", content)
+
     def test_untrusted_inputs_are_not_rendered_and_mentions_disabled(self):
         injected = "@everyone <@12345> ``` https://evil.example/secrets"
         result = self.payload(symbol=injected, action=injected)
