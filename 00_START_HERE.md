@@ -22,20 +22,23 @@ Kraken is the source of truth for balances, holdings, fees, and orders.
 | Kraken holdings report | [Portfolio Balance Check workflow](https://github.com/aesscialo-bot/DCA-Bot/actions/workflows/portfolio_check.yml) |
 | Code validation and deployment gate | [CI workflow](https://github.com/aesscialo-bot/DCA-Bot/actions/workflows/ci.yml) |
 
-## Recovery posture
+## Release posture: deployed and paused
 
-The bot is intentionally contained while this recovery is validated:
+This review-and-polish release publishes the bot without activating buying:
 
 - Railway scheduling is paused with `DCA_CRON_ENABLED=false`.
-- `DCA_TRADING_MODE=shadow` blocks every new Kraken order.
-- All pairs remain analysis-enabled, but the all-four Kraken history gate must
-  pass before even the SOL canary can submit an order.
-- The 7 August missed purchase will not be replayed.
-- Rollback at every rollout stage is `DCA_TRADING_MODE=shadow`.
+- GitHub **and** Railway use `DCA_TRADING_MODE=shadow`.
+- All four `BUY_ENABLED` flags remain `false`; DOGE stays £0/£0/£0.
+- All pairs remain analysis-enabled. GitHub's scheduled workflows continue,
+  but disabled rules and repository shadow mode block new orders.
+- No missed purchase is replayed, and no execution or migration archive is reset.
 
-Do not resume Railway or choose `canary` until the history manifest shows four
-verified 60-day decisions and one complete scheduled shadow cycle has produced
-zero Kraken `AddOrder` calls.
+An online worker is not a live-buying claim. Live activation and DOGE budgets
+require separate explicit approval after release checks pass. Before activation,
+require four verified 60-day decisions, a complete shadow cycle with zero order
+submissions, and matching runtime modes. Rollback must retain a four-target-
+compatible build and explicitly recheck disabled rules, both shadow settings,
+and paused Railway scheduling; restoring a deployment may restore its variables.
 
 ## Production baseline
 
@@ -43,15 +46,16 @@ The configured target set is exactly:
 
 | Pair | `UPTREND` lower | `SIDEWAYS` | `DOWNTREND` higher | Intended state |
 | --- | ---: | ---: | ---: | --- |
-| `BTC/GBP` | £5 | £10 | £20 | Enabled |
-| `ETH/GBP` | £5 | £10 | £15 | Enabled |
-| `SOL/GBP` | £5 | £10 | £15 | Enabled |
+| `BTC/GBP` | £5 | £10 | £20 | Disabled for paused release |
+| `ETH/GBP` | £5 | £10 | £15 | Disabled for paused release |
+| `SOL/GBP` | £5 | £10 | £15 | Disabled for paused release |
 | `DOGE/GBP` | £0 | £0 | £0 | Disabled pending approved budgets |
 
 - The bot deliberately buys more in a `DOWNTREND`, the explicit middle amount in a
   `SIDEWAYS` market, and less in an `UPTREND`.
-- Aggregate daily exposure is £50 / £30 / £15 when every pair is
-  downtrend / sideways / uptrend respectively.
+- If BTC/ETH/SOL are enabled later, their aggregate daily exposure is
+  £50 / £30 / £15 when all three are downtrend / sideways / uptrend respectively.
+  This all-disabled release has £0 new-order exposure; DOGE is not allocated.
 - Each enabled pair can buy at most once per Asia/Bangkok calendar day.
 - The strict trading start gate is `DCA_START_DATE=2026-08-07` in
   `Asia/Bangkok`. Earlier orders are blocked.
@@ -75,16 +79,17 @@ rules, decisions, pending state, and scheduler posture.
 3. Python selects the higher / explicit middle / lower GBP spend for downtrend /
    sideways / uptrend respectively, plus the best 15-minute execution time from
    deterministic 3-, 5-, 7-, 14-, 30-, 45-, and 60-day timing windows on
-   BTC/GBP, ETH/GBP, and SOL/GBP.
+   BTC/GBP, ETH/GBP, SOL/GBP, and DOGE/GBP.
 4. The workflow writes a fresh `DCA_ANALYSIS_STATE` and posts a readable summary
    to Discord.
 5. Railway checks the absolute execution times every five minutes and dispatches
    the trader when a pair is due.
 6. The trader rechecks the live rule, decision, uptrend-override document, date,
-   window, Kraken minimum, pending-order state, and once-per-day guard. Override
+   window, fresh executable Kraken GBP quote, market minimum, pending-order
+   state, and once-per-day guard. Historical carried prices cannot size an order. Override
    state must match the analysis before intent creation and immediately before
    Kraken submission.
-7. BTC, ETH, and SOL spend GBP directly on `BTC/GBP`, `ETH/GBP`, and `SOL/GBP`.
+7. BTC, ETH, SOL, and DOGE spend GBP directly on `BTC/GBP`, `ETH/GBP`, `SOL/GBP`, and `DOGE/GBP`.
    No active target has a funding leg.
 8. Kraken remains the authoritative record and Discord receives the result.
 
@@ -98,17 +103,33 @@ alerts Discord, and skips that purchase. The bot never reuses an old decision.
 The Daily DCA fallback also runs at minutes 02, 17, 32, and 47, but every trigger
 passes through the same durable intent and once-per-day lock.
 
-Status reports the analysis date, decision ID, selected optimal time, effective
-catch-up time, execution status, workflow ref, pending Kraken intent, Portfolio
-Compass delivery, and local Ghostfolio receipt completion. It prominently labels
+Status separates service connection, configured enablement, analysis readiness,
+GitHub order-authority mode, Railway mode, and scheduler state. A matching live
+mode does not authorize an order: quotes, balance, timing, daily limits, and
+recovery checks still apply. Mismatched or unavailable modes never appear ready.
+The four pair cards report budgets, effective time, history coverage, last traded
+candle, last buy, recovery, and reporting warnings. Long replies split safely
+instead of truncating warnings. Status and health prominently label
 any active emergency uptrend override with the normal rule result, confirmation
 progress, activation time, and reason. A stale decision is never shown as
-`READY` or `Next`.
+buying-ready or as a future purchase.
+
+Kraken history coverage and liquidity are different facts. Verified no-trade
+intervals may carry the last real close with zero volume through the verified
+cutoff for timing analysis only. Leading history, partial ingestion, and missing
+or changed partition evidence are never filled. `COVERAGE_THROUGH` must be fresh
+within 45 minutes at analysis creation; `LAST_REAL_CANDLE_AT` names the last
+traded candle's start, not an exact last-trade timestamp. A quiet DOGE market can
+have fresh coverage and an older last traded candle without an ingestion failure.
+The all-four, 170-daily, and 20-weekly checks remain mandatory.
 
 ## Everyday Discord controls
 
 Commands are exact safety controls. Use the allowlisted Discord account and the
 exact lowercase `!dca ` prefix and spacing.
+Missing or empty `DISCORD_ALLOWED_USERS` denies access, including private status
+reads and portfolio-report dispatches. Replies suppress mentions and escape
+untrusted content; do not broaden the allowlist to work around a blocked request.
 
 ### Check the bot
 
@@ -147,47 +168,63 @@ Example: set BTC to £5 in uptrend, £10 sideways, and £20 in downtrend.
 !dca disable BTC
 ```
 
-Wait for the first **Update DCA Configuration** run to succeed, then send:
+Wait for the first **Update DCA Configuration** receipt to say `APPLIED`, then send:
 
 ```text
 !dca set BTC amounts to 5 low, 10 sideways, and 20 high
 ```
 
-Wait for the second **Update DCA Configuration** run to succeed. Only then send:
-
-```text
-!dca analyze BTC
-```
-
-Wait for the **Crypto Analysis** run to succeed and for Discord to show a fresh
-`READY` result. Then send:
+Wait for the second **Update DCA Configuration** receipt to say `APPLIED`, then send:
 
 ```text
 !dca enable BTC
 ```
 
-Review the budgets, latest regime, effective amount, next execution time, age,
-and maximum aggregate daily exposure. Within five minutes, copy the exact
-confirmation returned by the bot, for example:
+Review the lower, sideways, and higher budgets, maximum aggregate daily exposure,
+and requirement for successful analysis after enabling. `show status` provides
+the last analysis and timing separately; those old values do not authorize this
+enable. Within five minutes, copy the exact confirmation returned by the bot,
+for example:
 
 ```text
 !dca confirm enable BTC_GBP
 ```
 
-Wait for the final **Update DCA Configuration** run to succeed. Railway can take
-up to five minutes to refresh the new schedule. Finish with:
+Wait for the final **Update DCA Configuration** receipt to say `APPLIED`. Enabling
+first invalidates the target's old decision, including a prior enabled decision
+from the same day. It cannot buy until successful analysis runs after the enable.
+Now send:
+
+```text
+!dca analyze all
+```
+
+Wait for all four analyses to succeed. Railway can take up to five minutes to
+refresh scheduling when it is separately authorized and running. Finish with:
 
 ```text
 show status
 !dca health
 ```
 
-Replace `BTC` with `ETH` or `SOL` as needed. Enter numbers without a `£` sign
+Replace `BTC` with `ETH`, `SOL`, or `DOGE` as needed, using only approved budgets.
+The BTC example does not approve DOGE amounts. Enter numbers without a `£` sign
 and with no more than two decimal places. Amounts must satisfy
 `low <= sideways <= high`. All three must be between £5 and £1,000 and at or
 above Kraken's current market minimum before enabling. Zero is permitted only
 as a disabled placeholder. The old two-amount command remains a rollout
 compatibility alias that derives its midpoint; use the explicit form above.
+
+Queued is not applied. Each configuration receipt links to its exact GitHub run;
+`APPLIED` requires complete rules readback matching the request. If a run fails,
+is cancelled, or its receipt is missing, check `show status` and Actions before
+retrying: the write may already have happened. A notification failure does not
+automatically repeat the write. If enable says analysis cannot be safely
+invalidated, run `!dca analyze all` first to repair missing, malformed, or obsolete
+analysis state, then review and confirm enable again and run analysis after it.
+
+These commands do not switch GitHub/Railway out of shadow or start the paused
+Railway scheduler. This release remains paused unless separately approved.
 
 ### Stop buying a pair
 
@@ -241,15 +278,19 @@ The user-owned repository variable is `DCA_TARGET_MAP`. Its approved shape is:
 {
   "BTC_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 20},
-    "BUY_ENABLED": true
+    "BUY_ENABLED": false
   },
   "ETH_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
-    "BUY_ENABLED": true
+    "BUY_ENABLED": false
   },
   "SOL_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
-    "BUY_ENABLED": true
+    "BUY_ENABLED": false
+  },
+  "DOGE_GBP": {
+    "REGIME_AMOUNTS_GBP": {"LOW": 0, "MID": 0, "UP": 0},
+    "BUY_ENABLED": false
   }
 }
 ```
@@ -258,8 +299,12 @@ The user-owned repository variable is `DCA_TARGET_MAP`. Its approved shape is:
 downtrend amounts. `UP` does **not** mean the amount used in an uptrend. Analysis
 records tiers `LOW`, `MID`, or `HIGH` according to the counter-cyclical policy.
 
-Use Discord for routine changes. It validates and serializes the write, checks
-fresh analysis before enabling, and checks Kraken's current market minimum.
+Use Discord for routine changes. It validates and serializes the write, binds
+confirmation to reviewed budgets and all four rules, and checks Kraken's current
+market minimum using an executable quote. Before persisting an enable, it safely
+invalidates that target's prior analysis under the analysis-writer lock and
+verifies the invalidation readback. Other decisions and all execution records
+are preserved. Buying requires successful analysis after enabling.
 
 If Discord is unavailable, the
 [Update DCA Configuration workflow](https://github.com/aesscialo-bot/DCA-Bot/actions/workflows/update_dca_config.yml)
@@ -275,8 +320,9 @@ can safely perform these limited operations:
 The workflow input `up_amount_gbp_json` is a compatibility name for the
 upper/higher endpoint.
 
-Do not manually use `set_enabled=true`; safe enabling binds to fresh decision
-and rules fingerprints that Discord supplies during exact confirmation.
+Do not manually use `set_enabled=true`; safe enabling binds to rules fingerprints
+that Discord supplies during exact confirmation. `expected_decision_id` is a
+legacy compatibility input, not a required fresh-decision binding.
 
 Do not manually edit:
 
@@ -287,13 +333,26 @@ Do not manually edit:
 
 Changing any regime amount invalidates that target's old decision fingerprint.
 Enabling or disabling changes the globally reviewed rules state.
-Run fresh analysis after a budget change before trying to re-enable or trade.
+Run fresh analysis after enabling and before expecting any purchase. Valid ERROR
+or stale decisions do not themselves prevent enabling, but malformed or obsolete
+analysis state must first be repaired so unrelated decisions can be preserved.
 
 ## Adding or permanently removing a pair
 
 Pair membership is a maintainer/Codex code-and-state migration, not a beginner
-JSON setting. The current schema requires exactly `BTC_GBP`, `ETH_GBP`, and
-`SOL_GBP`; an extra or missing key fails closed.
+JSON setting. The current schema requires exactly `BTC_GBP`, `ETH_GBP`,
+`SOL_GBP`, and `DOGE_GBP`; an extra or missing key fails closed.
+
+This release does not change membership and requires no migration. Do not rerun
+the completed DOGE addition or historical HYPE-to-ETH migration. Keep their
+archives and all buy dates/recovery records. The following procedure is only for
+a separately reviewed structural change; the HYPE steps remain historical.
+
+Only reviewed current code may write production history. Historical recovery
+branches and old bootstrap scripts may lack today's shared history-writer lock:
+do not run them concurrently with current writers or replay them against current
+production. Use the current `main` history workflow after deliberate review;
+this release does not update historical branches or authorize their execution.
 
 For a permanent pair change:
 
@@ -305,7 +364,8 @@ For a permanent pair change:
    GBP-equivalent market minimum. A non-GBP route also requires a reviewed,
    explicit funding path; `ETH/GBP` is direct and has no funding leg.
 5. Confirm the market has at least 170 completed daily candles, 20 completed
-   weekly candles, and seven complete days of 15-minute data.
+   weekly candles, and verified 65-day 15-minute coverage supporting all seven
+   timing windows through 60 complete Bangkok days.
 6. Have a maintainer prepare a staged compatibility/migration pull request that
    changes the canonical list, validation, workflow, audit, documentation, and
    test matrix. The release must also provide a guarded one-time migration for
@@ -330,8 +390,10 @@ For a permanent pair change:
     for verified ETH/GBP history coverage. Do not reuse HYPE partitions for ETH.
 11. Regenerate complete analysis with `!dca analyze all`, then run the Portfolio
     Balance Check and verify the new market set.
-12. Enable only the desired pairs with Discord exact confirmation.
-13. Restore `DCA_CRON_ENABLED=true` in Railway and verify `!dca health`.
+12. Only with separate live-activation approval, enable desired pairs with
+    Discord exact confirmation and then run fresh analysis again.
+13. Only after approved shadow/release checks pass, align both trading modes,
+    restore `DCA_CRON_ENABLED=true` in Railway, and verify `!dca health`.
 
 Primary code locations:
 
@@ -366,8 +428,9 @@ These changes require a tested pull request and cannot be made through Discord:
   only for legacy/historical recovery compatibility and is not an active route.
 
 `DCA_CRON_ENABLED` is a Railway runtime variable, not a GitHub repository
-variable. Keep it `true` for normal operation. Setting it to `false` pauses new
-Railway scheduler dispatches and is intended for controlled maintenance.
+variable. This release keeps it `false`. Setting it to `false` pauses new
+Railway scheduler dispatches but does not turn off GitHub schedules. Keep both
+environments in shadow and every target disabled for the paused release.
 `TIMEZONE=Asia/Bangkok` must match in both GitHub repository variables and the
 Railway service environment.
 
@@ -389,7 +452,8 @@ start-day analysis. Check the start date and the Crypto Analysis workflow.
 
 ### Other health postures
 
-- `ACTIVE`: enabled targets have fresh decisions and scheduling is running.
+- `ACTIVE`: an operational health summary, not authorization to buy; read the
+  separate modes and per-target order blockers.
 - `READY-BUT-DISABLED`: decisions are ready, but no target can submit a new
   order.
 - `NOT READY`: configuration or state validation failed and trading is blocked.
@@ -521,8 +585,10 @@ portfolio ledger or receipts from a Gist.
    indicate Kraken quantity drift, missing `USDGBP` reporting data, a non-GBP
    custody account, or `portfolio/details` returning `hasError`.
 4. Sign out of Ghostfolio, sign in with the current `Key.txt`, and reload
-   `/en/home/holdings`. The expected active DCA rows are Bitcoin, Ethereum, and
-   Solana. Historical Hyperliquid activity can remain for the fixed 7 August
+   `/en/home/holdings`. The reporting adapter supports Bitcoin, Ethereum, Solana,
+   and Dogecoin; only actually held assets with configured local mappings are
+   expected. This bot release does not redeploy the separate Ghostfolio app.
+   Historical Hyperliquid activity can remain for the fixed 7 August
    recovery record. Do not create another local user or copy activities between
    user IDs.
 

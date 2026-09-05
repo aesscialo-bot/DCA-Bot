@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import dca_config
+from tests.history_fixtures import ready_history
 
 
 NOW = datetime(2026, 8, 5, 21, 0, tzinfo=timezone.utc)
@@ -122,7 +123,7 @@ def ready_state(rules=None):
             "RULES_HASH": dca_config.rules_hash(target, rules[target]),
             "POLICY_VERSION": dca_config.TIMING_POLICY_VERSION,
             "ANALYSIS_DATE": "2026-08-06",
-            "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
+            "HISTORY": ready_history(target, "2026-08-05T21:00:00Z"),
             "SIGNALS": ready_signals(),
             "TIMING": {
                 "ANALYZED_AT": "2026-08-05T21:00:00Z",

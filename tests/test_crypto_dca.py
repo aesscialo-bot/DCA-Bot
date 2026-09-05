@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import crypto_dca
 import dca_config
 import gist_logger
+from tests.history_fixtures import ready_history
 from dca_config import (
     amount_tier_for_regime,
     default_rules_map,
@@ -116,7 +117,7 @@ def ready_decision(target, rule, *, now=NOW, regime="UPTREND", offset=0):
         "POLICY_VERSION": dca_config.TIMING_POLICY_VERSION,
         "ANALYSIS_DATE": now.astimezone(crypto_dca.SELECTED_TZ).date().isoformat(),
         "CATCHUP_APPLIED": False,
-        "HISTORY": {"STATUS": "READY", "HASH": "a" * 64},
+        "HISTORY": ready_history(target, analyzed_at),
         "SIGNALS": ready_signals(regime, analyzed_at),
         "TIMING": {
             "ANALYZED_AT": analyzed_at.isoformat().replace("+00:00", "Z")

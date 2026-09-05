@@ -11,8 +11,9 @@ service. It tracks and buys exactly these markets:
 - `BTC/GBP`
 - `ETH/GBP`
 - `SOL/GBP`
+- `DOGE/GBP`
 
-Budgets remain denominated in GBP. BTC, ETH, and SOL spend GBP directly on their
+Budgets remain denominated in GBP. BTC, ETH, SOL, and DOGE spend GBP directly on their
 Kraken GBP markets; no active target has a funding leg. There is no THB or
 Bitkub trading path.
 
@@ -24,10 +25,11 @@ audit and event artifacts are confirmed. Ghostfolio is a reporting-only local
 mirror and can never affect analysis, budgets, scheduling, or Kraken execution.
 
 > [!WARNING]
-> Recovery defaults to `DCA_TRADING_MODE=shadow`. Production scheduling remains
-> paused until the 65-day Kraken bootstrap reports verified `READY` coverage for
-> all four pairs and a full shadow cycle passes. The missed 7 August purchase
-> is intentionally not replayed.
+> This release is **deployed and paused**, not buying live: all four targets
+> remain disabled, GitHub and Railway both use `DCA_TRADING_MODE=shadow`, and
+> Railway uses `DCA_CRON_ENABLED=false`. Analysis continues independently.
+> Successful review or deployment does not authorize live activation or DOGE
+> budgets. No missed purchase is replayed.
 
 ## Production configuration
 
@@ -37,21 +39,22 @@ date, the trader fails closed without creating a Kraken order. Check live
 operation with `show status` and `!dca health` rather than treating this static
 baseline as current runtime state.
 
-The approved counter-cyclical budgets are explicit for every regime:
+The release preserves approved BTC/ETH/SOL budgets and unconfigured DOGE budgets,
+with every target disabled:
 
 ```json
 {
   "BTC_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 20},
-    "BUY_ENABLED": true
+    "BUY_ENABLED": false
   },
   "ETH_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
-    "BUY_ENABLED": true
+    "BUY_ENABLED": false
   },
   "SOL_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 5, "MID": 10, "UP": 15},
-    "BUY_ENABLED": true
+    "BUY_ENABLED": false
   },
   "DOGE_GBP": {
     "REGIME_AMOUNTS_GBP": {"LOW": 0, "MID": 0, "UP": 0},
@@ -65,10 +68,13 @@ downtrend budgets respectively. `UP` does not mean "use this in an uptrend."
 The counter-cyclical policy is:
 
 - `DOWNTREND` → higher amount: BTC £20, ETH £15, SOL £15; £50 aggregate.
-- `SIDEWAYS` → explicit middle amount: £10 each; £30 aggregate.
-- `UPTREND` → lower amount: £5 each; £15 aggregate.
+- `SIDEWAYS` → explicit middle amount: BTC/ETH/SOL £10 each; £30 aggregate.
+- `UPTREND` → lower amount: BTC/ETH/SOL £5 each; £15 aggregate.
 
-Each enabled asset can buy at most once per Bangkok calendar day.
+Those aggregate amounts assume BTC/ETH/SOL are enabled; this paused release has
+£0 new-order exposure. DOGE remains £0/£0/£0 until separately approved and cannot
+be enabled with placeholder budgets. Each enabled asset can buy at most once
+per Bangkok calendar day.
 
 ## Automated daily flow
 
@@ -79,11 +85,11 @@ flowchart TD
     C --> D["Select GBP budget and best 15-minute execution time"]
     D --> E["Write fresh DCA_ANALYSIS_STATE"]
     E --> F["Railway scheduler watches absolute execution times"]
-    F --> G{"All 3 histories READY and decision due?"}
+    F --> G{"All 4 histories READY and decision due?"}
     G -- "No" --> H["Skip safely"]
     G -- "Yes" --> I["Revalidate live rules, decision, minimum, and daily state"]
     I --> J["Save durable pending intent"]
-    J --> L["Buy directly on BTC/GBP, ETH/GBP, or SOL/GBP"]
+    J --> L["Buy directly on BTC/GBP, ETH/GBP, SOL/GBP, or DOGE/GBP"]
     L --> T["Require confirmed crypto fill"]
     T --> O["Atomically save buy date and Portfolio Compass outbox row"]
     O --> P["Deliver audit + event to private repository with SHA retries"]
@@ -154,7 +160,7 @@ compatibility and is normalized with its former half-up midpoint.
 
 The execution-time engine deterministically evaluates 3-, 5-, 7-, 14-, 30-,
 45-, and 60-day Bangkok-day windows at 15-minute resolution for the actual
-Kraken routes: BTC/GBP, ETH/GBP, and SOL/GBP. It minimizes median closing
+Kraken routes: BTC/GBP, ETH/GBP, SOL/GBP, and DOGE/GBP. It minimizes median closing
 price miss from each day's absolute low, measures wins within 0.5%, applies the
 locked 14-day override and 30-versus-60 thresholds, and resolves close candidates
 using Top-5 appearances across all seven windows, 60-day win rate, then earlier
@@ -166,14 +172,14 @@ History is built exclusively from Kraken's first-party PostTrade API into
 append-only monthly Gist partitions. The resumable bootstrap checkpoints every
 page, globally rate-limits requests, records explicit no-trade gaps and partition
 hashes, and verifies the overlapping recent 7.5 days against Kraken OHLC. No new
-order is permitted unless BTC/GBP, ETH/GBP, and SOL/GBP all have current,
+order is permitted unless BTC/GBP, ETH/GBP, SOL/GBP, and DOGE/GBP all have current,
 verified history and decisions.
 
-PostTrade pagination uses Kraken's exclusive `from_ts` cursor without subtracting
-time. Boundary trade IDs are deduplicated after nanosecond timestamps are
-normalized to Python microseconds; trades older than the active cursor are
-discarded. This prevents page-boundary executions being counted twice and is
-required for the OHLC overlap check to pass.
+PostTrade pagination preserves Kraken's exact nanosecond cursor and deduplicates
+boundary trade IDs. Coverage requires valid ordered pages, consistent counts,
+forward progress, and a verified empty terminal page. Partial ingestion, a
+stalled cursor, malformed data, or changed partition hashes cannot be interpreted
+as a quiet market or silently skipped.
 
 If analysis finishes after its selected time, the explicit legacy catch-up time
 is 05:00 Bangkok and is usable only through 06:00. Normal selections retain the
@@ -221,9 +227,23 @@ uptrend-confirmation count, override metadata, and whether that specific
 analysis run performed an automatic release.
 
 The private Kraken history preserves genuine no-trade intervals as gaps. For
-timing analysis only, internal gaps are represented as unchanged OHLC with zero
-volume and the last real close. Leading and trailing gaps are never filled, so
-the normal real-candle freshness check still fails closed on stale markets.
+timing analysis only, verified no-trade intervals after the first real candle
+are represented as unchanged OHLC with zero volume and the last real close,
+including the quiet tail through the verified cutoff. Leading history and
+unverified ingestion gaps are never invented.
+
+Version-2 history evidence binds `COVERAGE_THROUGH` (`THROUGH` remains its alias),
+`LAST_REAL_CANDLE_AT`, `VERIFIED_AT`, counts, overlap verification, and partition
+hashes. `LAST_REAL_CANDLE_AT` is the start of the last traded candle, not an exact
+trade timestamp. The 45-minute freshness limit applies to proven coverage at
+analysis creation, independently of how long a market has been quiet. The
+version-4 timing policy invalidates older decisions; run fresh four-target
+analysis after deployment. Existing verified history partitions are retained.
+
+Carried historical prices are analysis evidence only. Order validation and
+minimum checks require a fresh executable Kraken quote in the direct GBP market;
+a missing, stale, invalid, or non-executable quote blocks new orders. The daily
+and weekly history requirements and all-four readiness gate are unchanged.
 
 `DCA_EXECUTION_STATE` stores `LAST_BUY_DATE`, durable `PENDING_ORDER` state, and
 FIFO `PENDING_GIST_DELIVERIES`. Completion atomically moves confirmed fill
@@ -277,9 +297,10 @@ is only an additional reviewed constraint from crypto order ID to funding
 order ID; it cannot make otherwise incomplete evidence complete.
 
 `DCA_CRON_ENABLED` is a Railway runtime variable, not a GitHub repository
-variable. It must be `true` for normal scheduling and should be set to `false`
-only during controlled maintenance. See the [operating guide](00_START_HERE.md) for
-the direct Railway variables link and the safe pause/resume procedure.
+variable. This release keeps it `false`. GitHub's independently scheduled
+analysis and DCA workflows still run; repository `shadow` and disabled rules
+block new orders. See the [operating guide](00_START_HERE.md) for the direct
+Railway variables link and the separately authorized activation procedure.
 
 Required Railway runtime variables:
 
@@ -289,10 +310,15 @@ Required Railway runtime variables:
 - `GITHUB_WORKFLOW_REF` (`main`)
 - `DISCORD_CHANNEL_ID`
 - `DISCORD_ALLOWED_USERS`
-- `DCA_CRON_ENABLED` (`true` for normal operation)
+- `DCA_CRON_ENABLED` (`false` for this paused release)
 - `TIMEZONE` (`Asia/Bangkok`, matching the GitHub repository variable)
 - `DCA_TRADING_MODE` (must match the repository variable)
 - `DCA_CANARY_SYMBOL` (`SOL_GBP`)
+
+A missing or empty `DISCORD_ALLOWED_USERS` fails closed: the controller does not
+allow private status/portfolio reads, report dispatches, or configuration
+commands. Replies suppress mentions and escape untrusted text. Restore the
+allowlist deliberately; never widen access to make a health check pass.
 
 The Railway controller's receipt-aware health check is compiled to the exact
 private repository, branch, event path, and event-receipt path used by this
@@ -372,9 +398,30 @@ help
 ```
 
 Budget changes require the target to be disabled. Enabling requires exact
-confirmation and displays the lower, sideways, and higher amounts, the latest
-regime, effective amount, next execution time, decision age, and aggregate
-maximum daily exposure. `show status` also displays a prominent per-target
+confirmation and displays the lower, sideways, and higher amounts, aggregate
+maximum daily exposure, and requirement for successful analysis after enabling.
+Use `show status` separately for the last analysis and timing; the enable review
+does not authorize those old decisions. Confirmation expires after five minutes and binds the
+reviewed target budgets and global rules, not a mandatory fresh decision ID.
+The workflow's `expected_decision_id` input remains compatibility-only.
+Valid stale or ERROR decisions do not prevent saving an otherwise valid enable
+setting. Before the rules write, the configuration workflow invalidates only the
+selected target's prior decision and verifies that readback under both the rules
+and analysis writer locks. Buying must wait for the next successful analysis,
+even after disable/re-enable in the same execution window. Missing, malformed,
+or obsolete analysis state blocks enable until `!dca analyze all` repairs it;
+other decisions and all execution records are preserved.
+
+Dispatch acknowledgement means **queued**, not applied. The configuration workflow
+reports **APPLIED** only after reading back and matching the complete intended
+rules. Its sanitized Discord receipt links to the exact run. Failed or ambiguous
+writes require a status check before retrying; failed receipt delivery is visible
+in Actions and never automatically repeats the configuration operation.
+
+`show status` separates connection, configured enablement, analysis readiness,
+GitHub order-authority mode, Railway mode, scheduler state, and buying blockers.
+Mismatched or unavailable modes never appear buying-ready. Long status and health
+responses are split without dropping warnings. `show status` also displays a prominent per-target
 warning, normal rule result, confirmation count, activation time, and reason
 whenever an emergency uptrend override is active.
 
@@ -393,10 +440,16 @@ or submit an order; use `help` for the exact safety-critical command.
 | `daily_dca.yml` | Minutes 02/17/32/47 plus Railway | Revalidate the global history gate and execute due direct GBP purchases exactly once. |
 | `portfolio_check.yml` | Monthly or manual | Read-only active holdings plus retained historical HYPE, valued in GBP; USD values and cash use live Kraken GBP/USD. |
 | `migrate_hype_to_eth.yml` | Manual on `main` | Audit Kraken, replace HYPE/USD with disabled ETH/GBP, reset active analysis, and archive retired HYPE rule/analysis/execution state. |
-| `update_dca_config.yml` | Manual/Discord dispatch | Serialize atomic GBP budget and enable-state updates. |
+| `update_dca_config.yml` | Manual/Discord dispatch | Serialize guarded GBP budget/enable updates, verify rules readback, and publish sanitized completion receipts. |
 | `ci.yml` | Pull request and `main` | Compile, test, validate workflows, and build the Railway image. |
 
 ## Structural migration or recovery verification
+
+This review-and-polish release requires no target-membership migration. The
+four-target DOGE migration is already complete; do not rerun it or the historical
+HYPE migration. Preserve migration archives, execution records, and buy dates.
+The procedures below apply only to a separately reviewed structural change or
+the fixed historical recovery they describe.
 
 Do not reuse a historical start date, clear execution state, or delete a target
 key as a shortcut. A structural migration or recovery must begin with every
@@ -626,8 +679,10 @@ retained under the user-only `%LOCALAPPDATA%\dca-ghostfolio\retired-keys`
 directory. This prevents the desktop login from opening an empty second user
 while the sync service updates the populated portfolio.
 
-Ghostfolio 3.43.0 imports the active BTC, ETH, and SOL targets through
-CoinGecko. Its local CoinGecko importer rejects Hyperliquid despite returning
+The reporting adapter supports BTC, ETH, SOL, and DOGE through CoinGecko.
+Updating this bot does not deploy or reconfigure the separate local Ghostfolio
+installation; its asset/account mappings must already cover any holding it
+mirrors. Its local CoinGecko importer rejects Hyperliquid despite returning
 it in lookup results, so the retained historical HYPE recovery remains bound
 explicitly to Ghostfolio's supported Yahoo profile `HYPE32196USD`.
 

@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Mapping
 
 from dca_config import (
     ALLOWED_TARGETS,
     ConfigError,
+    empty_analysis_state,
     global_rules_hash,
     rules_hash,
     validate_enabled_market_minimums,
+    validate_analysis_state,
     validate_execution_state,
     validate_rules_map,
 )
@@ -23,6 +27,39 @@ def global_rules_pre_state_hash(current_rules) -> str:
     """Compatibility name for the shared global rules fingerprint."""
 
     return global_rules_hash(current_rules)
+
+
+def prepare_enable_analysis_invalidation(
+    updated_rules, analysis_state, *, symbol: str, now: datetime | None = None
+) -> dict:
+    """Invalidate only the enabled target, retaining every unrelated decision.
+
+    The workflow holds both rule-writer and analysis-writer locks and persists
+    this document BEFORE enabling rules. A failed enable therefore only blocks
+    analysis; it can never revive a formerly enabled same-day decision.
+    """
+
+    rules = validate_rules_map(updated_rules)
+    if symbol not in ALLOWED_TARGETS or rules[symbol]["BUY_ENABLED"] is not True:
+        raise ConfigError("Analysis invalidation requires a valid enabled target")
+    try:
+        state = validate_analysis_state(analysis_state)
+    except Exception:
+        raise ConfigError(
+            "Cannot safely invalidate analysis; run !dca analyze all before enabling"
+        ) from None
+    reason = "Enable request invalidated the prior decision; successful analysis is required"
+    replacement = empty_analysis_state(rules, now=now, reason=reason)["TARGETS"][symbol]
+    replacement["ANALYSIS_STATUS"] = "ERROR"
+    replacement["HISTORY"] = {"STATUS": "ERROR"}
+    # Other targets keep their original envelope date, including at midnight.
+    replacement["ANALYSIS_DATE"] = state["ANALYSIS_DATE"]
+    # An invalidation is not an override release. Preserve visible audit fields.
+    replacement["SIGNALS"] = {
+        **copy.deepcopy(state["TARGETS"][symbol]["SIGNALS"]), "ERROR": reason
+    }
+    state["TARGETS"][symbol] = replacement
+    return validate_analysis_state(state)
 
 
 def _json_number(value: str, label: str) -> int | float:
@@ -139,7 +176,9 @@ def apply_change(
     if market_minimum_provider is None:
         raise ConfigError("A fresh Kraken market-minimum check is required")
     minimum = _minimum_value(market_minimum_provider, symbol)
-    return validate_enabled_market_minimums(candidate, {symbol: minimum}), True
+    updated = validate_enabled_market_minimums(candidate, {symbol: minimum})
+    prepare_enable_analysis_invalidation(updated, analysis_state, symbol=symbol, now=now)
+    return updated, True
 
 
 def main(argv=None) -> int:
@@ -154,6 +193,7 @@ def main(argv=None) -> int:
     parser.add_argument("--expected-decision-id", default="")
     parser.add_argument("--expected-global-rules-hash", default="")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--analysis-output", default="")
     args = parser.parse_args(argv)
 
     rules = os.environ.get("DCA_TARGET_MAP", "")
@@ -182,6 +222,13 @@ def main(argv=None) -> int:
         expected_global_rules_hash=args.expected_global_rules_hash,
         market_minimum_provider=minimum_provider,
     )
+    if args.action == "set_enabled" and args.enabled_json == "true":
+        if not args.analysis_output:
+            raise ConfigError("Enable requires a separate pre-write analysis invalidation output")
+        invalidated = prepare_enable_analysis_invalidation(updated, state, symbol=args.symbol)
+        Path(args.analysis_output).write_text(
+            json.dumps(invalidated, separators=(",", ":")), encoding="utf-8"
+        )
     Path(args.output).write_text(
         json.dumps(updated, separators=(",", ":")), encoding="utf-8"
     )

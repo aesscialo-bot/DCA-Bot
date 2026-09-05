@@ -17,6 +17,7 @@ permissions:
 
 concurrency:
   group: dca-analysis-state-writers
+  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -24,6 +25,12 @@ jobs:
     name: Build deterministic decisions
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    concurrency:
+      # Analysis holds its state lock first, then shares the history lock with
+      # manual bootstrap so neither writer can overwrite the other's Gist data.
+      group: dca-kraken-history-writer
+      queue: max
+      cancel-in-progress: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7.0.1

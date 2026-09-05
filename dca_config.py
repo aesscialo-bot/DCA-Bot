@@ -34,8 +34,16 @@ RULE_FIELDS = frozenset({"REGIME_AMOUNTS_GBP", "BUY_ENABLED"})
 REGIME_AMOUNT_FIELDS = frozenset({"LOW", "MID", "UP"})
 LEGACY_REGIME_AMOUNT_FIELDS = frozenset({"LOW", "UP"})
 TIMING_POLICY_VERSION = (
-    "sma150-3-close-responsive-v2+multi-window-3-5-7-14-30-45-60-v3"
+    "sma150-3-close-responsive-v2+multi-window-3-5-7-14-30-45-60-v4"
 )
+HISTORY_SUMMARY_VERSION = 2
+HISTORY_COVERAGE_MAX_AGE = timedelta(minutes=45)
+HISTORY_SUMMARY_FIELDS = frozenset({
+    "VERSION", "STATUS", "PAIR", "FROM", "THROUGH", "COVERAGE_THROUGH",
+    "VERIFIED_AT", "LAST_REAL_CANDLE_AT", "CANDLE_COUNT", "NO_TRADE_INTERVALS",
+    "ANALYSIS_CANDLE_COUNT", "CARRIED_NO_TRADE_INTERVALS", "OVERLAP",
+    "PARTITIONS_HASH", "HASH",
+})
 UPTREND_OVERRIDE_STATE_VERSION = 1
 UPTREND_OVERRIDE_STATE_FIELDS = frozenset({"VERSION", "TARGETS"})
 UPTREND_OVERRIDE_ENTRY_FIELDS = frozenset(
@@ -1213,6 +1221,76 @@ def _validate_ready_analysis_signals(
             )
 
 
+def history_summary_hash(history: Mapping[str, Any]) -> str:
+    """Bind coverage evidence and raw partition hashes to the timing decision."""
+    payload = {key: value for key, value in history.items() if key != "HASH"}
+    return sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")).hexdigest()
+
+
+def validate_history_summary(
+    target: str, value: Mapping[str, Any], *, analyzed_at: datetime
+) -> dict[str, Any]:
+    """Validate source coverage, not the age of a thin market's last trade.
+
+    Freshness is relative to analysis creation. A daily decision remains usable
+    in its own execution window; order submission separately requires a current
+    executable quote and never uses these historical prices.
+    """
+    label = f"{target}.HISTORY"
+    if not isinstance(value, Mapping):
+        raise ConfigError(f"{label} must be an object")
+    history = dict(value)
+    _unexpected_fields(history, HISTORY_SUMMARY_FIELDS, label)
+    if type(history["VERSION"]) is not int or history["VERSION"] != HISTORY_SUMMARY_VERSION:
+        raise ConfigError(f"{label}.VERSION must be {HISTORY_SUMMARY_VERSION}")
+    if history["STATUS"] != READY_STATUS or history["PAIR"] != TARGET_SYMBOLS[target]:
+        raise ConfigError(f"{label} must be READY for the exact Kraken GBP pair")
+    for field in ("HASH", "PARTITIONS_HASH"):
+        if not isinstance(history[field], str) or not re.fullmatch(r"[0-9a-f]{64}", history[field]):
+            raise ConfigError(f"{label}.{field} must be a lowercase SHA-256 hash")
+    if history["HASH"] != history_summary_hash(history):
+        raise ConfigError(f"{label}.HASH does not match its coverage evidence")
+    times = {}
+    for field in ("FROM", "THROUGH", "COVERAGE_THROUGH", "VERIFIED_AT", "LAST_REAL_CANDLE_AT"):
+        times[field] = parse_iso_datetime(history[field], f"{label}.{field}")
+        if history[field] != times[field].isoformat().replace("+00:00", "Z"):
+            raise ConfigError(f"{label}.{field} must be a canonical UTC timestamp")
+    start, cutoff, real = times["FROM"], times["COVERAGE_THROUGH"], times["LAST_REAL_CANDLE_AT"]
+    for field in ("FROM", "COVERAGE_THROUGH", "LAST_REAL_CANDLE_AT"):
+        if times[field].timestamp() % 900:
+            raise ConfigError(f"{label}.{field} must align to 15 minutes")
+    if times["THROUGH"] != cutoff or cutoff - start < timedelta(days=60):
+        raise ConfigError(f"{label} requires at least 60 days of matching coverage")
+    if not start <= real < cutoff:
+        raise ConfigError(f"{label}.LAST_REAL_CANDLE_AT is outside verified coverage")
+    if not cutoff <= times["VERIFIED_AT"] <= analyzed_at:
+        raise ConfigError(f"{label} coverage verification is from the future")
+    if analyzed_at - cutoff > HISTORY_COVERAGE_MAX_AGE:
+        raise ConfigError(f"{label} coverage is stale (over 45 minutes at analysis)")
+    for field in ("CANDLE_COUNT", "NO_TRADE_INTERVALS", "ANALYSIS_CANDLE_COUNT", "CARRIED_NO_TRADE_INTERVALS"):
+        if type(history[field]) is not int or history[field] < 0:
+            raise ConfigError(f"{label}.{field} must be a non-negative integer")
+    expected = int((cutoff - start).total_seconds() // 900)
+    if (history["CANDLE_COUNT"] < 96
+        or history["CANDLE_COUNT"] + history["NO_TRADE_INTERVALS"] != expected
+        or not history["CANDLE_COUNT"] <= history["ANALYSIS_CANDLE_COUNT"] <= expected
+        or history["CARRIED_NO_TRADE_INTERVALS"] != history["ANALYSIS_CANDLE_COUNT"] - history["CANDLE_COUNT"]):
+        raise ConfigError(f"{label} candle and no-trade counts are inconsistent")
+    overlap = history["OVERLAP"]
+    if not isinstance(overlap, Mapping) or set(overlap) != {"STATUS", "CANDLES", "FROM", "THROUGH"}:
+        raise ConfigError(f"{label}.OVERLAP must contain verified candle evidence")
+    if (overlap["STATUS"] != "VERIFIED" or type(overlap["CANDLES"]) is not int
+        or not 96 <= overlap["CANDLES"] <= history["CANDLE_COUNT"]):
+        raise ConfigError(f"{label}.OVERLAP requires at least 96 verified real candles")
+    overlap_start = parse_iso_datetime(overlap["FROM"], f"{label}.OVERLAP.FROM")
+    overlap_end = parse_iso_datetime(overlap["THROUGH"], f"{label}.OVERLAP.THROUGH")
+    if not start <= overlap_start <= overlap_end <= real:
+        raise ConfigError(f"{label}.OVERLAP lies outside real source coverage")
+    return history
+
+
 def validate_analysis_decision(target: str, value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate one deterministic per-target v3 analysis result."""
 
@@ -1277,12 +1355,7 @@ def validate_analysis_decision(target: str, value: Mapping[str, Any]) -> dict[st
             raise ConfigError(f"{label}.CATCHUP_APPLIED requires an already-missed selected time")
         if not decision["CATCHUP_APPLIED"] and execute_at != selected_at:
             raise ConfigError(f"{label}.EXECUTE_AT must match SELECTED_AT without catch-up")
-        history = dict(decision["HISTORY"])
-        if history.get("STATUS") != "READY":
-            raise ConfigError(f"{label}.HISTORY must be READY")
-        history_hash = history.get("HASH")
-        if not isinstance(history_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", history_hash):
-            raise ConfigError(f"{label}.HISTORY.HASH must be a lowercase SHA-256 hash")
+        validate_history_summary(target, decision["HISTORY"], analyzed_at=analyzed_at)
         if decision["ERROR"] is not None:
             raise ConfigError(f"{label}.ERROR must be null for READY analysis")
         _validate_ready_analysis_signals(decision, analyzed_at, label)

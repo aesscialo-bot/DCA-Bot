@@ -14,15 +14,20 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
+import math
 import os
+import re
 import time
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlparse
 
 import requests
 
+from dca_config import ConfigError, history_summary_hash, validate_history_summary
+
 
 HISTORY_VERSION = 1
+SCAN_VERSION = 2
 INTERVAL_MINUTES = 15
 INTERVAL_SECONDS = INTERVAL_MINUTES * 60
 BOOTSTRAP_DAYS = 65
@@ -65,6 +70,67 @@ def _parse_iso(value: Any, label: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise HistoryError(f"{label} must include a timezone")
     return parsed.astimezone(timezone.utc)
+
+
+def _timestamp_ns(value: Any, label: str) -> int:
+    """Compare Kraken cursors without dropping their nanosecond precision."""
+    if not isinstance(value, str):
+        raise HistoryError(f"{label} must be a UTC timestamp")
+    match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z", value)
+    if match is None:
+        raise HistoryError(f"{label} must be a canonical UTC timestamp")
+    seconds = int(_parse_iso(match[1] + "Z", label).timestamp())
+    return seconds * 1_000_000_000 + int((match[2] or "").ljust(9, "0"))
+
+
+def _just_before(value: datetime) -> str:
+    """The nanosecond before a whole-second candle boundary."""
+    return (value - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S") + ".999999999Z"
+
+
+def _next_nanosecond(value: str) -> str:
+    seconds, nanos = divmod(_timestamp_ns(value, "history cursor") + 1, 1_000_000_000)
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + f".{nanos:09d}Z"
+
+
+def _validate_post_trade_page(
+    result: Any, pair: str, from_ts: str, to_ts: str
+) -> dict[str, Any]:
+    if not isinstance(result, Mapping):
+        raise HistoryError("Kraken PostTrade response has no result")
+    trades = result.get("trades")
+    count = result.get("count")
+    if not isinstance(trades, list):
+        raise HistoryError("Kraken PostTrade trades must be an explicit array")
+    if type(count) is not int or count != len(trades) or not 0 <= count <= MAX_PAGE_SIZE:
+        raise HistoryError("Kraken PostTrade count does not match the complete page")
+    cursor = result.get("last_ts")
+    if not trades:
+        if cursor != "":
+            raise HistoryError("Kraken empty PostTrade page must have an empty last_ts")
+        return {"trades": [], "last_ts": "", "count": 0}
+    lower = _timestamp_ns(from_ts, "PostTrade from_ts")
+    upper = _timestamp_ns(to_ts, "PostTrade to_ts")
+    previous = lower
+    identifiers = set()
+    for trade in trades:
+        if not isinstance(trade, Mapping):
+            raise HistoryError("Kraken PostTrade trade must be an object")
+        identifier = trade.get("trade_id")
+        if not isinstance(identifier, str) or not identifier.strip() or identifier in identifiers:
+            raise HistoryError("Kraken PostTrade trade_id is missing or duplicated")
+        identifiers.add(identifier)
+        timestamp = _timestamp_ns(trade.get("trade_ts"), "Kraken trade_ts")
+        if timestamp < lower or timestamp < previous or timestamp > upper:
+            raise HistoryError("Kraken PostTrade timestamps are out of order or request range")
+        previous = timestamp
+        if trade.get("symbol") != pair:
+            raise HistoryError("Kraken PostTrade returned a different currency pair")
+        _decimal(trade.get("price"), "Kraken trade price")
+        _decimal(trade.get("quantity"), "Kraken trade quantity")
+    if _timestamp_ns(cursor, "PostTrade last_ts") != previous:
+        raise HistoryError("Kraken PostTrade last_ts does not match its last trade")
+    return {"trades": list(trades), "last_ts": cursor, "count": count}
 
 
 def _completed_cutoff(now: datetime) -> datetime:
@@ -213,8 +279,8 @@ class KrakenPublicHistoryClient:
                 payload = response.json()
                 if not isinstance(payload, dict):
                     raise HistoryError("Kraken returned a non-object response")
-                errors = payload.get("error", [])
-                if errors:
+                errors = payload.get("error")
+                if not isinstance(errors, list) or errors:
                     raise HistoryError("Kraken returned a market-data error")
                 return payload
             except (requests.RequestException, ValueError, HistoryError) as exc:
@@ -227,27 +293,22 @@ class KrakenPublicHistoryClient:
         ) from last_error
 
     def post_trade_page(
-        self, pair: str, *, from_ts: datetime, to_ts: datetime
+        self, pair: str, *, from_ts: datetime | str, to_ts: datetime | str
     ) -> dict[str, Any]:
         payload = self._get(
             POST_TRADE_URL,
             {
                 "symbol": pair,
-                "from_ts": _iso(from_ts),
-                "to_ts": _iso(to_ts),
+                "from_ts": from_ts if isinstance(from_ts, str) else _iso(from_ts),
+                "to_ts": to_ts if isinstance(to_ts, str) else _iso(to_ts),
                 "count": MAX_PAGE_SIZE,
             },
         )
-        result = payload.get("result")
-        if not isinstance(result, Mapping):
-            raise HistoryError("Kraken PostTrade response has no result")
-        trades = result.get("trades", [])
-        if not isinstance(trades, list):
-            raise HistoryError("Kraken PostTrade trades must be an array")
-        last_ts = result.get("last_ts")
-        if trades and not isinstance(last_ts, str):
-            raise HistoryError("Kraken PostTrade page is missing last_ts")
-        return {"trades": trades, "last_ts": last_ts, "count": len(trades)}
+        return _validate_post_trade_page(
+            payload.get("result"), pair,
+            from_ts if isinstance(from_ts, str) else _iso(from_ts),
+            to_ts if isinstance(to_ts, str) else _iso(to_ts),
+        )
 
     def ohlc(self, pair: str) -> list[list[Any]]:
         payload = self._get(OHLC_URL, {"pair": pair, "interval": INTERVAL_MINUTES})
@@ -360,10 +421,10 @@ def _analysis_rows(
     """Return exact-cadence analysis rows without inventing market trades.
 
     Kraken PostTrade correctly omits intervals in which a thin market had no
-    executions.  For price-series analysis, an internal no-trade interval has
-    unchanged OHLC, zero volume, and the last observed close.  Leading and
-    trailing gaps remain absent so freshness checks still bind analysis to a
-    recent real Kraken candle.
+    executions. Call only after validating complete PostTrade source coverage.
+    Proven no-trade intervals have unchanged OHLC and zero volume through that
+    exclusive cutoff. Leading gaps remain absent; no price precedes a real trade.
+    These rows are analysis-only and must never price or size an order.
     """
 
     lower = int(query_from.timestamp())
@@ -376,11 +437,10 @@ def _analysis_rows(
     if not selected:
         return [], 0
     first = min(selected)
-    last = max(selected)
     rows: list[list[float]] = []
     previous_close: float | None = None
     carried = 0
-    for epoch in range(first, last + INTERVAL_SECONDS, INTERVAL_SECONDS):
+    for epoch in range(first, upper, INTERVAL_SECONDS):
         row = selected.get(epoch)
         if row is None:
             if previous_close is None:  # Defensive; ``first`` is a real candle.
@@ -397,6 +457,8 @@ def _analysis_rows(
             float(row["close"]),
             float(row["volume"]),
         ]
+        if not all(math.isfinite(value) and value > 0 for value in values):
+            raise HistoryError("real history contains unrepresentable analysis prices or volume")
         rows.append([epoch * 1000, *values])
         previous_close = values[3]
     return rows, carried
@@ -424,14 +486,19 @@ def _load_candles(
                 raise HistoryError(f"history partition row is invalid: {filename}")
             timestamp = _parse_iso(row.get("ts"), "history candle timestamp")
             epoch = int(timestamp.timestamp())
-            if epoch % INTERVAL_SECONDS:
+            if timestamp.timestamp() % INTERVAL_SECONDS:
                 raise HistoryError("history candle is not aligned to 15 minutes")
             if epoch in candles:
                 raise HistoryError("history contains a duplicate candle timestamp")
             for field in ("open", "high", "low", "close", "volume"):
-                _decimal(row.get(field), f"history candle {field}", allow_zero=field == "volume")
+                _decimal(row.get(field), f"history candle {field}")
             if type(row.get("trades")) is not int or row["trades"] < 1:
                 raise HistoryError("history candle trade count must be positive")
+            if row.get("traded") is not True:
+                raise HistoryError("raw history partitions may contain only real trades")
+            if not (Decimal(row["low"]) <= min(Decimal(row["open"]), Decimal(row["close"]))
+                    <= max(Decimal(row["open"]), Decimal(row["close"])) <= Decimal(row["high"])):
+                raise HistoryError("history candle OHLC range is inconsistent")
             candles[epoch] = row
     return candles
 
@@ -463,23 +530,25 @@ def _write_checkpoint(
     pair: str,
     query_from: datetime,
     cutoff: datetime,
-    last_ts: datetime,
+    last_ts: datetime | str,
     last_trade_ids: Iterable[str],
     overlap: Mapping[str, Any] | None = None,
     error: str | None = None,
+    verified_at: datetime | None = None,
 ) -> dict[str, Any]:
     partition_contents, hashes = _serialize_partitions(target, candles)
     sorted_epochs = sorted(candles)
     expected = max(0, int((cutoff - query_from).total_seconds()) // INTERVAL_SECONDS)
     gaps = _gap_summary(candles, query_from, cutoff)
     entry = {
+        "SCAN_VERSION": SCAN_VERSION,
         "STATUS": status,
         "SOURCE": "Kraken PostTrade",
         "PAIR": pair,
         "INTERVAL_MINUTES": INTERVAL_MINUTES,
         "QUERY_FROM": _iso(query_from),
         "CUTOFF": _iso(cutoff),
-        "LAST_TS": _iso(last_ts),
+        "LAST_TS": last_ts if isinstance(last_ts, str) else _iso(last_ts),
         "LAST_TRADE_IDS": sorted(set(last_trade_ids)),
         "CANDLE_START": _iso(datetime.fromtimestamp(sorted_epochs[0], tz=timezone.utc)) if sorted_epochs else None,
         "CANDLE_END": _iso(datetime.fromtimestamp(sorted_epochs[-1], tz=timezone.utc)) if sorted_epochs else None,
@@ -491,6 +560,15 @@ def _write_checkpoint(
         "OVERLAP": dict(overlap or {}),
         "ERROR": error,
     }
+    if status == "READY":
+        if verified_at is None or entry["LAST_TS"] != _iso(cutoff):
+            raise HistoryError("READY history requires completed coverage verification")
+        entry["COVERAGE_VERSION"] = 2
+        entry["COVERAGE_THROUGH"] = _iso(cutoff)
+        entry["VERIFIED_AT"] = _iso(verified_at)
+    # Partial progress is resumable only when it was produced by this stricter
+    # scanner, with its exact cursor and preserved partition hashes bound too.
+    entry["EVIDENCE_HASH"] = sha256(_canonical_json(entry).encode("utf-8")).hexdigest()
     manifest["VERSION"] = HISTORY_VERSION
     manifest["UPDATED_AT"] = _iso(_utc_now())
     manifest.setdefault("TARGETS", {})[target] = entry
@@ -559,15 +637,40 @@ def refresh_target(
     snapshot = store.snapshot()
     manifest = load_manifest(store, snapshot)
     previous = manifest.get("TARGETS", {}).get(target)
+    if previous is not None and not isinstance(previous, Mapping):
+        raise HistoryError("existing history checkpoint must be an object")
     if isinstance(previous, Mapping):
+        scan_version = previous.get("SCAN_VERSION")
+        if "SCAN_VERSION" not in previous:
+            # Preserve reviewed legacy READY prefixes, not unproven partial
+            # ingestion. Adoption is not a retrospective 65-day source rescan.
+            overlap = previous.get("OVERLAP")
+            if (previous.get("STATUS") != "READY"
+                or not isinstance(overlap, Mapping)
+                or overlap.get("STATUS") != "VERIFIED"
+                or type(overlap.get("CANDLES")) is not int
+                or overlap["CANDLES"] < MIN_OVERLAP_CANDLES
+                or previous.get("LAST_TS") != previous.get("CUTOFF")):
+                raise HistoryError("legacy history adoption requires READY, verified overlap, and a completed cutoff cursor")
+        elif type(scan_version) is not int or scan_version != SCAN_VERSION:
+            raise HistoryError("existing history has an unsupported scan version")
+        if scan_version == SCAN_VERSION or previous.get("COVERAGE_VERSION") == 2:
+            previous_evidence = {key: value for key, value in previous.items() if key != "EVIDENCE_HASH"}
+            if previous.get("EVIDENCE_HASH") != sha256(_canonical_json(previous_evidence).encode("utf-8")).hexdigest():
+                raise HistoryError("existing history coverage evidence hash mismatch")
         query_from = _parse_iso(previous.get("QUERY_FROM"), "history QUERY_FROM")
         candles = _load_candles(store, previous, snapshot)
-        last_ts = _parse_iso(previous.get("LAST_TS"), "history LAST_TS")
+        last_ts = previous.get("LAST_TS")
+        _timestamp_ns(last_ts, "history LAST_TS")
         boundary_ids = set(previous.get("LAST_TRADE_IDS") or [])
+        if previous.get("PAIR") != pair or previous.get("SOURCE") != "Kraken PostTrade":
+            raise HistoryError("existing history has a different source or pair")
+        if not _timestamp_ns(_iso(query_from), "QUERY_FROM") <= _timestamp_ns(last_ts, "LAST_TS") <= _timestamp_ns(_iso(cutoff), "CUTOFF"):
+            raise HistoryError("existing history cursor is outside the requested coverage")
     else:
         query_from = cutoff - timedelta(days=BOOTSTRAP_DAYS)
         candles = {}
-        last_ts = query_from
+        last_ts = _iso(query_from)
         boundary_ids: set[str] = set()
     required_start = cutoff - timedelta(days=BOOTSTRAP_DAYS)
     if query_from > required_start:
@@ -587,55 +690,55 @@ def refresh_target(
     )
 
     page_number = 0
-    stalled = 0
+    terminal_probe_from: str | None = None
     try:
-        while last_ts < cutoff:
-            # PostTrade defines ``from_ts`` as exclusive. Python normalizes
-            # Kraken's nanosecond cursor to microseconds, so subtracting another
-            # microsecond reintroduced already-aggregated trades at page
-            # boundaries. Reuse the normalized boundary and deduplicate every
-            # trade that maps to it by ID.
-            page_from = max(query_from, last_ts)
-            page = client.post_trade_page(pair, from_ts=page_from, to_ts=cutoff)
+        while _timestamp_ns(last_ts, "history cursor") < _timestamp_ns(_iso(cutoff), "cutoff"):
+            # Kraken documents an exclusive from_ts, but the live endpoint
+            # repeats exact-boundary trades. Preserve nanoseconds and IDs;
+            # never skip a stalled full page or an unobserved timestamp group.
+            cursor_ns = _timestamp_ns(last_ts, "history cursor")
+            cursor_epoch = cursor_ns // 1_000_000_000
+            unconsumed_boundary = (cursor_ns % (INTERVAL_SECONDS * 1_000_000_000) == 0
+                                   and cursor_epoch not in candles)
+            page_from = _just_before(_parse_iso(last_ts, "history cursor")) if unconsumed_boundary else last_ts
+            if terminal_probe_from is not None:
+                page_from = terminal_probe_from
+                terminal_probe_from = None
+            page_to = _just_before(cutoff)
+            page = _validate_post_trade_page(
+                client.post_trade_page(pair, from_ts=page_from, to_ts=page_to),
+                pair, page_from, page_to,
+            )
             trades = page["trades"]
             if not trades:
-                last_ts = cutoff
+                last_ts = _iso(cutoff)
                 break
-            page_seen: set[str] = set()
-            newest = last_ts
-            newest_ids: set[str] = set()
             new_count = 0
             for trade in trades:
-                if not isinstance(trade, Mapping):
-                    raise HistoryError("Kraken PostTrade trade must be an object")
-                trade_id = str(trade.get("trade_id", ""))
-                trade_time = _parse_iso(trade.get("trade_ts"), "Kraken trade_ts")
-                if trade_time < last_ts:
+                trade_ns = _timestamp_ns(trade["trade_ts"], "trade_ts")
+                # The one-nanosecond overlap before a completed coverage
+                # boundary is already represented in the preserved partition.
+                if trade_ns < cursor_ns:
                     continue
-                if trade_id in page_seen or (trade_time == last_ts and trade_id in boundary_ids):
-                    continue
-                page_seen.add(trade_id)
-                if trade_time < query_from or trade_time >= cutoff:
+                # Legacy checkpoints stored microsecond cursors with the IDs
+                # already aggregated at that boundary. Preserve those candles
+                # while upgrading to exact nanosecond cursor continuation.
+                if trade["trade_id"] in boundary_ids and _parse_iso(trade["trade_ts"], "trade_ts") == _parse_iso(last_ts, "last_ts"):
                     continue
                 _add_trade(candles, trade, pair)
                 new_count += 1
-                if trade_time > newest:
-                    newest = trade_time
-                    newest_ids = {trade_id}
-                elif trade_time == newest:
-                    newest_ids.add(trade_id)
-            if newest <= last_ts and new_count == 0:
-                stalled += 1
-                if stalled >= 2:
-                    raise HistoryError("Kraken PostTrade pagination made no progress")
-                last_ts += timedelta(microseconds=1)
+            newest_ns = _timestamp_ns(page["last_ts"], "PostTrade last_ts")
+            if newest_ns <= cursor_ns and not new_count:
+                if len(trades) >= MAX_PAGE_SIZE:
+                    raise HistoryError("Kraken PostTrade pagination made no progress on a full page")
+                # This validated short tail proves the entire remaining group
+                # consists of known IDs. Only then probe one nanosecond later
+                # for an explicit empty terminal response (never one microsecond).
+                terminal_probe_from = _next_nanosecond(last_ts)
             else:
-                stalled = 0
-                if newest == last_ts:
-                    boundary_ids.update(newest_ids)
-                else:
-                    last_ts = newest
-                    boundary_ids = newest_ids
+                newest_ids = {trade["trade_id"] for trade in trades if _timestamp_ns(trade["trade_ts"], "trade_ts") == newest_ns}
+                boundary_ids = boundary_ids | newest_ids if newest_ns == cursor_ns else newest_ids
+                last_ts = page["last_ts"]
             page_number += 1
             if page_number % max(1, checkpoint_pages) == 0:
                 _write_checkpoint(
@@ -650,9 +753,8 @@ def refresh_target(
                     last_ts=last_ts,
                     last_trade_ids=boundary_ids,
                 )
-            if len(trades) < MAX_PAGE_SIZE:
-                last_ts = cutoff
-                break
+            # A short page is not itself proof of exhaustion: request the tail
+            # and require an explicit, schema-validated empty result.
 
         overlap = validate_ohlc_overlap(client, pair, candles, cutoff)
         return _write_checkpoint(
@@ -667,6 +769,7 @@ def refresh_target(
             last_ts=cutoff,
             last_trade_ids=boundary_ids,
             overlap=overlap,
+            verified_at=max(reference, _utc_now()),
         )
     except Exception as exc:
         message = str(exc).strip() or type(exc).__name__
@@ -690,6 +793,7 @@ def load_ready_history(
     target: str,
     *,
     store: HistoryGistStore | None = None,
+    now: datetime | None = None,
 ) -> tuple[list[list[float]], dict[str, Any]]:
     selected_store = store or HistoryGistStore()
     snapshot = selected_store.snapshot()
@@ -699,30 +803,61 @@ def load_ready_history(
         raise HistoryError(f"{target} history is not bootstrapped")
     if entry.get("STATUS") != "READY":
         raise HistoryError(f"{target} history status is {entry.get('STATUS', 'UNKNOWN')}")
-    if entry.get("OVERLAP", {}).get("STATUS") != "VERIFIED":
+    if (entry.get("COVERAGE_VERSION") != 2
+        or type(entry.get("SCAN_VERSION")) is not int or entry["SCAN_VERSION"] != SCAN_VERSION
+        or entry.get("SOURCE") != "Kraken PostTrade"
+        or entry.get("PAIR") != TARGET_PAIRS.get(target)
+        or entry.get("INTERVAL_MINUTES") != INTERVAL_MINUTES):
+        raise HistoryError(f"{target} history requires a current verified coverage refresh")
+    evidence = {key: value for key, value in entry.items() if key != "EVIDENCE_HASH"}
+    if entry.get("EVIDENCE_HASH") != sha256(_canonical_json(evidence).encode("utf-8")).hexdigest():
+        raise HistoryError(f"{target} history coverage evidence hash mismatch")
+    if not isinstance(entry.get("OVERLAP"), Mapping) or entry["OVERLAP"].get("STATUS") != "VERIFIED":
         raise HistoryError(f"{target} history overlap is not verified")
     query_from = _parse_iso(entry.get("QUERY_FROM"), "history QUERY_FROM")
     cutoff = _parse_iso(entry.get("CUTOFF"), "history CUTOFF")
     if cutoff - query_from < timedelta(days=60):
         raise HistoryError(f"{target} history has less than 60 days of source coverage")
     candles = _load_candles(selected_store, entry, snapshot)
+    epochs = sorted(candles)
+    if not epochs or any(not int(query_from.timestamp()) <= epoch < int(cutoff.timestamp()) for epoch in epochs):
+        raise HistoryError(f"{target} real candles lie outside source coverage")
+    first = _iso(datetime.fromtimestamp(epochs[0], tz=timezone.utc))
+    last = _iso(datetime.fromtimestamp(epochs[-1], tz=timezone.utc))
+    gaps = _gap_summary(candles, query_from, cutoff)
+    if (entry.get("LAST_TS") != entry.get("CUTOFF")
+        or entry.get("COVERAGE_THROUGH") != entry.get("CUTOFF")
+        or entry.get("CANDLE_COUNT") != len(candles)
+        or entry.get("CANDLE_START") != first or entry.get("CANDLE_END") != last
+        or entry.get("NO_TRADE_INTERVALS") != gaps["COUNT"]
+        or entry.get("GAP_SUMMARY") != gaps
+        or entry.get("EXPECTED_INTERVALS") != int((cutoff - query_from).total_seconds() // INTERVAL_SECONDS)):
+        raise HistoryError(f"{target} history coverage does not match its real candles")
     rows, carried_intervals = _analysis_rows(candles, query_from, cutoff)
     history_hash = sha256(
         _canonical_json(entry.get("PARTITIONS", {})).encode("utf-8")
     ).hexdigest()
     summary = {
-        "VERSION": HISTORY_VERSION,
+        "VERSION": 2,
         "STATUS": "READY",
         "PAIR": entry["PAIR"],
         "FROM": entry["QUERY_FROM"],
         "THROUGH": entry["CUTOFF"],
+        "COVERAGE_THROUGH": entry["COVERAGE_THROUGH"],
+        "VERIFIED_AT": entry["VERIFIED_AT"],
+        "LAST_REAL_CANDLE_AT": last,
         "CANDLE_COUNT": entry["CANDLE_COUNT"],
         "NO_TRADE_INTERVALS": entry["NO_TRADE_INTERVALS"],
         "ANALYSIS_CANDLE_COUNT": len(rows),
         "CARRIED_NO_TRADE_INTERVALS": carried_intervals,
         "OVERLAP": dict(entry["OVERLAP"]),
-        "HASH": history_hash,
+        "PARTITIONS_HASH": history_hash,
     }
+    summary["HASH"] = history_summary_hash(summary)
+    try:
+        validate_history_summary(target, summary, analyzed_at=now or _utc_now())
+    except ConfigError as exc:
+        raise HistoryError(str(exc)) from exc
     return rows, summary
 
 

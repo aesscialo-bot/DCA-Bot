@@ -23,6 +23,7 @@ _TERMINAL_ORDER_STATUSES = frozenset({"closed", "canceled", "expired", "rejected
 ORDER_POLL_DELAYS_SECONDS = (1, 2, 4, 8, 10)
 SUBMISSION_RECONCILE_DELAYS_SECONDS = (1, 2, 4)
 ORDER_SUBMISSION_DEADLINE_SECONDS = 15
+MAX_EXECUTABLE_QUOTE_AGE_SECONDS = 15
 # Preflight cannot know the account's exact taker fee or market slippage.  Hold
 # back 1% when converting a USD target minimum to GBP; the confirmed fill is
 # still validated again before the crypto AddOrder.
@@ -111,6 +112,52 @@ def validate_kraken_credentials() -> dict:
     }
 
 
+def _fresh_executable_ask(client, symbol: str, market: dict) -> tuple[float, float]:
+    """Fetch an executable ask, never a last trade or carried history price.
+
+    Kraken's REST ticker normally has no snapshot timestamp. In that case a
+    bounded, uncached request supplies freshness; a timestamp, when supplied,
+    must independently be current. Keep a conservative monotonic observation for the
+    final pre-submission check after network-backed configuration validation.
+    """
+    if market.get("active") is False:
+        raise RuntimeError(f"Kraken spot market is inactive: {symbol}")
+    native_status = (market.get("info") or {}).get("status")
+    if native_status is not None and native_status != "online":
+        raise RuntimeError(f"Kraken spot market is not online: {symbol}")
+    started = time.monotonic()
+    ticker = client.fetch_ticker(symbol)
+    received = time.monotonic()
+    if received - started > MAX_EXECUTABLE_QUOTE_AGE_SECONDS:
+        raise RuntimeError(f"Kraken executable quote request is stale for {symbol}")
+    if not isinstance(ticker, dict):
+        raise RuntimeError(f"Kraken executable quote is malformed for {symbol}")
+    if ticker.get("symbol") not in (None, symbol):
+        raise RuntimeError(f"Kraken executable quote has the wrong market for {symbol}")
+    raw_ask = ticker.get("ask")
+    if isinstance(raw_ask, bool):
+        raise RuntimeError(f"Kraken returned no executable ask for {symbol}")
+    try:
+        ask = float(raw_ask)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"Kraken returned no executable ask for {symbol}") from None
+    if not math.isfinite(ask) or ask <= 0:
+        raise RuntimeError(f"Kraken returned no executable ask for {symbol}")
+    timestamp = ticker.get("timestamp")
+    observed = started
+    if timestamp is not None:
+        if isinstance(timestamp, bool):
+            raise RuntimeError(f"Kraken executable quote timestamp is invalid for {symbol}")
+        try:
+            age = time.time() - float(timestamp) / 1000
+        except (TypeError, ValueError):
+            raise RuntimeError(f"Kraken executable quote timestamp is invalid for {symbol}") from None
+        if not math.isfinite(age) or age < -1 or age > MAX_EXECUTABLE_QUOTE_AGE_SECONDS:
+            raise RuntimeError(f"Kraken executable quote is stale or future-dated for {symbol}")
+        observed = min(observed, received - max(0, age))
+    return ask, observed
+
+
 def get_market_minimum_gbp(config_symbol: str, *, exchange=None) -> dict:
     """Return the current end-to-end market minimum expressed in GBP.
 
@@ -130,7 +177,10 @@ def get_market_minimum_gbp(config_symbol: str, *, exchange=None) -> dict:
     minimum_amount = float((limits.get("amount", {}) or {}).get("min") or 0)
     quote_currency = symbol.split("/", maxsplit=1)[1]
     ask_quote = 0.0
-    if minimum_amount > 0:
+    quote_received_at = None
+    if quote_currency == QUOTE_CURRENCY:
+        ask_quote, quote_received_at = _fresh_executable_ask(client, symbol, market)
+    elif minimum_amount > 0:
         ticker = client.fetch_ticker(symbol)
         ask_quote = float(ticker.get("ask") or ticker.get("last") or 0)
         if not math.isfinite(ask_quote) or ask_quote <= 0:
@@ -202,6 +252,7 @@ def get_market_minimum_gbp(config_symbol: str, *, exchange=None) -> dict:
         "effective_minimum_quote": effective_minimum_quote,
         "gbp_usd_rate": gbp_usd_rate,
         "funding_minimum_gbp": funding_minimum_gbp,
+        "quote_received_at_monotonic": quote_received_at,
     }
 
 
@@ -788,6 +839,9 @@ def place_market_buy(
 
         if pre_submit_check is not None:
             pre_submit_check()
+        quote_age = time.monotonic() - minimum["quote_received_at_monotonic"]
+        if quote_age < 0 or quote_age > MAX_EXECUTABLE_QUOTE_AGE_SECONDS:
+            raise RuntimeError("Kraken executable quote expired during final validation")
         # Generate Kraken's short deadline after all network-backed rule checks,
         # immediately before AddOrder.
         submission_params = {

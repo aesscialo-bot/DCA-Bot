@@ -150,22 +150,23 @@ def _source_analysis_state(
 
     normalized_targets = {}
     for target in SOURCE_TARGETS:
-        # The per-decision v3 schema contains no embedded pair name. Validate
-        # retired HYPE through the structurally equivalent current ETH slot,
-        # then independently verify its original target-bound rules hash.
-        validation_target = "ETH_GBP" if target == "HYPE_USD" else target
-        decision = validate_analysis_decision(validation_target, targets[target])
-        if decision["ANALYSIS_DATE"] != analysis_date:
-            raise ValueError(
-                f"source analysis decision date does not match for {target}"
-            )
+        source_decision = targets[target]
+        # Verify the original target binding before shared-schema validation;
+        # never relabel retired HYPE history as a current ETH/DOGE fixture.
         if (
-            decision["ANALYSIS_STATUS"] == "READY"
-            and decision["RULES_HASH"]
+            isinstance(source_decision, Mapping)
+            and source_decision.get("ANALYSIS_STATUS") == "READY"
+            and source_decision.get("RULES_HASH")
             != _source_rules_hash(target, source_rules[target])
         ):
             raise ValueError(
                 f"source analysis rules hash does not match {target} budgets"
+            )
+        validation_target = "ETH_GBP" if target == "HYPE_USD" else target
+        decision = validate_analysis_decision(validation_target, source_decision)
+        if decision["ANALYSIS_DATE"] != analysis_date:
+            raise ValueError(
+                f"source analysis decision date does not match for {target}"
             )
         normalized_targets[target] = decision
     return {

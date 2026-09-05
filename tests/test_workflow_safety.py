@@ -255,6 +255,55 @@ class WorkflowSafetyTests(unittest.TestCase):
         self.assertIn("queue: max", text)
         self.assertIn("cancel-in-progress: false", text)
 
+    def test_analysis_and_bootstrap_share_history_writer_lock_without_inverting_order(self):
+        analysis = self._read("crypto_analysis.yml")
+        bootstrap = self._read("kraken_history_bootstrap.yml")
+        analysis_outer, analysis_jobs = analysis.split("jobs:", 1)
+        analysis_job_lock = analysis_jobs.split("steps:", 1)[0]
+        bootstrap_outer = bootstrap.split("jobs:", 1)[0]
+        self.assertIn("group: dca-analysis-state-writers", analysis_outer)
+        self.assertNotIn("group: dca-kraken-history-writer", analysis_outer)
+        self.assertIn("group: dca-kraken-history-writer", analysis_job_lock)
+        self.assertIn("group: dca-kraken-history-writer", bootstrap_outer)
+        self.assertNotIn("dca-analysis-state-writers", bootstrap)
+        for region in (analysis_outer, analysis_job_lock, bootstrap_outer):
+            self.assertIn("queue: max", region)
+            self.assertIn("cancel-in-progress: false", region)
+        # Enable still acquires analysis before rules; emergency disable does
+        # not wait for either analysis or history merely to acquire its lock.
+        configuration = self._read("update_dca_config.yml")
+        config_outer, config_jobs = configuration.split("jobs:", 1)
+        self.assertIn("inputs.enabled_json == 'true' && 'dca-analysis-state-writers'", config_outer)
+        self.assertIn("group: dca-rule-writers", config_jobs.split("steps:", 1)[0])
+        self.assertNotIn("dca-kraken-history-writer", configuration)
+
+    def test_every_history_producer_is_locked_and_normal_reports_remain_independent(self):
+        producers = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in WORKFLOWS.glob("*.yml")
+            if "kraken_history.py" in path.read_text(encoding="utf-8")
+        }
+        self.assertEqual(set(producers), {
+            "crypto_analysis.yml", "kraken_history_bootstrap.yml", "portfolio_check.yml"
+        })
+        for name, text in producers.items():
+            with self.subTest(workflow=name):
+                self.assertIn("dca-kraken-history-writer", text)
+                self.assertIn("queue: max", text)
+                self.assertIn("cancel-in-progress: false", text)
+        portfolio = producers["portfolio_check.yml"]
+        job_header = portfolio.split("jobs:", 1)[1].split("steps:", 1)[0]
+        recovery_condition = (
+            "github.event_name == 'workflow_dispatch' && "
+            "github.ref == 'refs/heads/recovery/dca-core' && inputs.bootstrap_history == true"
+        )
+        self.assertIn(recovery_condition + " && 'dca-kraken-history-writer'", job_header)
+        self.assertIn("format('dca-portfolio-report-{0}', github.run_id)", job_header)
+        self.assertIn("queue: max", job_header)
+        self.assertIn("cancel-in-progress: false", job_header)
+        self.assertEqual(portfolio.count("if: " + recovery_condition), 2)
+        self.assertNotIn("dca-analysis-state-writers", portfolio)
+
 
 if __name__ == "__main__":
     unittest.main()

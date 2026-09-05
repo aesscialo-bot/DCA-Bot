@@ -186,7 +186,7 @@ class KrakenClientTests(unittest.TestCase):
         exchange.fetch_ticker.assert_called_once_with("BTC/GBP")
         exchange.create_market_buy_order_with_cost.assert_not_called()
 
-    def test_market_minimum_does_not_need_ticker_for_cost_only_market(self):
+    def test_market_minimum_requires_executable_ask_even_for_cost_only_market(self):
         exchange = configured_exchange()
         exchange.market.return_value = {
             "limits": {"cost": {"min": 5.0}, "amount": {"min": None}}
@@ -197,7 +197,68 @@ class KrakenClientTests(unittest.TestCase):
         )
 
         self.assertEqual(result["effective_minimum_gbp"], 5.0)
-        exchange.fetch_ticker.assert_not_called()
+        exchange.fetch_ticker.assert_called_once_with("BTC/GBP")
+        exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    def test_gbp_minimum_never_falls_back_to_last_trade(self):
+        for ask in (None, 0, -1, float("nan"), float("inf"), True, "bad"):
+            with self.subTest(ask=ask):
+                exchange = configured_exchange()
+                exchange.fetch_ticker.return_value = {"ask": ask, "last": 50000}
+                with self.assertRaisesRegex(RuntimeError, "executable ask"):
+                    kraken_client.get_market_minimum_gbp("BTC_GBP", exchange=exchange)
+                exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    def test_gbp_quote_must_be_current_and_correct_market(self):
+        for ticker in (
+            {"ask": 50000, "timestamp": 1},
+            {"ask": 50000, "timestamp": float("nan")},
+            {"ask": 50000, "timestamp": True},
+            {"ask": 50000, "timestamp": (kraken_client.time.time() + 60) * 1000},
+            {"ask": 50000, "symbol": "ETH/GBP"},
+            [],
+        ):
+            with self.subTest(ticker=ticker):
+                exchange = configured_exchange()
+                exchange.fetch_ticker.return_value = ticker
+                with self.assertRaises(RuntimeError):
+                    kraken_client.get_market_minimum_gbp("BTC_GBP", exchange=exchange)
+
+    def test_inactive_or_restricted_market_cannot_prepare_new_order(self):
+        for extra in ({"active": False}, {"info": {"status": "cancel_only"}}):
+            with self.subTest(extra=extra):
+                exchange = configured_exchange()
+                exchange.market.return_value.update(extra)
+                with self.assertRaisesRegex(RuntimeError, "inactive|not online"):
+                    kraken_client.get_market_minimum_gbp("BTC_GBP", exchange=exchange)
+                exchange.fetch_ticker.assert_not_called()
+
+    def test_slow_quote_request_is_rejected(self):
+        exchange = configured_exchange()
+        with patch.object(kraken_client.time, "monotonic", side_effect=[100, 116]):
+            with self.assertRaisesRegex(RuntimeError, "request is stale"):
+                kraken_client.get_market_minimum_gbp("BTC_GBP", exchange=exchange)
+
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_quote_expiring_during_live_rule_check_prevents_submission(self, get_exchange):
+        exchange = configured_exchange()
+        get_exchange.return_value = exchange
+        with patch.object(kraken_client.time, "monotonic", side_effect=[100, 101, 116]):
+            with self.assertRaisesRegex(kraken_client.KrakenPreSubmissionError, "quote expired"):
+                kraken_client.place_market_buy("BTC_GBP", 5.50, pre_submit_check=lambda: None)
+        exchange.create_market_buy_order_with_cost.assert_not_called()
+
+    @patch.object(kraken_client, "get_kraken_exchange")
+    def test_old_ticker_timestamp_age_is_retained_through_final_validation(self, get_exchange):
+        exchange = configured_exchange()
+        get_exchange.return_value = exchange
+        exchange.fetch_ticker.return_value = {"ask": 50000, "timestamp": 990_000}
+        with (
+            patch.object(kraken_client.time, "time", return_value=1000),
+            patch.object(kraken_client.time, "monotonic", side_effect=[100, 101, 107]),
+        ):
+            with self.assertRaisesRegex(kraken_client.KrakenPreSubmissionError, "quote expired"):
+                kraken_client.place_market_buy("BTC_GBP", 5.50)
         exchange.create_market_buy_order_with_cost.assert_not_called()
 
     def test_symbol_accepts_only_supported_gbp_and_usd_pairs(self):
