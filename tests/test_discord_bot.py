@@ -1867,7 +1867,7 @@ class DiscordBotWorkflowAndGeminiTests(unittest.TestCase):
             patch.object(discord_bot, "GEMINI_API_KEY", "test-key"),
             patch.object(discord_bot.genai, "Client", return_value=client) as ctor,
         ):
-            result = asyncio.run(discord_bot.classify_intent("show status"))
+            result = asyncio.run(discord_bot.classify_intent("Could you give me a rundown?"))
         ctor.assert_called_once()
         self.assertEqual(ctor.call_args.kwargs["api_key"], "test-key")
         self.assertEqual(

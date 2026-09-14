@@ -27,6 +27,8 @@ from google import genai
 from google.genai import types
 import requests
 
+from discord_conversation import exact_read_only_action, rule_based_read_only_intent
+
 from dca_config import (
     ALLOWED_TARGETS,
     ConfigError,
@@ -198,10 +200,18 @@ async def _reply_sections(
             # Native cards wrap naturally in both desktop and mobile Discord.
             # One bounded description per message stays below both embed and
             # aggregate limits, including unusually long recovery warnings.
-            await message.reply(
-                embed=discord.Embed(description=part, color=color),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            try:
+                await message.reply(
+                    embed=discord.Embed(description=part, color=color),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except discord.Forbidden:
+                # A definite embed-permission rejection is safe to retry as
+                # text. Do not retry uncertain network/server errors.
+                _log("WARN Discord card rejected; trying plain-text reply")
+                await message.reply(
+                    part, allowed_mentions=discord.AllowedMentions.none()
+                )
 
 
 def _workflow_link(workflow_file: str) -> str:
@@ -717,49 +727,7 @@ INTENT_RESPONSE_SCHEMA = {
 
 def _rule_based_read_only_intent(text: str) -> dict[str, Any]:
     """Keep safe, common requests useful when Gemini is unavailable."""
-
-    lowered = text.casefold().strip()
-    if re.search(
-        r"\b(enable|disable|change|set|increase|decrease|buy|purchase|order|"
-        r"analyse|analyze)\b",
-        lowered,
-    ):
-        action, topic = "chat", "controls"
-    elif any(word in lowered for word in ("help", "command", "how do i")):
-        action, topic = "help", "capabilities"
-    elif any(word in lowered for word in ("portfolio", "balance", "holding")):
-        action, topic = "portfolio", "capabilities"
-    elif any(word in lowered for word in ("health", "healthy", "online", "scheduler")):
-        action, topic = "health", "capabilities"
-    elif any(
-        word in lowered
-        for word in (
-            "status",
-            "enabled",
-            "disabled",
-            "regime",
-            "trend",
-            "amount",
-            "execution time",
-            "next buy",
-        )
-    ):
-        action, topic = "status", "capabilities"
-    elif any(word in lowered for word in ("hello", "hi ", "hey", "good morning")):
-        action, topic = "chat", "greeting"
-    elif "risk" in lowered or "safe" in lowered:
-        action, topic = "chat", "risk"
-    elif "time" in lowered or "schedule" in lowered:
-        action, topic = "chat", "timing"
-    elif "market" in lowered or "pair" in lowered:
-        action, topic = "chat", "markets"
-    elif "dca" in lowered:
-        action, topic = "chat", "dca"
-    elif lowered:
-        action, topic = "chat", "capabilities"
-    else:
-        action, topic = "unknown", "capabilities"
-    return _validate_intent({"action": action, "topic": topic})
+    return _validate_intent(rule_based_read_only_intent(text))
 
 
 def _validate_intent(intent: dict[str, Any]) -> dict[str, Any]:
@@ -785,8 +753,16 @@ def _validate_intent(intent: dict[str, Any]) -> dict[str, Any]:
 
 
 async def classify_intent(text: str) -> dict[str, Any]:
+    local_intent = _rule_based_read_only_intent(text)
+    # Common questions should answer promptly even when the AI service is
+    # slow or unavailable. Let Gemini interpret unfamiliar phrasing only.
+    if local_intent["action"] not in {"chat", "unknown"} or (
+        local_intent["action"] == "chat"
+        and local_intent["topic"] != "capabilities"
+    ):
+        return local_intent
     if not GEMINI_API_KEY:
-        return _rule_based_read_only_intent(text)
+        return local_intent
     prompt = f"{CLASSIFY_PROMPT}\n\nUser message: {text[:1_500]}"
     last_error: Exception | None = None
     for model in AI_MODEL_CANDIDATES:
@@ -2046,9 +2022,9 @@ HELP_TEXT = """🐙 **Kraken GBP-market DCA controls — clear command guide**
 Markets: **BTC/GBP**, **ETH/GBP**, **SOL/GBP**, and **DOGE/GBP**. Budgets are in GBP.
 
 📊 **Read only**
-`show status` or `!dca status` — pair state, today’s analysis, times, and order permission
-`!dca health` — scheduler, workflow, analysis, ledger, and Ghostfolio health
-`show portfolio` or `!dca portfolio` — queue a read-only Kraken holdings report
+`status`, `show status` or `!dca status` — pair state, today’s analysis, times, and order permission
+`health` or `!dca health` — scheduler, workflow, analysis, ledger, and Ghostfolio health
+`portfolio`, `show portfolio` or `!dca portfolio` — queue a read-only Kraken holdings report
 `help`, `!help`, or `!dca help` — show this guide
 
 🔎 **Run deterministic analysis** *(allowlisted user)*
@@ -2072,6 +2048,7 @@ Any invalid budget or pending order blocks bulk enable. After APPLIED, run
 💬 **Chat with Gemini**
 Talk normally for explanations or read-only requests. Natural language cannot
 change budgets, run analysis, enable/disable a pair, or place an order.
+Try “When is the next buy?”, “Why are you not buying?” or “Are you working?”
 
 🛡️ Use the configured channel and allowlisted account for private reads and changes.
 Changes require exact lowercase `!dca ` commands. “Queued” is not “applied”.
@@ -2497,6 +2474,16 @@ READ_ONLY_ACTION_HANDLERS = {
 
 
 @client.event
+async def on_disconnect() -> None:
+    _log("WARN Discord gateway disconnected; automatic reconnect pending")
+
+
+@client.event
+async def on_resumed() -> None:
+    _log("INFO Discord gateway session resumed")
+
+
+@client.event
 async def on_ready() -> None:
     global _workflow_contract_error
     commit = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "unknown")[:12]
@@ -2620,6 +2607,31 @@ async def on_message(message: discord.Message) -> None:
         return
     if not _is_authorized_config_writer(message):
         return
+    _log("INFO Discord authorized message received")
+    try:
+        await _process_authorized_message(message)
+        _log("INFO Discord message handled")
+    except Exception as exc:
+        # Never print message content, credentials, API responses or tracebacks.
+        _log(f"ERROR Discord message handling failed: {type(exc).__name__}")
+        try:
+            await message.reply(
+                "Sorry, I couldn't finish that request. Try `help` for commands "
+                "or `status` for the latest state. If you requested a change or "
+                "analysis, check its workflow before retrying; it may already "
+                "have been queued.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as reply_exc:
+            _log(f"ERROR Discord error reply failed: {type(reply_exc).__name__}")
+
+
+@client.event
+async def on_error(event_method: str, *args: Any, **kwargs: Any) -> None:
+    _log(f"ERROR Discord event failed: {event_method} {type(sys.exception()).__name__}")
+
+
+async def _process_authorized_message(message: discord.Message) -> None:
     mentions = getattr(message, "mentions", [])
 
     text = str(message.content)
@@ -2637,14 +2649,9 @@ async def on_message(message: discord.Message) -> None:
             "an exact lowercase command."
         )
         return
-    if text.casefold() == "show status":
-        await handle_status({}, message)
-        return
-    if text.casefold() == "show portfolio":
-        await handle_portfolio({}, message)
-        return
-    if text.casefold() in {"help", "!help"}:
-        await handle_help({}, message)
+    action = exact_read_only_action(text)
+    if action:
+        await READ_ONLY_ACTION_HANDLERS[action]({}, message)
         return
 
     async with message.channel.typing():

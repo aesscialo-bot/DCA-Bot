@@ -394,9 +394,12 @@ Examples use the canonical GBP-market targets:
 !dca analyze BTC
 !dca analyze all
 show status
+status
 !dca status
+health
 !dca health
 show portfolio
+portfolio
 !dca portfolio
 help
 ```
@@ -451,11 +454,17 @@ responses are split without dropping warnings. `show status` also displays a pro
 warning, normal rule result, confirmation count, activation time, and reason
 whenever an emergency uptrend override is active.
 
-Messages that are not exact commands can be phrased naturally. Gemini routes
-them only to read-only handlers or reviewed emoji-labelled explanations about
+Read commands such as `help`, `status`, `health`, and `portfolio` accept normal
+capitalization and trailing punctuation. Common questions such as “When is the
+next buy?”, “Why are you not buying?”, and “Are you working?” are answered
+without waiting for Gemini. Unfamiliar phrasing uses Gemini to select
+read-only handlers or reviewed emoji-labelled explanations about
 DCA, regimes, timing, risk, markets, and controls. Natural language cannot
 change configuration, start analysis, enable/disable a pair, confirm a change,
 or submit an order; use `help` for the exact safety-critical command.
+If Discord rejects an embedded reply, the bot tries plain text. Command errors
+produce a short reply and sanitized Railway log; an uncertain operation is
+never automatically repeated.
 
 ## Workflows
 
