@@ -190,7 +190,9 @@ class HistoryGistStore:
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
+            "Cache-Control": "no-cache",
         }
+        self._written_files: dict[str, str] = {}
 
     def snapshot(self) -> dict[str, Any]:
         response = self.session.get(
@@ -200,7 +202,19 @@ class HistoryGistStore:
         payload = response.json()
         if not isinstance(payload, dict) or not isinstance(payload.get("files"), dict):
             raise HistoryError("history Gist returned an invalid files payload")
-        return payload
+        # Gist GETs can lag successful PATCHes. Refreshing the next target from
+        # such a GET would rewrite the whole manifest with an earlier target's
+        # BOOTSTRAPPING entry, undoing its completed READY checkpoint. Retain
+        # acknowledged writes for this store's lifetime; workflow concurrency
+        # serializes writers, so these are authoritative for this refresh.
+        files = dict(payload["files"])
+        for filename, content in self._written_files.items():
+            files[filename] = {
+                "content": content,
+                "truncated": False,
+                "size": len(content.encode("utf-8")),
+            }
+        return {**payload, "files": files}
 
     def read_file(self, filename: str, snapshot: Mapping[str, Any] | None = None) -> str:
         gist = dict(snapshot) if snapshot is not None else self.snapshot()
@@ -242,6 +256,7 @@ class HistoryGistStore:
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
+        self._written_files.update(files)
 
 
 class KrakenPublicHistoryClient:

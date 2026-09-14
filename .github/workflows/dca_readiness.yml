@@ -1,0 +1,58 @@
+name: Read-only DCA Readiness
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dca-execution-state-writers
+  cancel-in-progress: false
+
+jobs:
+  readiness:
+    name: Check Kraken funds, minimums, and recovery
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Load protected rules and execution state
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_VARS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          load_variable() {
+            local name="$1"
+            local value
+            if ! value="$(gh variable get "$name" --repo "$GITHUB_REPOSITORY" 2>/dev/null)"; then
+              echo "Could not load required repository variable $name; refusing preflight." >&2
+              exit 1
+            fi
+            while IFS= read -r line; do
+              [ -z "$line" ] || printf '::add-mask::%s\n' "$line"
+            done <<< "$value"
+            local delimiter="DCA_${GITHUB_RUN_ID}_${RANDOM}"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "$value" "$delimiter" >> "$GITHUB_ENV"
+          }
+          load_variable DCA_TARGET_MAP
+          load_variable DCA_EXECUTION_STATE
+
+      - name: Run read-only preflight
+        env:
+          KRAKEN_API_KEY: ${{ secrets.KRAKEN_API_KEY }}
+          KRAKEN_API_SECRET: ${{ secrets.KRAKEN_API_SECRET }}
+        run: python -u dca_readiness.py

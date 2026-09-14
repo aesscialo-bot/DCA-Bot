@@ -32,6 +32,47 @@ class MemoryStore:
         self.files.update(files)
 
 
+class HistoryGistStoreTests(unittest.TestCase):
+    def test_acknowledged_write_survives_a_stale_gist_snapshot(self):
+        session = MagicMock()
+        session.get.return_value.json.return_value = {
+            "files": {
+                "manifest.json": {"content": "BOOTSTRAPPING", "truncated": False},
+                "partition.jsonl": {"truncated": True, "raw_url": "stale-url"},
+                "other.txt": {"content": "preserved"},
+            }
+        }
+        store = kraken_history.HistoryGistStore("gist", "token", session=session)
+        store.write_files({"manifest.json": "READY", "partition.jsonl": "verified rows"})
+        snapshot = store.snapshot()
+        self.assertEqual(store.read_file("manifest.json", snapshot), "READY")
+        self.assertEqual(store.read_file("partition.jsonl", snapshot), "verified rows")
+        self.assertEqual(store.read_file("other.txt", snapshot), "preserved")
+        self.assertEqual(session.get.call_count, 1, "must not follow the stale raw URL")
+        self.assertEqual(session.get.call_args.kwargs["headers"]["Cache-Control"], "no-cache")
+
+    def test_failed_write_is_not_treated_as_acknowledged(self):
+        session = MagicMock()
+        session.get.return_value.json.return_value = {
+            "files": {"manifest.json": {"content": "READY"}}
+        }
+        session.patch.return_value.raise_for_status.side_effect = kraken_history.requests.HTTPError("failed")
+        store = kraken_history.HistoryGistStore("gist", "token", session=session)
+        with self.assertRaises(kraken_history.requests.HTTPError):
+            store.write_files({"manifest.json": "BOOTSTRAPPING"})
+        self.assertEqual(store.read_file("manifest.json"), "READY")
+
+    def test_read_only_store_observes_later_external_snapshots(self):
+        session = MagicMock()
+        session.get.return_value.json.side_effect = [
+            {"files": {"manifest.json": {"content": "before"}}},
+            {"files": {"manifest.json": {"content": "after"}}},
+        ]
+        store = kraken_history.HistoryGistStore("gist", "token", session=session)
+        self.assertEqual(store.read_file("manifest.json"), "before")
+        self.assertEqual(store.read_file("manifest.json"), "after")
+
+
 class KrakenHistoryTests(unittest.TestCase):
     def as_legacy_checkpoint(self, store, **changes):
         manifest = json.loads(store.files[kraken_history.MANIFEST_FILENAME])
@@ -68,6 +109,47 @@ class KrakenHistoryTests(unittest.TestCase):
         self.assertEqual(summary["CANDLE_COUNT"], len(candles))
         self.assertEqual(store.files, original_files, "analysis must never persist synthetic rows")
         self.assertEqual(summary["CARRIED_NO_TRADE_INTERVALS"], len(rows) - len(candles))
+
+    def test_sequential_refresh_keeps_prior_targets_ready_when_get_lags_patch(self):
+        memory, cutoff, candles, overlap = self.seeded_store()
+        manifest = json.loads(memory.files[kraken_history.MANIFEST_FILENAME])
+        for target, pair in kraken_history.TARGET_PAIRS.items():
+            kraken_history._write_checkpoint(
+                memory, manifest, target, candles, status="READY", pair=pair,
+                query_from=cutoff - timedelta(days=65), cutoff=cutoff,
+                last_ts=cutoff, last_trade_ids=[], overlap=overlap, verified_at=cutoff,
+            )
+        visible_files = dict(memory.files)
+        session = MagicMock()
+
+        def stale_get(*args, **kwargs):
+            response = MagicMock()
+            response.json.return_value = {
+                "files": {name: {"content": content} for name, content in visible_files.items()}
+            }
+            return response
+
+        def acknowledged_patch(*args, **kwargs):
+            nonlocal visible_files
+            # Reproduce production: a GET after READY still returns the prior
+            # BOOTSTRAPPING checkpoint, despite the PATCH having succeeded.
+            visible_files = dict(memory.files)
+            memory.write_files({name: info["content"] for name, info in kwargs["json"]["files"].items()})
+            return MagicMock()
+
+        session.get.side_effect = stale_get
+        session.patch.side_effect = acknowledged_patch
+        store = kraken_history.HistoryGistStore("gist", "token", session=session)
+        client = MagicMock()
+        client.post_trade_page.return_value = {"count": 0, "trades": [], "last_ts": ""}
+        later = cutoff + timedelta(minutes=15)
+        with patch.object(kraken_history, "validate_ohlc_overlap", return_value=overlap), patch.object(kraken_history, "_utc_now", return_value=later):
+            kraken_history.refresh_all(kraken_history.TARGET_PAIRS, store=store, client=client, now=later)
+        for target in kraken_history.TARGET_PAIRS:
+            with self.subTest(target=target):
+                _, summary = kraken_history.load_ready_history(target, store=memory, now=later)
+                self.assertEqual(summary["STATUS"], "READY")
+                self.assertEqual(summary["COVERAGE_THROUGH"], kraken_history._iso(later))
 
     def test_verified_legacy_ready_prefix_is_adopted_without_rewriting_real_partitions(self):
         store, cutoff, _, overlap = self.seeded_store()
