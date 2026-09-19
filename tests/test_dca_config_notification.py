@@ -46,6 +46,11 @@ class ConfigurationReceiptTests(unittest.TestCase):
         self.assertIn("no configuration was changed", content)
         self.assertNotIn("APPLIED", content)
 
+    def test_set_rate_receipt_is_treated_as_an_applied_configuration_write(self):
+        content = self.payload(action="set_rate")["content"]
+        self.assertIn("fixed SET_RATE amount", content)
+        self.assertIn("APPLIED", content)
+
     def test_bulk_applied_receipt_names_all_four_targets_only_for_supported_operation(self):
         result = self.payload(symbol="all")
         self.assertIn("all four targets (BTC, ETH, SOL, DOGE)", result["content"])

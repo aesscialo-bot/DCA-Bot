@@ -1197,6 +1197,43 @@ class DecisionAndNarrationTests(unittest.TestCase):
             timedelta(minutes=60),
         )
 
+    def test_set_rate_uses_only_timing_history_and_skips_trend_classifier(self):
+        rule = {
+            "STRATEGY": "SET_RATE",
+            "SET_RATE_GBP": 12,
+            "BUY_ENABLED": False,
+        }
+        exchange = MagicMock()
+        with (
+            patch.object(
+                crypto_analysis,
+                "_fetch_timing_rows",
+                return_value=(intraday_rows(), ready_history("BTC_GBP")),
+            ) as timing_fetch,
+            patch.object(crypto_analysis, "_fetch_asset_rows") as trend_fetch,
+            patch.object(
+                crypto_analysis,
+                "classify_trend",
+                side_effect=AssertionError("SET_RATE must not classify trend"),
+            ),
+            patch.object(crypto_analysis, "LOCAL_TZ", "Asia/Bangkok"),
+        ):
+            decision = crypto_analysis.analyze_asset(
+                exchange,
+                "BTC_GBP",
+                rule,
+                now=NOW,
+            )
+
+        timing_fetch.assert_called_once_with(exchange, "BTC/GBP")
+        trend_fetch.assert_not_called()
+        self.assertEqual(decision["REGIME"], "SET_RATE")
+        self.assertEqual(decision["AMOUNT_TIER"], "SET_RATE")
+        self.assertEqual(decision["SIGNALS"], {"STRATEGY": "SET_RATE"})
+        self.assertIn("trend analysis is bypassed", crypto_analysis._decision_report(
+            "BTC_GBP", decision, rule
+        ))
+
     def test_active_override_forces_effective_uptrend_budget_on_normal_downtrend(self):
         rule = dca_config.default_rules_map()["BTC_GBP"]
         daily, weekly = trend_rows("down")

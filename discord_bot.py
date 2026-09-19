@@ -231,7 +231,7 @@ def _unconfirmed_dispatch(workflow_file: str) -> str:
 def _config_write_block_reason(
     action: str, raw_text: str, message: discord.Message
 ) -> str | None:
-    if action not in {"set_amounts", "set_enabled", "analyze", "update_dca"}:
+    if action not in {"set_amounts", "set_rate", "set_enabled", "analyze", "update_dca"}:
         return None
     if not _is_authorized_config_writer(message):
         return (
@@ -653,7 +653,8 @@ CHAT_TOPIC_REPLIES = {
     "dca": (
         "🪙 DCA invests a configured amount on a repeating schedule. This bot "
         "uses deterministic Kraken candle analysis to choose the daily time and "
-        "budget tier; DCA reduces timing concentration but cannot remove crypto risk."
+        "budget tier; SET_RATE can instead use one fixed GBP amount and skip trend "
+        "classification. DCA reduces timing concentration but cannot remove crypto risk."
     ),
     "regimes": (
         "🧭 UPTREND requires the latest 3 consecutive completed daily Kraken "
@@ -870,6 +871,56 @@ async def handle_set_amounts(
         await message.reply(_unconfirmed_dispatch("update_dca_config.yml"))
 
 
+async def handle_set_rate(
+    symbol_value: str,
+    rate_value: Any,
+    message: discord.Message,
+) -> None:
+    """Queue a fixed GBP purchase amount; edits require a disabled target."""
+
+    if not _is_authorized_config_writer(message):
+        await message.reply("Blocked: this write requires an allowlisted Discord user.")
+        return
+    try:
+        symbol = _normalise_usd_key(symbol_value)
+        rate = _parse_amount(rate_value, "fixed rate")
+        if rate < DCA_AMOUNT_MIN_GBP:
+            raise ValueError(
+                f"fixed rate must be at least £{DCA_AMOUNT_MIN_GBP:g}"
+            )
+    except ValueError as exc:
+        await message.reply(f"Invalid request: {_safe_text(exc)}")
+        return
+
+    raw = await asyncio.to_thread(get_repo_variable, RULES_VARIABLE)
+    try:
+        rules = validate_rules_map(raw or "")
+    except ConfigError as exc:
+        await message.reply(f"Blocked: live rules are invalid ({_safe_text(exc)}).")
+        return
+    if rules[symbol]["BUY_ENABLED"]:
+        await message.reply(
+            f"Blocked: disable **{symbol}** before changing its fixed rate."
+        )
+        return
+
+    inputs = {
+        "action": "set_rate",
+        "symbol": symbol,
+        "set_rate_gbp_json": json.dumps(rate, separators=(",", ":")),
+    }
+    if await asyncio.to_thread(trigger_workflow, "update_dca_config.yml", inputs):
+        await message.reply(
+            f"Queued **SET_RATE** for **{symbol}** at {_display_amount(rate)} per purchase. "
+            "This mode uses the best time of day from 15-minute history and skips "
+            "trend analysis. Run `!dca analyze "
+            f"{symbol.split('_', 1)[0]}` after the workflow completes.\n"
+            + _workflow_link("update_dca_config.yml")
+        )
+    else:
+        await message.reply(_unconfirmed_dispatch("update_dca_config.yml"))
+
+
 def _enable_targets(symbol: str) -> tuple[str, ...]:
     return tuple(ALLOWED_TARGETS) if symbol == "all" else (symbol,)
 
@@ -941,6 +992,19 @@ def _enable_review(
     reviewed_targets = {}
     for target in targets:
         rule = rules[target]
+        if rule.get("STRATEGY", "REGIME") == "SET_RATE":
+            fixed_rate = float(rule["SET_RATE_GBP"])
+            if not DCA_AMOUNT_MIN_GBP <= fixed_rate <= DCA_AMOUNT_MAX_GBP:
+                raise ConfigError(
+                    f"{target} fixed rate must be between £{DCA_AMOUNT_MIN_GBP:g} "
+                    f"and £{DCA_AMOUNT_MAX_GBP:,.0f} before enabling"
+                )
+            reviewed_targets[target] = {
+                "strategy": "SET_RATE",
+                "set_rate": fixed_rate,
+                "enabled": rule["BUY_ENABLED"],
+            }
+            continue
         tier_amounts = {
             "LOW": amount_for_tier_gbp(rule, "LOW"),
             "MID": amount_for_tier_gbp(rule, "MID"),
@@ -954,6 +1018,7 @@ def _enable_review(
                     f"and £{DCA_AMOUNT_MAX_GBP:,.0f} before enabling"
                 )
         reviewed_targets[target] = {
+            "strategy": "REGIME",
             "low": float(tier_amounts["LOW"]),
             "mid": float(tier_amounts["MID"]),
             "high": float(tier_amounts["UP"]),
@@ -1026,12 +1091,18 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
         ]
         for target, target_review in review["targets"].items():
             flag = "ENABLED" if target_review["enabled"] else "DISABLED"
-            lines.append(
-                f"**{target.replace('_', '/')}** — currently {flag} → ENABLED\n"
-                f"{_display_amount(target_review['low'])} / "
-                f"{_display_amount(target_review['mid'])} / "
-                f"{_display_amount(target_review['high'])}"
-            )
+            if target_review["strategy"] == "SET_RATE":
+                lines.append(
+                    f"**{target.replace('_', '/')}** — currently {flag} → ENABLED\n"
+                    f"SET_RATE fixed purchase: {_display_amount(target_review['set_rate'])}"
+                )
+            else:
+                lines.append(
+                    f"**{target.replace('_', '/')}** — currently {flag} → ENABLED\n"
+                    f"{_display_amount(target_review['low'])} / "
+                    f"{_display_amount(target_review['mid'])} / "
+                    f"{_display_amount(target_review['high'])}"
+                )
         lines.extend([
             "Maximum aggregate daily exposure after enable: "
             f"**{_display_amount(review['maximum_exposure'])}**",
@@ -1045,11 +1116,20 @@ async def handle_enable(symbol_value: str, message: discord.Message) -> None:
         ])
         await _reply_sections(message, ["\n".join(lines)])
         return
+    if review.get("strategy") == "SET_RATE":
+        amount_line = (
+            f"SET_RATE fixed purchase: {_display_amount(review['set_rate'])}\n"
+            "Trend analysis is bypassed; only the selected time of day is used.\n"
+        )
+    else:
+        amount_line = (
+            f"UPTREND/lower: {_display_amount(review['low'])} | "
+            f"SIDEWAYS: {_display_amount(review['mid'])} | "
+            f"DOWNTREND/higher: {_display_amount(review['high'])}\n"
+        )
     await message.reply(
         f"**Enable review for {symbol}**\n"
-        f"UPTREND/lower: {_display_amount(review['low'])} | "
-        f"SIDEWAYS: {_display_amount(review['mid'])} | "
-        f"DOWNTREND/higher: {_display_amount(review['high'])}\n"
+        f"{amount_line}"
         f"Maximum aggregate daily exposure after enable: "
         f"**{_display_amount(review['maximum_exposure'])}**\n"
         "Activation starts with the next successful analysis. Existing or stale "
@@ -1476,6 +1556,7 @@ def _decision_summary(
     global_history_ready: bool = False,
 ) -> str:
     enabled = rule["BUY_ENABLED"]
+    strategy = rule.get("STRATEGY", "REGIME")
     amounts = rule["REGIME_AMOUNTS_GBP"]
     configured_status = "ENABLED" if enabled else "DISABLED"
     configured_icon = "✅" if enabled else "⏸️"
@@ -1563,7 +1644,12 @@ def _decision_summary(
     override_summary = _uptrend_override_summary(decision)
     override_suffix = f"{override_summary}\n" if override_summary else ""
     next_step = ""
-    if any(float(value) == 0 for value in amounts.values()):
+    if strategy == "SET_RATE":
+        next_step = (
+            "\n  Mode: SET_RATE uses the fixed purchase amount and the best time of day; "
+            "trend analysis is bypassed."
+        )
+    elif any(float(value) == 0 for value in amounts.values()):
         next_step = "\n  Next: approve and set LOW / MID / UP budgets while disabled; £0 cannot be enabled."
     elif not rules_match:
         next_step = f"\n  Next: run `!dca analyze {symbol.split('_')[0]}` after the configuration workflow succeeds."
@@ -1571,6 +1657,19 @@ def _decision_summary(
         next_step = "\n  Next: inspect the analysis workflow failure, then run `!dca analyze all`."
     error = decision.get("ERROR")
     error_text = f"\n  Analysis issue: {_safe_text(error)}" if error else ""
+    if strategy == "SET_RATE":
+        return (
+            f"{configured_icon} **{_pair_label(symbol)}** (`{symbol}`) | "
+            f"**{configured_status}** | Orders: **{permission}**\n"
+            f"  💷 SET_RATE fixed purchase {_display_amount(rule['SET_RATE_GBP'])}\n"
+            f"  📊 {decision_status} | Strategy: `SET_RATE` | Regime: `{regime}` | Spend: {amount} | "
+            f"Effective: `{next_time}`\n"
+            f"  Mode: SET_RATE uses the best time of day and bypasses trend analysis.\n"
+            f"  🧾 Coverage through: `{history_data_through}`\n"
+            f"  Last traded candle: `{_history_last_traded_candle(decision)}` | "
+            f"Last buy: `{_safe_text(state_entry.get('LAST_BUY_DATE') or 'never')}`"
+            f"{pending_text}{delivery_text}{error_text}"
+        )
     return (
         f"{configured_icon} **{_pair_label(symbol)}** (`{symbol}`) | "
         f"**{configured_status}** | Orders: **{permission}**\n"
@@ -2035,6 +2134,12 @@ Markets: **BTC/GBP**, **ETH/GBP**, **SOL/GBP**, and **DOGE/GBP**. Budgets are in
 `!dca set BTC amounts to 5 low, 10 sideways, and 20 high`
 Wait for the workflow's applied confirmation before the next change.
 LOW ≤ MID ≤ UP; all three need approved nonzero budgets before enabling.
+
+⏱️ **Use a fixed set rate** *(disable the pair first)*
+`!dca set BTC rate to 10`
+This selects **SET_RATE** at £10 per purchase, chooses the best time of day
+from 15-minute history, and skips uptrend/sideways/downtrend analysis. Run
+`!dca analyze BTC` after the workflow reports APPLIED.
 
 ⏸️ **Disable or review-enable targets**
 `!dca disable BTC`
@@ -2542,6 +2647,9 @@ _SET_EXPLICIT_AMOUNTS_RE = re.compile(
     r"([0-9]+(?:\.[0-9]{1,2})?) sideways, and "
     r"([0-9]+(?:\.[0-9]{1,2})?) (?:high|up)$"
 )
+_SET_RATE_RE = re.compile(
+    r"^!dca set ([A-Za-z]+) rate to ([0-9]+(?:\.[0-9]{1,2})?)$"
+)
 _DISABLE_RE = re.compile(r"^!dca disable ([A-Za-z]+)$")
 _ENABLE_RE = re.compile(r"^!dca enable ([A-Za-z]+)$")
 _ANALYZE_RE = re.compile(r"^!dca analyze (all|[A-Za-z]+)$")
@@ -2562,6 +2670,10 @@ async def _handle_exact_dca_command(text: str, message: discord.Message) -> bool
         return True
     if text.startswith("!dca confirm"):
         await _handle_enable_confirmation(message, text)
+        return True
+    match = _SET_RATE_RE.fullmatch(text)
+    if match:
+        await handle_set_rate(match.group(1), match.group(2), message)
         return True
     match = _SET_EXPLICIT_AMOUNTS_RE.fullmatch(text)
     if match:

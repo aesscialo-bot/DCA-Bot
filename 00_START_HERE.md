@@ -76,15 +76,17 @@ That budget update did not enable any target or change either trading mode.
    From midnight until 04:20, a healthy prior-day state is an expected waiting
    posture: no old decision can trade, pending recovery remains active, and no
    stale-date incident is sent unless the state is otherwise unhealthy.
-2. Deterministic Python classifies each pair as `UPTREND`, `DOWNTREND`, or
-   `SIDEWAYS`. Uptrend requires the latest 3 consecutive completed daily closes
-   above each candle's own SMA150. The first break returns sideways. Downtrend
-   requires 3 completed closes below their own SMA150 values and a bearish latest
-   EMA20/EMA50. Weekly EMA and SMA150 slope remain informational.
-3. Python selects the higher / explicit middle / lower GBP spend for downtrend /
-   sideways / uptrend respectively, plus the best 15-minute execution time from
-   deterministic 3-, 5-, 7-, 14-, 30-, 45-, and 60-day timing windows on
-   BTC/GBP, ETH/GBP, SOL/GBP, and DOGE/GBP.
+2. For the default `REGIME` strategy, deterministic Python classifies each pair
+   as `UPTREND`, `DOWNTREND`, or `SIDEWAYS`. Uptrend requires the latest 3
+   consecutive completed daily closes above each candle's own SMA150. The first
+   break returns sideways. Downtrend requires 3 completed closes below their own
+   SMA150 values and a bearish latest EMA20/EMA50. Weekly EMA and SMA150 slope
+   remain informational.
+3. For `REGIME`, Python selects the higher / explicit middle / lower GBP spend
+   for downtrend / sideways / uptrend. For `SET_RATE`, it skips daily/weekly
+   trend data and uses one fixed GBP amount. Both strategies select the best
+   execution time from deterministic 3-, 5-, 7-, 14-, 30-, 45-, and 60-day
+   timing windows on the four direct GBP markets.
 4. The workflow writes a fresh `DCA_ANALYSIS_STATE` and posts a readable summary
    to Discord.
 5. Railway checks the absolute execution times every five minutes and dispatches
@@ -99,7 +101,7 @@ That budget update did not enable any target or change either trading mode.
 8. Kraken remains the authoritative record and Discord receives the result.
 
 Gemini Flash-Lite explains the completed Python decision. It cannot select or
-change the regime, amount, pair, or execution time. If Gemini is unavailable,
+change the strategy, regime, amount, pair, or execution time. If Gemini is unavailable,
 the deterministic decision remains valid and only the optional explanation is
 missing.
 
@@ -178,6 +180,15 @@ Wait for the first **Update DCA Configuration** receipt to say `APPLIED`, then s
 ```text
 !dca set BTC amounts to 5 low, 10 sideways, and 20 high
 ```
+
+For fixed-rate mode, disable the pair first, then run:
+
+```text
+!dca set BTC rate to 10
+```
+
+After the workflow reports `APPLIED`, run `!dca analyze BTC`. SET_RATE uses the
+best time-of-day result and bypasses trend classification.
 
 Wait for the second **Update DCA Configuration** receipt to say `APPLIED`, then send:
 
@@ -357,6 +368,20 @@ The user-owned repository variable is `DCA_TARGET_MAP`. Its approved shape is:
 downtrend amounts. `UP` does **not** mean the amount used in an uptrend. Analysis
 records tiers `LOW`, `MID`, or `HIGH` according to the counter-cyclical policy.
 
+A disabled target may instead use `STRATEGY=SET_RATE` with `SET_RATE_GBP`:
+
+```json
+{
+  "STRATEGY": "SET_RATE",
+  "SET_RATE_GBP": 10,
+  "BUY_ENABLED": false
+}
+```
+
+SET_RATE chooses the best time of day from verified 15-minute history and skips
+trend classification. A later budget update switches that target back to the
+regime strategy.
+
 Use Discord for routine changes. It validates and serializes the write, binds
 confirmation to reviewed budgets and all four rules, and checks Kraken's current
 market minimum using an executable quote. Before persisting an enable, it safely
@@ -373,6 +398,8 @@ can safely perform these limited operations:
 - Change budgets while disabled: `action=set_amounts`, canonical `symbol`, and
   numeric `low_amount_gbp_json`, `mid_amount_gbp_json`, and
   `up_amount_gbp_json` values.
+- Change to fixed-rate mode while disabled: `action=set_rate`, canonical
+  `symbol`, and numeric `set_rate_gbp_json`.
 - Validate without writing: `action=dry_run`, canonical `symbol`, all three
   numeric amount inputs, and a target that is already disabled.
 
