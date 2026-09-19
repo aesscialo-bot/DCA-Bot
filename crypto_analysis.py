@@ -670,6 +670,14 @@ def _fetch_asset_rows(exchange, symbol: str) -> tuple[list, list, list, dict[str
     return daily, weekly, intraday, history
 
 
+def _fetch_timing_rows(exchange, symbol: str) -> tuple[list, dict[str, Any]]:
+    """Load only the intraday evidence used by the SET_RATE strategy."""
+
+    target = symbol.replace("/", "_")
+    intraday, history = load_ready_history(target)
+    return intraday, history
+
+
 def _decision_id(
     target: str,
     analysis_date: str,
@@ -796,14 +804,28 @@ def analyze_asset(
         raise AnalysisError(f"Unsupported target: {target}")
     generated = now or _utc_now()
     fingerprint = rules_hash(target, rule)
-    daily, weekly, intraday, history = _fetch_asset_rows(exchange, TARGET_SYMBOLS[target])
+    normalized_rule = validate_rules_map(
+        {target: rule}, require_all=False
+    )[target]
+    strategy = normalized_rule.get("STRATEGY", "REGIME")
+    if strategy == "SET_RATE":
+        daily = weekly = []
+        intraday, history = _fetch_timing_rows(exchange, TARGET_SYMBOLS[target])
+    else:
+        daily, weekly, intraday, history = _fetch_asset_rows(
+            exchange, TARGET_SYMBOLS[target]
+        )
     # Freshness is the verified completed source scan, not the latest actual
     # trade on a thin market. Historical prices never size a live Kraken order.
     validate_history_summary(target, history, analyzed_at=generated)
-    normal_regime, signals = classify_trend(daily, weekly, now=generated)
-    regime, signals = _apply_uptrend_override(
-        normal_regime, signals, uptrend_override
-    )
+    if strategy == "SET_RATE":
+        regime = "SET_RATE"
+        signals = {"STRATEGY": "SET_RATE"}
+    else:
+        normal_regime, signals = classify_trend(daily, weekly, now=generated)
+        regime, signals = _apply_uptrend_override(
+            normal_regime, signals, uptrend_override
+        )
     selected_time, timing = select_best_time(intraday, now=generated, local_tz=LOCAL_TZ)
     zone = ZoneInfo(LOCAL_TZ)
     local_now = generated.astimezone(zone)
@@ -928,7 +950,6 @@ def _decision_report(target: str, decision: Mapping[str, Any], rule: Mapping[str
             f"Purchase skipped. {decision.get('ERROR') or 'Unknown error'}"
             f"{override_line}"
         )
-    tier = decision["AMOUNT_TIER"]
     amount = effective_amount(rule, decision)
     timing = decision["TIMING"]
     history = decision["HISTORY"]
@@ -949,6 +970,28 @@ def _decision_report(target: str, decision: Mapping[str, Any], rule: Mapping[str
                 "Emergency override: `AUTO-RELEASED`; natural "
                 f"{UPTREND_CONFIRMATION_CANDLES}-close UPTREND confirmed\n"
             )
+    if decision["REGIME"] == "SET_RATE":
+        strategy_line = (
+            f"Strategy: `SET_RATE` — fixed `£{amount:g}` per purchase; "
+            "trend analysis is bypassed\n"
+        )
+    else:
+        strategy_line = (
+            f"Regime: `{decision['REGIME']}` → `{decision['AMOUNT_TIER']}` "
+            f"tier (`£{amount:g} configured`)\n"
+        )
+    if decision["REGIME"] == "SET_RATE":
+        return (
+            f"📊 **{target} daily decision**\n"
+            f"{strategy_line}"
+            f"{override_line}"
+            f"Best time: `{timing['SELECTED_LOCAL_TIME']} {timing['TIMEZONE']}` "
+            f"via `{timing['SELECTION_RULE']}`\n"
+            f"Effective execution: `{decision['EXECUTE_AT']}`{catchup}; valid to `{decision['VALID_UNTIL']}`\n"
+            f"History: `{history.get('FROM')} to {history.get('THROUGH')}`; hash `{history.get('HASH', '')[:12]}`\n"
+            f"Execution status: `{decision['EXECUTION_STATUS']}`; decision `{decision['DECISION_ID']}`"
+        )
+    tier = decision["AMOUNT_TIER"]
     return (
         f"📊 **{target} daily decision**\n"
         f"Regime: `{decision['REGIME']}` → `{tier}` tier (`£{amount:g}` configured)\n"
@@ -1210,6 +1253,18 @@ def _analysis_is_complete_for_live_rules(
             },
         )
 
+    def fresh_for_strategy(target: str) -> bool:
+        decision = state["TARGETS"][target]
+        strategy = rules[target].get("STRATEGY", "REGIME")
+        if strategy == "SET_RATE":
+            # SET_RATE intentionally has no daily classifier signal. The
+            # analysis date and timing history still bind it to this run.
+            return True
+        return (
+            decision.get("SIGNALS", {}).get("DAILY_LAST_COMPLETE")
+            == latest_completed_daily
+        )
+
     return (
         state.get("ANALYSIS_DATE") == analysis_date
         and state.get("POLICY_VERSION") == TIMING_POLICY_VERSION
@@ -1219,10 +1274,7 @@ def _analysis_is_complete_for_live_rules(
             == rules_hash(target, rules[target])
             and state["TARGETS"][target].get("ENABLED")
             is bool(rules[target]["BUY_ENABLED"])
-            and state["TARGETS"][target]
-            .get("SIGNALS", {})
-            .get("DAILY_LAST_COMPLETE")
-            == latest_completed_daily
+            and fresh_for_strategy(target)
             and override_matches(target)
             for target in selected_targets
         )
@@ -1321,7 +1373,8 @@ def main() -> int:
             if model:
                 report += f"\nGemini explanation ({model}): {explanation}"
             print(
-                f"{target}: READY regime={decision['REGIME']} "
+                f"{target}: READY strategy={rules[target].get('STRATEGY', 'REGIME')} "
+                f"regime={decision['REGIME']} "
                 f"time={decision['TIMING']['SELECTED_LOCAL_TIME']} {LOCAL_TZ}"
             )
         except Exception as exc:

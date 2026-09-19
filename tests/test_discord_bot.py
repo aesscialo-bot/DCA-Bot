@@ -418,6 +418,37 @@ class DiscordBotControlTests(unittest.TestCase):
         dispatch.assert_not_called()
         self.assertIn("disable", blocked.text)
 
+    def test_set_rate_command_queues_fixed_strategy_for_disabled_target(self):
+        message = MessageStub()
+        with (
+            patch.object(
+                discord_bot, "get_repo_variable", return_value=json.dumps(self.rules)
+            ),
+            patch.object(discord_bot, "trigger_workflow", return_value=True) as dispatch,
+        ):
+            asyncio.run(discord_bot.handle_set_rate("BTC", "12.50", message))
+        dispatch.assert_called_once_with(
+            "update_dca_config.yml",
+            {
+                "action": "set_rate",
+                "symbol": "BTC_GBP",
+                "set_rate_gbp_json": "12.5",
+            },
+        )
+        self.assertIn("SET_RATE", message.text)
+        self.assertIn("trend analysis", message.text)
+
+    def test_set_rate_exact_command_parser_routes_without_ai(self):
+        message = MessageStub()
+        with patch.object(discord_bot, "handle_set_rate") as handler:
+            handled = asyncio.run(
+                discord_bot._handle_exact_dca_command(
+                    "!dca set BTC rate to 10", message
+                )
+            )
+        self.assertTrue(handled)
+        handler.assert_called_once_with("BTC", "10", message)
+
     def test_zero_is_allowed_only_as_disabled_placeholder(self):
         message = MessageStub()
         with (

@@ -88,6 +88,35 @@ class DcaConfigWriterTests(unittest.TestCase):
             {"LOW": 10, "MID": 12, "UP": 20},
         )
 
+    def test_set_rate_update_switches_strategy_while_disabled(self):
+        updated, should_write = apply_change(
+            self.rules,
+            action="set_rate",
+            symbol="BTC_GBP",
+            set_rate_gbp_json="12.50",
+        )
+        self.assertTrue(should_write)
+        self.assertEqual(updated["BTC_GBP"]["STRATEGY"], "SET_RATE")
+        self.assertEqual(updated["BTC_GBP"]["SET_RATE_GBP"], 12.5)
+        self.assertFalse(updated["BTC_GBP"]["BUY_ENABLED"])
+
+    def test_budget_update_switches_set_rate_back_to_regime(self):
+        self.rules["BTC_GBP"] = {
+            "STRATEGY": "SET_RATE",
+            "SET_RATE_GBP": 12,
+            "BUY_ENABLED": False,
+        }
+        updated, _ = apply_change(
+            self.rules,
+            action="set_amounts",
+            symbol="BTC_GBP",
+            low_amount_gbp_json="10",
+            mid_amount_gbp_json="12",
+            up_amount_gbp_json="20",
+        )
+        self.assertNotIn("STRATEGY", updated["BTC_GBP"])
+        self.assertNotIn("SET_RATE_GBP", updated["BTC_GBP"])
+
     def test_budget_update_rejects_enabled_target(self):
         self.rules["BTC_GBP"] = {
             "REGIME_AMOUNTS_GBP": {"LOW": 10, "UP": 20},

@@ -70,11 +70,12 @@ def notification_payload(
     )
     operation = {
         "set_amounts": "budgets",
+        "set_rate": "fixed SET_RATE amount",
         "set_enabled": "enable/disable setting",
         "dry_run": "budget validation",
     }.get(action, "configuration")
     if outcome == "success" and verified_result == "applied" and action in {
-        "set_amounts", "set_enabled"
+        "set_amounts", "set_rate", "set_enabled"
     } and (symbol in ALLOWED_TARGETS or supported_bulk):
         status = "APPLIED — persisted rules readback matched the requested update."
         next_step = (

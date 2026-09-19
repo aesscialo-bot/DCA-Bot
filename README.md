@@ -76,6 +76,23 @@ Those aggregate amounts assume all four targets are enabled; this paused release
 has £0 new-order exposure. Budget approval alone does not enable buying or change
 shadow mode. Each enabled asset can buy at most once per Bangkok calendar day.
 
+An individual target can use `STRATEGY=SET_RATE` instead of the regime policy:
+
+```json
+{
+  "BTC_GBP": {
+    "STRATEGY": "SET_RATE",
+    "SET_RATE_GBP": 10,
+    "BUY_ENABLED": false
+  }
+}
+```
+
+SET_RATE selects the best time of day from verified 15-minute history, buys the
+fixed GBP amount, and skips daily/weekly trend fetching and classification. The
+target must be disabled while changing strategies or rates; the fixed amount
+still passes the £5–£1,000 and live Kraken minimum checks before enablement.
+
 ## Automated daily flow
 
 ```mermaid
@@ -130,6 +147,9 @@ still reconcile, and the normal rollover does not raise an incident alert.
   three qualifying closes can confirm either directional regime within three.
 - `DOWNTREND` selects `HIGH`, `SIDEWAYS` selects `MID`, and `UPTREND`
   selects `LOW`.
+
+Targets using `SET_RATE` do not receive a market regime or tier; their persisted
+decision records `REGIME=SET_RATE`, `AMOUNT_TIER=SET_RATE`, and the fixed amount.
 
 The classifier still requires at least 170 consecutive completed daily candles
 and 20 completed weekly candles. Weekly EMA and 20-day SMA150 slope remain
@@ -215,13 +235,16 @@ stopping automation.
 
 ## State and runtime configuration
 
-`DCA_TARGET_MAP` contains only the four exact target keys, explicit `LOW`, `MID`,
-and `UP` GBP amounts, and `BUY_ENABLED` flags. Budget edits are atomic and
-permitted only while the selected asset is disabled. DOGE's approved configured
-budgets are now £5/£10/£15; all four targets remain disabled. Zero-budget defaults
-are valid disabled placeholders, not enabled allocations.
+`DCA_TARGET_MAP` contains only the four exact target keys. Each entry uses the
+default regime strategy with explicit `LOW`, `MID`, and `UP` GBP amounts, or
+`STRATEGY=SET_RATE` with one `SET_RATE_GBP` amount, plus its `BUY_ENABLED` flag.
+Budget and strategy edits are atomic and permitted only while the selected asset
+is disabled. DOGE's approved configured budgets are now £5/£10/£15; all four
+targets remain disabled. Zero-budget defaults are valid disabled placeholders,
+not enabled allocations.
 
-`DCA_ANALYSIS_STATE` stores each asset's status, effective regime, selected tier,
+`DCA_ANALYSIS_STATE` stores each asset's status, effective regime or SET_RATE
+strategy, selected tier, fixed amount when applicable,
 `EXECUTE_AT`, `VALID_UNTIL`, `DECISION_ID`, `RULES_HASH`, signal metrics, and
 timing metrics. Its signals preserve the regime without override, the trailing
 uptrend-confirmation count, override metadata, and whether that specific
@@ -238,13 +261,15 @@ Version-2 history evidence binds `COVERAGE_THROUGH` (`THROUGH` remains its alias
 hashes. `LAST_REAL_CANDLE_AT` is the start of the last traded candle, not an exact
 trade timestamp. The 45-minute freshness limit applies to proven coverage at
 analysis creation, independently of how long a market has been quiet. The
-version-4 timing policy invalidates older decisions; run fresh four-target
+version-5 timing policy invalidates older decisions; run fresh four-target
 analysis after deployment. Existing verified history partitions are retained.
 
 Carried historical prices are analysis evidence only. Order validation and
 minimum checks require a fresh executable Kraken quote in the direct GBP market;
 a missing, stale, invalid, or non-executable quote blocks new orders. The daily
-and weekly history requirements and all-four readiness gate are unchanged.
+and weekly history requirements apply to the regime strategy; SET_RATE uses the
+same verified intraday history but deliberately skips daily/weekly trend fetching
+and classification. The all-four readiness gate is unchanged.
 
 `DCA_EXECUTION_STATE` stores `LAST_BUY_DATE`, durable `PENDING_ORDER` state, and
 FIFO `PENDING_GIST_DELIVERIES`. Completion atomically moves confirmed fill
@@ -385,6 +410,7 @@ Examples use the canonical GBP-market targets:
 
 ```text
 !dca set BTC amounts to 5 low, 10 sideways, and 20 high
+!dca set BTC rate to 10
 !dca disable BTC
 !dca enable BTC
 !dca confirm enable BTC_GBP
@@ -407,6 +433,9 @@ help
 Budget changes require the target to be disabled. Enabling requires exact
 confirmation and displays the lower, sideways, and higher amounts, aggregate
 maximum daily exposure, and requirement for successful analysis after enabling.
+The fixed-rate command selects SET_RATE at the amount supplied and uses the best
+time of day without trend classification. After its workflow reports `APPLIED`,
+run `!dca analyze BTC` before enabling.
 Use `show status` separately for the last analysis and timing; the enable review
 does not authorize those old decisions. Confirmation expires after five minutes and binds the
 reviewed target budgets and global rules, not a mandatory fresh decision ID.

@@ -7,8 +7,11 @@ workflows, or release configuration.
 ## Production invariants and current defaults
 
 - Supported targets are exactly `BTC_GBP`, `ETH_GBP`, `SOL_GBP`, and `DOGE_GBP`.
-- `DCA_TARGET_MAP` contains only `REGIME_AMOUNTS_GBP` (explicit `LOW`, `MID`,
-  and compatibility-named `UP`) and `BUY_ENABLED` for each target.
+- `DCA_TARGET_MAP` entries use the default `REGIME` strategy with
+  `REGIME_AMOUNTS_GBP` (explicit `LOW`, `MID`, and compatibility-named `UP`),
+  or `STRATEGY=SET_RATE` with one `SET_RATE_GBP` amount. Every entry also has
+  `BUY_ENABLED`; SET_RATE bypasses trend classification and uses only the
+  deterministic time-of-day analysis.
 - The current release gate is `DCA_START_DATE=2026-08-07`, interpreted as a
   strict `YYYY-MM-DD` date in `Asia/Bangkok`; all earlier trading fails closed.
 - Counter-cyclical spend mapping is downtrend=`HIGH`, sideways=`MID`, and
@@ -41,7 +44,8 @@ workflows, or release configuration.
   the 45-minute verified-coverage freshness gate. Carry last-close, zero-volume
   candles only for proven no-trade intervals after the first real candle through
   the verified cutoff; never conceal partial ingestion or invent leading data.
-  Version-2 history evidence and timing policy v4 invalidate older decisions.
+  Version-2 history evidence and timing policy v5 (including SET_RATE) invalidate
+  older decisions.
 - A fresh executable direct-GBP Kraken quote is required for order sizing and
   market minimums; carried historical prices never authorize a new order.
 - Exact enable confirmation expires after five minutes and binds reviewed

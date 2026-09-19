@@ -111,6 +111,7 @@ def apply_change(
     low_amount_gbp_json: str = "",
     mid_amount_gbp_json: str = "",
     up_amount_gbp_json: str = "",
+    set_rate_gbp_json: str = "",
     enabled_json: str = "",
     expected_rules_hash: str = "",
     expected_decision_id: str = "",
@@ -123,9 +124,9 @@ def apply_change(
     rules = validate_rules_map(current_rules)
     if symbol not in ALLOWED_TARGETS and symbol != "all":
         raise ConfigError(f"Unknown production target: {symbol}")
-    if action not in {"set_amounts", "set_enabled", "dry_run"}:
+    if action not in {"set_amounts", "set_rate", "set_enabled", "dry_run"}:
         raise ConfigError(f"Unsupported configuration action: {action}")
-    if symbol == "all" and action != "set_enabled":
+    if symbol == "all" and action not in {"set_enabled"}:
         raise ConfigError("The all target is supported only for set_enabled; edit budgets individually")
 
     if action in {"set_amounts", "dry_run"}:
@@ -149,14 +150,29 @@ def apply_change(
         normalized = validate_rules_map(candidate)
         return normalized, action != "dry_run"
 
+    if action == "set_rate":
+        if rules[symbol]["BUY_ENABLED"]:
+            raise ConfigError(f"Disable {symbol} before changing its fixed rate")
+        rate = _json_number(set_rate_gbp_json, "set_rate_gbp_json")
+        candidate = {key: dict(value) for key, value in rules.items()}
+        candidate[symbol] = {
+            "STRATEGY": "SET_RATE",
+            "SET_RATE_GBP": rate,
+            "REGIME_AMOUNTS_GBP": dict(
+                rules[symbol].get(
+                    "REGIME_AMOUNTS_GBP", {"LOW": 0, "MID": 0, "UP": 0}
+                )
+            ),
+            "BUY_ENABLED": False,
+        }
+        return validate_rules_map(candidate), True
+
     enabled = _json_boolean(enabled_json, "enabled_json")
     candidate = {key: dict(value) for key, value in rules.items()}
     targets = ALLOWED_TARGETS if symbol == "all" else (symbol,)
     for target in targets:
-        candidate[target] = {
-            "REGIME_AMOUNTS_GBP": dict(rules[target]["REGIME_AMOUNTS_GBP"]),
-            "BUY_ENABLED": enabled,
-        }
+        candidate[target] = dict(rules[target])
+        candidate[target]["BUY_ENABLED"] = enabled
     if not enabled:
         return validate_rules_map(candidate), True
 
@@ -199,6 +215,7 @@ def main(argv=None) -> int:
     parser.add_argument("--low-amount-gbp-json", default="")
     parser.add_argument("--mid-amount-gbp-json", default="")
     parser.add_argument("--up-amount-gbp-json", default="")
+    parser.add_argument("--set-rate-gbp-json", default="")
     parser.add_argument("--enabled-json", default="")
     parser.add_argument("--expected-rules-hash", default="")
     parser.add_argument("--expected-decision-id", default="")
@@ -227,6 +244,7 @@ def main(argv=None) -> int:
         low_amount_gbp_json=args.low_amount_gbp_json,
         mid_amount_gbp_json=args.mid_amount_gbp_json,
         up_amount_gbp_json=args.up_amount_gbp_json,
+        set_rate_gbp_json=args.set_rate_gbp_json,
         enabled_json=args.enabled_json,
         expected_rules_hash=args.expected_rules_hash,
         expected_decision_id=args.expected_decision_id,

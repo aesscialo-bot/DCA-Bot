@@ -30,11 +30,13 @@ TARGET_ROUTES = {
     "SOL_GBP": "DIRECT_GBP",
     "DOGE_GBP": "DIRECT_GBP",
 }
-RULE_FIELDS = frozenset({"REGIME_AMOUNTS_GBP", "BUY_ENABLED"})
+RULE_FIELDS = frozenset(
+    {"REGIME_AMOUNTS_GBP", "BUY_ENABLED", "STRATEGY", "SET_RATE_GBP"}
+)
 REGIME_AMOUNT_FIELDS = frozenset({"LOW", "MID", "UP"})
 LEGACY_REGIME_AMOUNT_FIELDS = frozenset({"LOW", "UP"})
 TIMING_POLICY_VERSION = (
-    "sma150-3-close-responsive-v2+multi-window-3-5-7-14-30-45-60-v4"
+    "sma150-3-close-responsive-v2+multi-window-3-5-7-14-30-45-60-v5-set-rate"
 )
 HISTORY_SUMMARY_VERSION = 2
 HISTORY_COVERAGE_MAX_AGE = timedelta(minutes=45)
@@ -91,6 +93,7 @@ ANALYSIS_READY_SIGNAL_FIELDS = frozenset(
         "UPTREND_OVERRIDE_AUTO_RELEASED",
     }
 )
+SET_RATE_READY_SIGNAL_FIELDS = frozenset({"STRATEGY"})
 UPTREND_OVERRIDE_AUDIT_SIGNAL_FIELDS = frozenset(
     {
         "REGIME_WITHOUT_OVERRIDE",
@@ -194,12 +197,14 @@ ANALYSIS_STATUSES = frozenset(
 EXECUTION_STATUSES = frozenset(
     {"DISABLED", "SHADOW", "ARMED", "DUE", "EXECUTED", "EXPIRED", "BLOCKED"}
 )
-REGIMES = frozenset({"UPTREND", "DOWNTREND", "SIDEWAYS"})
-AMOUNT_TIERS = frozenset({"LOW", "MID", "HIGH"})
+REGIMES = frozenset({"UPTREND", "DOWNTREND", "SIDEWAYS", "SET_RATE"})
+AMOUNT_TIERS = frozenset({"LOW", "MID", "HIGH", "SET_RATE"})
+STRATEGIES = frozenset({"REGIME", "SET_RATE"})
 REGIME_AMOUNT_TIERS = {
     "DOWNTREND": "HIGH",
     "SIDEWAYS": "MID",
     "UPTREND": "LOW",
+    "SET_RATE": "SET_RATE",
 }
 
 
@@ -275,11 +280,13 @@ def validate_target_map(
     """Validate and normalize user-owned DCA rules.
 
     Disabled targets may use zero as an explicit unconfigured placeholder.
-    Enabled targets require all three regime amounts to be within £5–£1,000 and
-    not below a supplied live Kraken market minimum. The explicit three-field
-    amount schema is canonical. The deployed two-field LOW/UP schema remains
+    The default ``REGIME`` strategy requires all three regime amounts. The
+    ``SET_RATE`` strategy uses one fixed GBP amount and skips trend analysis;
+    its optional regime amounts are retained only for a later mode switch.
+    Enabled spend values must be within £5–£1,000 and not below a supplied live
+    Kraken market minimum. The deployed two-field LOW/UP schema remains
     readable during migration and is normalized with its former derived midpoint.
-    All budget values remain GBP-denominated.
+    All spend values remain GBP-denominated.
     """
 
     raw_map = _json_object(value, "DCA_TARGET_MAP")
@@ -305,21 +312,60 @@ def validate_target_map(
         if not isinstance(entry, Mapping):
             raise ConfigError(f"DCA_TARGET_MAP.{target} must be an object")
         entry = dict(entry)
-        _unexpected_fields(entry, RULE_FIELDS, f"DCA_TARGET_MAP.{target}")
+        label = f"DCA_TARGET_MAP.{target}"
+        unsupported_fields = set(entry) - RULE_FIELDS
+        if unsupported_fields:
+            raise ConfigError(
+                f"{label} contains unsupported fields: "
+                + ", ".join(sorted(unsupported_fields))
+            )
+        if "BUY_ENABLED" not in entry:
+            raise ConfigError(f"{label} is missing: BUY_ENABLED")
         enabled = entry["BUY_ENABLED"]
         if not isinstance(enabled, bool):
-            raise ConfigError(f"DCA_TARGET_MAP.{target}.BUY_ENABLED must be boolean")
-        amounts = entry["REGIME_AMOUNTS_GBP"]
+            raise ConfigError(f"{label}.BUY_ENABLED must be boolean")
+        strategy = entry.get("STRATEGY", "REGIME")
+        if not isinstance(strategy, str) or strategy not in STRATEGIES:
+            raise ConfigError(
+                f"{label}.STRATEGY must be REGIME or SET_RATE"
+            )
+
+        raw_set_rate = entry.get("SET_RATE_GBP")
+        if strategy == "SET_RATE":
+            if raw_set_rate is None:
+                raise ConfigError(f"{label}.SET_RATE_GBP is required for SET_RATE")
+            set_rate = _amount(raw_set_rate, f"{target}.SET_RATE_GBP")
+            if set_rate < MIN_ENABLED_AMOUNT_GBP:
+                raise ConfigError(
+                    f"{target}.SET_RATE_GBP must be at least "
+                    f"£{MIN_ENABLED_AMOUNT_GBP:.0f}"
+                )
+            market_minimum = _minimum_for_target(target, market_minimums_gbp)
+            if enabled and market_minimum is not None and set_rate < market_minimum:
+                raise ConfigError(
+                    f"{target}.SET_RATE_GBP £{set_rate:g} is below Kraken's current "
+                    f"£{market_minimum:g} market minimum"
+                )
+        elif raw_set_rate is not None:
+            raise ConfigError(f"{label}.SET_RATE_GBP is only valid for SET_RATE")
+        else:
+            set_rate = None
+
+        amounts = entry.get("REGIME_AMOUNTS_GBP")
+        if amounts is None:
+            if strategy != "SET_RATE":
+                raise ConfigError(f"{label}.REGIME_AMOUNTS_GBP is required")
+            amounts = {"LOW": 0, "MID": 0, "UP": 0}
         if not isinstance(amounts, Mapping):
             raise ConfigError(
-                f"DCA_TARGET_MAP.{target}.REGIME_AMOUNTS_GBP must be an object"
+                f"{label}.REGIME_AMOUNTS_GBP must be an object"
             )
         amounts = dict(amounts)
         amount_fields = frozenset(amounts)
         if amount_fields not in {REGIME_AMOUNT_FIELDS, LEGACY_REGIME_AMOUNT_FIELDS}:
             expected = "LOW, MID, and UP (or legacy LOW and UP during migration)"
             raise ConfigError(
-                f"DCA_TARGET_MAP.{target}.REGIME_AMOUNTS_GBP must contain exactly {expected}"
+                f"{label}.REGIME_AMOUNTS_GBP must contain exactly {expected}"
             )
         low = _amount(amounts["LOW"], f"{target}.REGIME_AMOUNTS_GBP.LOW")
         up = _amount(amounts["UP"], f"{target}.REGIME_AMOUNTS_GBP.UP")
@@ -338,7 +384,7 @@ def validate_target_map(
                     f"{target}.{tier} must be £0 while unconfigured or at least "
                     f"£{MIN_ENABLED_AMOUNT_GBP:.0f}"
                 )
-        if enabled:
+        if enabled and strategy == "REGIME":
             for tier, amount in (("LOW", low), ("MID", mid), ("UP", up)):
                 if amount < MIN_ENABLED_AMOUNT_GBP:
                     raise ConfigError(
@@ -356,6 +402,9 @@ def validate_target_map(
             "REGIME_AMOUNTS_GBP": {"LOW": low, "MID": mid, "UP": up},
             "BUY_ENABLED": enabled,
         }
+        if strategy == "SET_RATE":
+            normalized[target]["STRATEGY"] = "SET_RATE"
+            normalized[target]["SET_RATE_GBP"] = set_rate
     return normalized
 
 
@@ -381,8 +430,11 @@ def rules_hash(target: str, rule: Mapping[str, Any]) -> str:
     payload = {
         "TARGET": target,
         "AMOUNT_POLICY_VERSION": AMOUNT_POLICY_VERSION,
+        "STRATEGY": normalized.get("STRATEGY", "REGIME"),
         "REGIME_AMOUNTS_GBP": normalized["REGIME_AMOUNTS_GBP"],
     }
+    if normalized.get("STRATEGY", "REGIME") == "SET_RATE":
+        payload["SET_RATE_GBP"] = normalized["SET_RATE_GBP"]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return sha256(encoded).hexdigest()
 
@@ -417,6 +469,10 @@ def amount_for_tier_gbp(rule: Mapping[str, Any], tier: str) -> int | float:
     normalized = validate_target_map(
         {TARGET_KEYS[0]: entry}, require_all=False
     )[TARGET_KEYS[0]]
+    if tier == "SET_RATE":
+        if normalized.get("STRATEGY") != "SET_RATE":
+            raise ConfigError("SET_RATE amount requires a SET_RATE strategy")
+        return normalized["SET_RATE_GBP"]
     amounts = normalized["REGIME_AMOUNTS_GBP"]
     if tier == "LOW":
         return amounts["LOW"]
@@ -450,7 +506,9 @@ def maximum_daily_exposure_gbp(value: str | Mapping[str, Any]) -> int | float:
 
     target_map = validate_target_map(value)
     total = sum(
-        max(entry["REGIME_AMOUNTS_GBP"].values())
+        entry["SET_RATE_GBP"]
+        if entry.get("STRATEGY", "REGIME") == "SET_RATE"
+        else max(entry["REGIME_AMOUNTS_GBP"].values())
         for entry in target_map.values()
         if entry["BUY_ENABLED"]
     )
@@ -589,6 +647,11 @@ def analysis_decision_matches_uptrend_override(
     signals = decision.get("SIGNALS")
     if not isinstance(signals, Mapping):
         return False
+    # SET_RATE deliberately bypasses trend classification and the emergency
+    # trend override. Its fixed spend decision is bound to the timing history
+    # and rule fingerprint instead.
+    if decision.get("REGIME") == "SET_RATE":
+        return True
     normalized = validate_uptrend_override_state(override_state)
     entry = normalized["TARGETS"].get(target)
     if entry is None:
@@ -975,6 +1038,11 @@ def _validate_ready_analysis_signals(
 ) -> None:
     signals = dict(decision["SIGNALS"])
     signal_label = f"{label}.SIGNALS"
+    if decision["REGIME"] == "SET_RATE":
+        _unexpected_fields(signals, SET_RATE_READY_SIGNAL_FIELDS, signal_label)
+        if signals["STRATEGY"] != "SET_RATE":
+            raise ConfigError(f"{signal_label}.STRATEGY must be SET_RATE")
+        return
     _unexpected_fields(signals, ANALYSIS_READY_SIGNAL_FIELDS, signal_label)
 
     completed_at = _canonical_utc_timestamp(
@@ -1876,6 +1944,7 @@ __all__ = [
     "AMOUNT_POLICY_VERSION",
     "AMOUNT_TIERS",
     "ANALYSIS_READY_SIGNAL_FIELDS",
+    "SET_RATE_READY_SIGNAL_FIELDS",
     "ANALYSIS_STATE_VERSION",
     "ANALYSIS_STATUSES",
     "ConfigError",
@@ -1894,6 +1963,7 @@ __all__ = [
     "PORTFOLIO_EVENT_FIELDS",
     "READY_STATUS",
     "REGIMES",
+    "STRATEGIES",
     "TARGET_KEYS",
     "TARGET_SYMBOLS",
     "TIMING_POLICY_VERSION",

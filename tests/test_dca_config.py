@@ -136,6 +136,73 @@ def ready_state(rules=None):
 
 
 class RulesSchemaTests(unittest.TestCase):
+    def test_set_rate_strategy_uses_one_fixed_amount_and_its_own_hash(self):
+        rules = dca_config.validate_target_map(
+            {
+                "BTC_GBP": {
+                    "STRATEGY": "SET_RATE",
+                    "SET_RATE_GBP": 12.5,
+                    "BUY_ENABLED": True,
+                }
+            },
+            market_minimums_gbp={"BTC_GBP": 10},
+            require_all=False,
+        )
+        rule = rules["BTC_GBP"]
+        self.assertEqual(rule["STRATEGY"], "SET_RATE")
+        self.assertEqual(rule["SET_RATE_GBP"], 12.5)
+        self.assertEqual(rule["REGIME_AMOUNTS_GBP"], {"LOW": 0, "MID": 0, "UP": 0})
+        self.assertEqual(dca_config.amount_tier_for_regime("SET_RATE"), "SET_RATE")
+        decision = {"REGIME": "SET_RATE", "AMOUNT_TIER": "SET_RATE"}
+        self.assertEqual(dca_config.effective_amount(rule, decision), 12.5)
+        self.assertNotEqual(
+            dca_config.rules_hash("BTC_GBP", rule),
+            dca_config.rules_hash(
+                "BTC_GBP",
+                {
+                    **rule,
+                    "SET_RATE_GBP": 15,
+                },
+            ),
+        )
+
+    def test_set_rate_requires_current_market_minimum_when_enabled(self):
+        with self.assertRaisesRegex(ValueError, "market minimum"):
+            dca_config.validate_target_map(
+                {
+                    "BTC_GBP": {
+                        "STRATEGY": "SET_RATE",
+                        "SET_RATE_GBP": 9,
+                        "BUY_ENABLED": True,
+                    }
+                },
+                market_minimums_gbp={"BTC_GBP": 10},
+                require_all=False,
+            )
+
+    def test_set_rate_ready_decision_accepts_minimal_strategy_signal(self):
+        rules = dca_config.default_rules_map()
+        rules["BTC_GBP"] = {
+            "STRATEGY": "SET_RATE",
+            "SET_RATE_GBP": 12,
+            "BUY_ENABLED": False,
+        }
+        state = ready_state(rules)
+        decision = state["TARGETS"]["BTC_GBP"]
+        decision.update(
+            {
+                "REGIME": "SET_RATE",
+                "AMOUNT_TIER": "SET_RATE",
+                "SIGNALS": {"STRATEGY": "SET_RATE"},
+                "RULES_HASH": dca_config.rules_hash("BTC_GBP", rules["BTC_GBP"]),
+            }
+        )
+        validated = dca_config.validate_analysis_state(state, rules)
+        self.assertEqual(
+            validated["TARGETS"]["BTC_GBP"]["SIGNALS"],
+            {"STRATEGY": "SET_RATE"},
+        )
+
     def test_global_rules_hash_covers_budgets_and_enable_flags(self):
         rules = dca_config.default_rules_map()
         baseline = dca_config.global_rules_hash(rules)
