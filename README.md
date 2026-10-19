@@ -191,7 +191,13 @@ explain the result but cannot choose, change, or block it.
 History is built exclusively from Kraken's first-party PostTrade API into
 append-only monthly Gist partitions. The resumable bootstrap checkpoints every
 page, globally rate-limits requests, records explicit no-trade gaps and partition
-hashes, and verifies the overlapping recent 7.5 days against Kraken OHLC. No new
+hashes, and verifies the recent overlap against Kraken OHLC. Verification starts
+with 15-minute reference candles; if a quiet market has fewer than 96 traded
+candles in that window, it tries 30-minute and then 60-minute references. The
+stored 15-minute trades are aggregated for comparison, and at least 96 real
+traded reference candles must still match. A mismatch stops verification;
+empty intervals never count as traded candles. Timing continues to use the
+original 15-minute history. No new
 order is permitted unless BTC/GBP, ETH/GBP, SOL/GBP, and DOGE/GBP all have current,
 verified history and decisions.
 

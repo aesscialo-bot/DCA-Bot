@@ -30,6 +30,7 @@ class HistorySummaryValidationTests(unittest.TestCase):
     def test_fresh_coverage_does_not_require_a_recent_real_trade(self):
         summary = ready_history("DOGE_GBP", self.now)
         summary["LAST_REAL_CANDLE_AT"] = "2026-09-04T22:00:00Z"
+        summary["OVERLAP"]["FROM"] = "2026-09-03T22:15:00Z"
         summary["OVERLAP"]["THROUGH"] = summary["LAST_REAL_CANDLE_AT"]
         summary["CANDLE_COUNT"] -= 7
         summary["NO_TRADE_INTERVALS"] += 7
@@ -43,6 +44,37 @@ class HistorySummaryValidationTests(unittest.TestCase):
             self.validate(ready_history("DOGE_GBP", self.now - timedelta(minutes=46)))
         with self.assertRaisesRegex(dca_config.ConfigError, "future"):
             self.validate(ready_history("DOGE_GBP", self.now + timedelta(minutes=15)))
+
+    def test_expanded_overlap_preserves_real_candle_minimum_and_legacy_shape(self):
+        self.validate(ready_history("DOGE_GBP", self.now))
+        for interval in (15, 30, 60):
+            summary = ready_history("DOGE_GBP", self.now)
+            summary["OVERLAP"].update(
+                INTERVAL_MINUTES=interval,
+                FROM=(self.now - timedelta(minutes=96 * interval)).isoformat().replace("+00:00", "Z"),
+                THROUGH=(self.now - timedelta(minutes=interval)).isoformat().replace("+00:00", "Z"),
+            )
+            summary["HASH"] = dca_config.history_summary_hash(summary)
+            with self.subTest(interval=interval):
+                self.assertEqual(self.validate(summary), summary)
+
+    def test_rehashed_invalid_expanded_overlap_is_rejected(self):
+        base = ready_history("DOGE_GBP", self.now)
+        base["OVERLAP"].update(INTERVAL_MINUTES=30, FROM="2026-09-03T00:00:00Z", THROUGH="2026-09-04T23:30:00Z")
+        changes = [
+            {"INTERVAL_MINUTES": True}, {"INTERVAL_MINUTES": "30"},
+            {"INTERVAL_MINUTES": 5}, {"INTERVAL_MINUTES": 240},
+            {"CANDLES": 95}, {"CANDLES": 97},
+            {"FROM": "2026-09-03T00:15:00Z"},
+            {"THROUGH": "2026-09-04T23:45:00Z"},
+            {"THROUGH": "2026-09-05T00:00:00Z"}, {"UNKNOWN": 1},
+        ]
+        for change in changes:
+            summary = deepcopy(base)
+            summary["OVERLAP"].update(change)
+            summary["HASH"] = dca_config.history_summary_hash(summary)
+            with self.subTest(change=change), self.assertRaises(dca_config.ConfigError):
+                self.validate(summary)
 
     def test_rehashed_malformed_evidence_is_still_invalid(self):
         base = ready_history("DOGE_GBP", self.now)

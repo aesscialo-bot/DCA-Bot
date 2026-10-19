@@ -548,6 +548,23 @@ start-day analysis. Check the start date and the Crypto Analysis workflow.
 - A pending intent is not permission to clear state manually; let the trader
   reconcile Kraken's open and closed orders.
 
+### History fails because the recent market is quiet
+
+An error such as `PostTrade/OHLC overlap has only 90 candles; 96 required`
+means the recent reference window has too few traded candles. The worker may
+still be online while the all-four history gate blocks new purchases.
+
+The verifier checks 15-minute Kraken OHLC first, then extends the reference
+window using 30-minute or 60-minute candles when necessary. It aggregates the
+original PostTrade candles for that comparison and still requires at least 96
+matching real traded reference candles. Any mismatch stops the refresh. Empty
+intervals do not count toward the minimum, and timing stays at 15-minute resolution.
+
+Deploy the matching shared validator to Railway before running fresh all-four
+analysis. Do not lower the minimum, edit history evidence, clear buy dates, or
+replay expired decisions. Check the completed Crypto Analysis run and current
+`!dca health` before expecting the next normal scheduled purchase.
+
 ### An old pending intent has no matching Kraken order
 
 Do not delete execution JSON by hand or replay the missed date. The manual

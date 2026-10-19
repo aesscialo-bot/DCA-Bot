@@ -508,9 +508,127 @@ class KrakenHistoryTests(unittest.TestCase):
         client = type("Client", (), {"ohlc": lambda self, pair: rows})()
         overlap = kraken_history.validate_ohlc_overlap(client, "BTC/GBP", candles, cutoff)
         self.assertEqual(overlap["STATUS"], "VERIFIED")
+        self.assertNotIn("INTERVAL_MINUTES", overlap)
+        rows[0][2] = "101"
         rows[0][4] = "101"
         with self.assertRaisesRegex(kraken_history.HistoryError, "overlap mismatch"):
             kraken_history.validate_ohlc_overlap(client, "BTC/GBP", candles, cutoff)
+
+    def sparse_overlap_source(self, *, spacing_hours=2):
+        cutoff = datetime(2026, 10, 19, tzinfo=timezone.utc)
+        start = cutoff - timedelta(days=65)
+        candles = {}
+        for offset in range(0, 65 * 24, spacing_hours):
+            timestamp = start + timedelta(hours=offset)
+            candles[int(timestamp.timestamp())] = kraken_history._new_candle(timestamp, Decimal("100"), Decimal("1"))
+        references = {}
+        for interval in (15, 30, 60):
+            rows = []
+            for offset in range(720, -1, -1):
+                epoch = int(cutoff.timestamp()) - offset * interval * 60
+                traded = epoch in candles
+                rows.append([epoch, "100", "100", "100", "100", "100", "1" if traded else "0", int(traded)])
+            references[interval] = rows
+        client = MagicMock()
+        client.ohlc.side_effect = lambda pair, interval_minutes=15: references[interval_minutes]
+        return client, candles, references, start, cutoff
+
+    def test_sparse_market_expands_reference_window_without_counting_quiet_bars(self):
+        for spacing, expected_interval in ((2, 30), (4, 60)):
+            with self.subTest(interval=expected_interval):
+                client, candles, references, start, cutoff = self.sparse_overlap_source(spacing_hours=spacing)
+                original = json.dumps(candles, sort_keys=True)
+                overlap = kraken_history.validate_ohlc_overlap(client, "DOGE/GBP", candles, cutoff, query_from=start)
+                self.assertEqual(overlap["INTERVAL_MINUTES"], expected_interval)
+                self.assertEqual(overlap["CANDLES"], 180)
+                self.assertEqual(json.dumps(candles, sort_keys=True), original)
+                self.assertEqual(client.ohlc.call_count, 2 if expected_interval == 30 else 3)
+                store = MemoryStore()
+                kraken_history._write_checkpoint(
+                    store, {"VERSION": 1, "TARGETS": {}}, "DOGE_GBP", candles,
+                    status="READY", pair="DOGE/GBP", query_from=start, cutoff=cutoff,
+                    last_ts=cutoff, last_trade_ids=[], overlap=overlap, verified_at=cutoff,
+                )
+                _, summary = kraken_history.load_ready_history("DOGE_GBP", store=store, now=cutoff)
+                self.assertEqual(summary["OVERLAP"], overlap)
+
+    def test_coarse_reference_matches_exact_real_candle_aggregation(self):
+        client, candles, references, start, cutoff = self.sparse_overlap_source()
+        epoch = int((cutoff - timedelta(days=10)).timestamp())
+        candles[epoch].update(open="100", high="110", low="95", close="105", trades=2)
+        candles[epoch + 900] = kraken_history._new_candle(
+            datetime.fromtimestamp(epoch + 900, tz=timezone.utc), Decimal("90"), Decimal("2"),
+        )
+        candles[epoch + 900].update(high="108", low="80", trades=3)
+        reference = next(row for row in references[30] if row[0] == epoch)
+        reference[1:5], reference[6], reference[7] = ["100", "110", "80", "90"], "3", 5
+        # A bucket whose first half had no trades opens at its second half's
+        # actual price, rather than a synthetic carry from the previous bucket.
+        delayed_epoch = epoch + 2 * 3600
+        delayed = candles.pop(delayed_epoch)
+        delayed["ts"] = kraken_history._iso(datetime.fromtimestamp(delayed_epoch + 900, tz=timezone.utc))
+        candles[delayed_epoch + 900] = delayed
+        overlap = kraken_history.validate_ohlc_overlap(client, "DOGE/GBP", candles, cutoff, query_from=start)
+        self.assertEqual(overlap["INTERVAL_MINUTES"], 30)
+        reference[7] = 4
+        with self.assertRaisesRegex(kraken_history.HistoryError, "overlap mismatch"):
+            kraken_history.validate_ohlc_overlap(client, "DOGE/GBP", candles, cutoff, query_from=start)
+
+    def test_overlap_discrepancies_never_fall_back_to_a_larger_window(self):
+        for interval, damage in ((15, "price"), (15, "missing"), (15, "quiet"), (30, "price")):
+            with self.subTest(interval=interval, damage=damage):
+                client, candles, references, start, cutoff = self.sparse_overlap_source()
+                real = next(row for row in references[interval] if row[7] == 1)
+                if damage == "price":
+                    real[2], real[4] = "101", "101"
+                elif damage == "missing":
+                    del candles[real[0]]
+                else:
+                    real[6], real[7] = "0", 0
+                with self.assertRaises(kraken_history.HistoryError):
+                    kraken_history.validate_ohlc_overlap(client, "DOGE/GBP", candles, cutoff, query_from=start)
+                self.assertEqual(client.ohlc.call_count, 1 if interval == 15 else 2)
+
+    def test_incomplete_or_partially_covered_coarse_reference_is_not_compared(self):
+        client, candles, references, start, cutoff = self.sparse_overlap_source()
+        # The active 30-minute row contains an unverified future trade. The
+        # previous completed row remains the last evidence, even at :15.
+        references[30][-1][7], references[30][-1][6] = 1, "1"
+        overlap = kraken_history.validate_ohlc_overlap(
+            client, "DOGE/GBP", candles, cutoff + timedelta(minutes=15),
+            query_from=cutoff - timedelta(days=15) + timedelta(minutes=15),
+        )
+        self.assertEqual(overlap["INTERVAL_MINUTES"], 30)
+        self.assertEqual(overlap["CANDLES"], 179)
+        self.assertLess(kraken_history._parse_iso(overlap["THROUGH"], "through"), cutoff)
+
+    def test_malformed_reference_rows_cannot_supply_the_minimum_evidence(self):
+        for damage in ("duplicate", "gap", "unaligned", "negative_count", "noninteger_count", "quiet_volume"):
+            with self.subTest(damage=damage):
+                client, candles, references, start, cutoff = self.sparse_overlap_source()
+                rows = references[15]
+                if damage == "duplicate":
+                    rows[1] = list(rows[0])
+                elif damage == "gap":
+                    del rows[1]
+                elif damage == "unaligned":
+                    rows[0][0] += 1
+                elif damage == "negative_count":
+                    rows[0][7] = -1
+                elif damage == "noninteger_count":
+                    rows[0][7] = True
+                else:
+                    quiet = next(row for row in rows if row[7] == 0)
+                    quiet[6] = "1"
+                with self.assertRaises(kraken_history.HistoryError):
+                    kraken_history.validate_ohlc_overlap(client, "DOGE/GBP", candles, cutoff, query_from=start)
+                self.assertEqual(client.ohlc.call_count, 1)
+
+    def test_all_reference_windows_below_real_candle_minimum_fail_closed(self):
+        client, candles, references, start, cutoff = self.sparse_overlap_source(spacing_hours=24)
+        with self.assertRaisesRegex(kraken_history.HistoryError, "96 required"):
+            kraken_history.validate_ohlc_overlap(client, "DOGE/GBP", candles, cutoff, query_from=start)
+        self.assertEqual(client.ohlc.call_count, 3)
 
     def test_target_parser_is_strict_and_deduplicated(self):
         self.assertEqual(
