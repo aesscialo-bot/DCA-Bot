@@ -1347,14 +1347,23 @@ def validate_history_summary(
         or history["CARRIED_NO_TRADE_INTERVALS"] != history["ANALYSIS_CANDLE_COUNT"] - history["CANDLE_COUNT"]):
         raise ConfigError(f"{label} candle and no-trade counts are inconsistent")
     overlap = history["OVERLAP"]
-    if not isinstance(overlap, Mapping) or set(overlap) != {"STATUS", "CANDLES", "FROM", "THROUGH"}:
+    overlap_fields = {"STATUS", "CANDLES", "FROM", "THROUGH"}
+    if (not isinstance(overlap, Mapping)
+        or set(overlap) not in (overlap_fields, overlap_fields | {"INTERVAL_MINUTES"})):
         raise ConfigError(f"{label}.OVERLAP must contain verified candle evidence")
+    interval = overlap.get("INTERVAL_MINUTES", 15)
+    if type(interval) is not int or interval not in (15, 30, 60):
+        raise ConfigError(f"{label}.OVERLAP has an unsupported verification interval")
     if (overlap["STATUS"] != "VERIFIED" or type(overlap["CANDLES"]) is not int
         or not 96 <= overlap["CANDLES"] <= history["CANDLE_COUNT"]):
         raise ConfigError(f"{label}.OVERLAP requires at least 96 verified real candles")
     overlap_start = parse_iso_datetime(overlap["FROM"], f"{label}.OVERLAP.FROM")
     overlap_end = parse_iso_datetime(overlap["THROUGH"], f"{label}.OVERLAP.THROUGH")
-    if not start <= overlap_start <= overlap_end <= real:
+    if (not start <= overlap_start <= overlap_end <= real
+        or overlap_start.timestamp() % (interval * 60)
+        or overlap_end.timestamp() % (interval * 60)
+        or overlap_end + timedelta(minutes=interval) > cutoff
+        or overlap["CANDLES"] > int((overlap_end - overlap_start).total_seconds() // (interval * 60)) + 1):
         raise ConfigError(f"{label}.OVERLAP lies outside real source coverage")
     return history
 

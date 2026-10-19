@@ -38,6 +38,7 @@ REQUEST_TIMEOUT_SECONDS = 30
 MAX_GIST_FILE_BYTES = 8_000_000
 MAX_PAGE_SIZE = 1_000
 MIN_OVERLAP_CANDLES = 96
+OVERLAP_INTERVALS_MINUTES = (15, 30, 60)
 TARGET_PAIRS = {
     "BTC_GBP": "BTC/GBP",
     "ETH_GBP": "ETH/GBP",
@@ -325,8 +326,10 @@ class KrakenPublicHistoryClient:
             to_ts if isinstance(to_ts, str) else _iso(to_ts),
         )
 
-    def ohlc(self, pair: str) -> list[list[Any]]:
-        payload = self._get(OHLC_URL, {"pair": pair, "interval": INTERVAL_MINUTES})
+    def ohlc(self, pair: str, *, interval_minutes: int = INTERVAL_MINUTES) -> list[list[Any]]:
+        if type(interval_minutes) is not int or interval_minutes not in OVERLAP_INTERVALS_MINUTES:
+            raise HistoryError("unsupported Kraken OHLC verification interval")
+        payload = self._get(OHLC_URL, {"pair": pair, "interval": interval_minutes})
         result = payload.get("result")
         if not isinstance(result, Mapping):
             raise HistoryError("Kraken OHLC response has no result")
@@ -600,40 +603,86 @@ def validate_ohlc_overlap(
     pair: str,
     candles: Mapping[int, Mapping[str, Any]],
     cutoff: datetime,
+    *,
+    query_from: datetime | None = None,
 ) -> dict[str, Any]:
+    """Verify at least 96 real Kraken bars without weakening thin-market checks.
+
+    Kraken returns only its latest 720 intervals, which can contain fewer than
+    96 traded 15-minute bars. Only a valid but insufficient overlap can expand
+    to 30/60 minutes. Those reference bars are compared to exact aggregates of
+    the unchanged real 15-minute history; quiet intervals never count as bars.
+    Any discrepancy at any interval stops verification immediately.
+    """
+    cutoff_epoch = int(cutoff.timestamp())
+    source_start = int(query_from.timestamp()) if query_from is not None else min(candles, default=cutoff_epoch)
     compared = 0
-    first: datetime | None = None
-    last: datetime | None = None
-    for row in client.ohlc(pair):
-        if not isinstance(row, list) or len(row) < 8:
-            raise HistoryError("Kraken OHLC row is malformed")
-        epoch = int(row[0])
-        if epoch >= int(cutoff.timestamp()):
-            continue
-        trade_count = int(row[7])
-        if trade_count == 0:
-            continue
-        candidate = candles.get(epoch)
-        if candidate is None:
-            raise HistoryError("PostTrade history is missing a traded OHLC candle")
-        expected_values = [Decimal(str(value)) for value in row[1:5]]
-        actual_values = [Decimal(candidate[name]) for name in ("open", "high", "low", "close")]
-        if expected_values != actual_values or int(candidate["trades"]) != trade_count:
-            raise HistoryError("PostTrade/OHLC overlap mismatch")
-        compared += 1
-        timestamp = datetime.fromtimestamp(epoch, tz=timezone.utc)
-        first = timestamp if first is None else min(first, timestamp)
-        last = timestamp if last is None else max(last, timestamp)
-    if compared < MIN_OVERLAP_CANDLES:
-        raise HistoryError(
-            f"PostTrade/OHLC overlap has only {compared} candles; {MIN_OVERLAP_CANDLES} required"
-        )
-    return {
-        "STATUS": "VERIFIED",
-        "CANDLES": compared,
-        "FROM": _iso(first),
-        "THROUGH": _iso(last),
-    }
+    for interval in OVERLAP_INTERVALS_MINUTES:
+        seconds = interval * 60
+        aggregated: dict[int, dict[str, Any]] = {}
+        for epoch in sorted(candles):
+            bucket = epoch // seconds * seconds
+            # A partially covered leading/trailing reference bar cannot prove
+            # the corresponding full OHLC bucket, even if it contains trades.
+            if bucket < source_start or bucket + seconds > cutoff_epoch:
+                continue
+            candle = candles[epoch]
+            if bucket not in aggregated:
+                aggregated[bucket] = dict(candle)
+            else:
+                merged = aggregated[bucket]
+                merged["high"] = str(max(Decimal(merged["high"]), Decimal(candle["high"])))
+                merged["low"] = str(min(Decimal(merged["low"]), Decimal(candle["low"])))
+                merged["close"] = candle["close"]
+                merged["trades"] += candle["trades"]
+        rows = client.ohlc(pair) if interval == INTERVAL_MINUTES else client.ohlc(pair, interval_minutes=interval)
+        compared = 0
+        first: datetime | None = None
+        last: datetime | None = None
+        previous_epoch: int | None = None
+        for row in rows:
+            if (not isinstance(row, list) or len(row) < 8
+                or type(row[0]) is not int or row[0] % seconds
+                or type(row[7]) is not int or row[7] < 0):
+                raise HistoryError("Kraken OHLC row is malformed")
+            epoch, trade_count = row[0], row[7]
+            if previous_epoch is not None and epoch != previous_epoch + seconds:
+                raise HistoryError("Kraken OHLC rows are not consecutive and ordered")
+            previous_epoch = epoch
+            expected_values = [_decimal(value, "Kraken OHLC price") for value in row[1:5]]
+            volume = _decimal(row[6], "Kraken OHLC volume", allow_zero=True)
+            open_price, high, low, close = expected_values
+            if (not low <= min(open_price, close) <= max(open_price, close) <= high
+                or (trade_count == 0) != (volume == 0)):
+                raise HistoryError("Kraken OHLC row is inconsistent")
+            if epoch < source_start or epoch + seconds > cutoff_epoch:
+                continue
+            candidate = aggregated.get(epoch)
+            if trade_count == 0:
+                if candidate is not None:
+                    raise HistoryError("PostTrade/OHLC no-trade overlap mismatch")
+                continue
+            if candidate is None:
+                raise HistoryError("PostTrade history is missing a traded OHLC candle")
+            actual_values = [Decimal(candidate[name]) for name in ("open", "high", "low", "close")]
+            if expected_values != actual_values or candidate["trades"] != trade_count:
+                raise HistoryError("PostTrade/OHLC overlap mismatch")
+            compared += 1
+            timestamp = datetime.fromtimestamp(epoch, tz=timezone.utc)
+            first = timestamp if first is None else min(first, timestamp)
+            last = timestamp if last is None else max(last, timestamp)
+        if compared >= MIN_OVERLAP_CANDLES:
+            overlap = {
+                "STATUS": "VERIFIED", "CANDLES": compared,
+                "FROM": _iso(first), "THROUGH": _iso(last),
+            }
+            if interval != INTERVAL_MINUTES:
+                overlap["INTERVAL_MINUTES"] = interval
+            return overlap
+    raise HistoryError(
+        f"PostTrade/OHLC overlap has only {compared} real candles at 60 minutes; "
+        f"{MIN_OVERLAP_CANDLES} required"
+    )
 
 
 def refresh_target(
@@ -771,7 +820,7 @@ def refresh_target(
             # A short page is not itself proof of exhaustion: request the tail
             # and require an explicit, schema-validated empty result.
 
-        overlap = validate_ohlc_overlap(client, pair, candles, cutoff)
+        overlap = validate_ohlc_overlap(client, pair, candles, cutoff, query_from=query_from)
         return _write_checkpoint(
             store,
             manifest,

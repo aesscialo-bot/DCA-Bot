@@ -48,6 +48,12 @@ workflows, or release configuration.
   older decisions.
 - A fresh executable direct-GBP Kraken quote is required for order sizing and
   market minimums; carried historical prices never authorize a new order.
+- OHLC cross-checking requires at least 96 real traded reference candles.
+  Compare 15-minute references first, then 30-minute and 60-minute references
+  only when the shorter window has too few traded candles. Aggregate the stored
+  15-minute source exactly; never bypass a mismatch or count empty intervals as
+  real trades. Deploy the matching shared validator before generating analysis
+  containing an expanded reference interval. Timing resolution stays 15 minutes.
 - Exact enable confirmation expires after five minutes and binds reviewed
   budgets and all four rules. Every enable invalidates the selected target's old
   analysis before the rules write under both writer locks, verifies readback,
